@@ -13,6 +13,7 @@ pub struct Program {
     formats: Vec<Format>,
     pub ir: String,
     handlers: Vec<Handler>,
+    ustack: bool,
     _engine: Engine,
 }
 impl Program {
@@ -40,6 +41,7 @@ impl Program {
             formats: generator.formats,
             ir,
             handlers,
+            ustack: generator.ustack,
             _engine: engine,
         })
     }
@@ -49,6 +51,7 @@ impl Program {
             std::sync::Arc::ptr_eq(&state.origin, &self.origin),
             "State belongs to a different Program"
         );
+        state.stack_strings.clear();
         // Handler lifetime is bounded by the Engine held by this Program. Event
         // strings stay alive throughout this synchronous invocation.
         unsafe {
@@ -62,6 +65,9 @@ impl Program {
                 .any(|(_, p)| matches!(p, Probe::Perf { .. }))
         })
     }
+    pub fn needs_ustack(&self) -> bool {
+        self.ustack
+    }
     pub fn state<'a>(&self, writer: impl std::io::Write + 'a) -> State<'a> {
         State::new(
             self.origin.clone(),
@@ -73,7 +79,7 @@ impl Program {
 }
 
 const PRELUDE: &str = "
-%Event = type { i64, i64, i64, i64, i64, i64, ptr, ptr }
+%Event = type { i64, i64, i64, i64, i64, i64, ptr, ptr, ptr, i64 }
 declare void @pt_map_update(ptr, i64, ptr, i64, i64, i64)
 declare i64 @pt_map_get(ptr, i64, ptr, i64)
 declare void @pt_printf(ptr, i64, ptr)
@@ -81,6 +87,7 @@ declare void @pt_map_action(ptr, i64, i64)
 declare void @pt_exit(ptr)
 declare i64 @pt_stopped(ptr)
 declare i64 @pt_streq(ptr, ptr)
+declare i64 @pt_ustack(ptr, ptr, i64)
 ";
 
 #[derive(Default)]
@@ -95,6 +102,7 @@ struct Generator {
     next: usize,
     current: String,
     locals: BTreeMap<String, String>,
+    ustack: bool,
 }
 struct Value {
     reg: String,
@@ -132,6 +140,7 @@ impl Generator {
         match e {
             Expr::String(_) => Type::String,
             Expr::Builtin(n) if n == "comm" || n == "probe" => Type::String,
+            Expr::Builtin(n) | Expr::Call(n, _) if n == "ustack" => Type::Stack,
             _ => Type::Number,
         }
     }
@@ -258,10 +267,7 @@ impl Generator {
             if v.ty != self.specs[id].keys[i] {
                 return Err(format!("wrong key type for @{name}"));
             }
-            for (field, value) in [
-                (0, v.reg),
-                (1, if v.ty == Type::String { "1" } else { "0" }.into()),
-            ] {
+            for (field, value) in [(0, v.reg), (1, (v.ty as u64).to_string())] {
                 let ptr = self
                     .value(
                         format!("getelementptr {{ i64, i64 }}, ptr {array}, i64 {i}, i32 {field}"),
@@ -293,6 +299,9 @@ impl Generator {
                 Ok(self.value(format!("ptrtoint ptr @str{id} to i64"), Type::String))
             }
             Expr::Builtin(name) => {
+                if name == "ustack" {
+                    return self.stack(127);
+                }
                 if name == "true" || name == "false" {
                     return Ok(Value {
                         reg: if name == "true" { "1" } else { "0" }.into(),
@@ -343,6 +352,18 @@ impl Generator {
                     ),
                     Type::Number,
                 ))
+            }
+            Expr::Call(name, args) if name == "ustack" => {
+                let depth = match args.as_slice() {
+                    [] => 127,
+                    [Expr::Number(n)] if (1..=127).contains(n) => *n,
+                    _ => {
+                        return Err(
+                            "ustack() accepts an optional constant depth from 1 to 127".into()
+                        );
+                    }
+                };
+                self.stack(depth)
             }
             Expr::Call(name, _) => Err(format!(
                 "{name}() cannot be used here; aggregations must be assigned directly to maps"
@@ -396,7 +417,7 @@ impl Generator {
                 if a.ty != b.ty {
                     return Err("cannot mix strings and integers".into());
                 }
-                if a.ty == Type::String {
+                if a.ty != Type::Number {
                     if op != "==" && op != "!=" {
                         return Err("strings support only == and !=".into());
                     }
@@ -553,7 +574,7 @@ impl Generator {
                             .reg;
                         for (i, (expr, ty)) in args[1..].iter().zip(&format.types).enumerate() {
                             let v = self.expr(expr)?;
-                            if v.ty != *ty {
+                            if v.ty != *ty && !(v.ty == Type::Stack && *ty == Type::String) {
                                 return Err(format!(
                                     "printf argument {} has the wrong type",
                                     i + 1
@@ -602,5 +623,12 @@ impl Generator {
             self.label(&next);
         }
         Ok(())
+    }
+    fn stack(&mut self, depth: i64) -> Result<Value> {
+        self.ustack = true;
+        Ok(self.value(
+            format!("call i64 @pt_ustack(ptr %state, ptr %event, i64 {depth})"),
+            Type::Stack,
+        ))
     }
 }

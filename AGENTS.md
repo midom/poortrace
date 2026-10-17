@@ -9,7 +9,8 @@ programs. See `README.md` for supported syntax, probes, examples, and limitation
 
 Supported targets are 64-bit Linux on x86-64 and AArch64. The crate uses Rust
 edition 2024 with a minimum Rust version of 1.85. Runtime dependencies are `libc`
-and `clap`; LLVM is accessed through direct C API bindings.
+and `clap`, plus `object`, `cpp_demangle`, and `rustc-demangle` for ELF user-stack
+symbolization; LLVM is accessed through direct C API bindings.
 
 ## Source map
 
@@ -20,6 +21,7 @@ and `clap`; LLVM is accessed through direct C API bindings.
   registration, and engine/context ownership.
 - `src/runtime.rs`: event ABI, typed map keys, aggregations, formatting, output,
   and callbacks called by generated code.
+- `src/symbols.rs`: target mappings, ELF symbol lookup, and user-stack rendering.
 - `src/perf.rs`: perf attributes, event descriptors, mmap ring consumption,
   record decoding, and perf access diagnostics.
 - `src/main.rs`: CLI, signal handling, process launch gate, thread discovery,

@@ -124,6 +124,10 @@ END { printf("finished\n"); }
 * Integer builtins: `pid`, `tid`, `cpu`, `nsecs`, `ip`, `period`. `nsecs` uses
   `CLOCK_MONOTONIC`; `period` is the sample's perf counter period. String
   builtins: `comm` and `probe`.
+* User stacks: `ustack` or `ustack()` captures up to 127 user frames;
+  `ustack(N)` limits output to a constant depth from 1 to 127. Stacks can be map
+  keys or arguments to `printf("%s", ...)`. They have a distinct key type and
+  print as indented frames, leaf first. They cannot be used as integers.
 * Arithmetic `+ - * / %`, bitwise `& | ^ ~ << >>`, comparisons, unary `!`,
   and short-circuit `&& ||`. Strings support `==` and `!=` by content.
 * `$local = expression`, `+=`, `-=`, `++`, `--`, and `if (...) { ... } else { ... }`.
@@ -156,6 +160,41 @@ For lifecycle and interval handlers, `pid` and `tid` are the target process ID
 callbacks are scheduled in userspace and missed ticks coalesce. They do not
 provide hard real-time timing.
 
+## User stacks
+
+```sh
+./target/release/poortrace -p 1234 -d 10 \
+  -e 'profile:hz:99 { @[comm, ustack(32)] = count(); }'
+./target/release/poortrace examples/stacks.pt -- ./my-program
+```
+
+Perf callchain capture is enabled when the script uses `ustack`, including in
+predicates. It uses the kernel's user frame-pointer unwinder; compile C/C++
+targets with `-fno-omit-frame-pointer`, or Rust targets with
+`RUSTFLAGS='-C force-frame-pointers=yes'`, for useful caller frames. On AArch64,
+also use `-mno-omit-leaf-frame-pointer` with C/C++ compilers that otherwise omit
+leaf frames. The kernel's
+`perf_event_max_stack` also limits captured depth. Omitted frame pointers,
+inlining, tail calls, or interrupted prologues can truncate stacks. This mode
+does not perform DWARF unwinding or recover interpreter/JIT language frames.
+
+Frames resolve against the target's `/proc/PID/maps` and ELF regular/dynamic
+symbol tables, accounting for PIE/ASLR and shared-library segment offsets.
+Rust and C++ names are demangled. Available symbols print as
+`function+0xOFFSET (/path/to/module)`; unavailable symbols retain their raw
+address and module/file offset when possible. Stripped binaries may expose
+only exported symbols. Separate debug files, source lines, and inline frames
+are not resolved. Symbol lookup uses pure Rust libraries and needs no external
+symbolizer executable or additional shared libraries in a static build.
+
+Resolution is best effort: mappings refresh at most every 100 ms while handling
+stacks, so unloading/replacing modules before samples are processed can prevent
+or invalidate resolution. Access restrictions, deleted/unreadable files, and
+anonymous mappings fall back to addresses. ELF reads are limited to 128 MiB per
+file and 250,000 text symbols; symbol caches are bounded. Stack keys own their
+rendered frames so maps remain printable after the target exits. Lifecycle and
+interval events have no sampled stack and print `<no user stack>`.
+
 ## Target lifecycle and limits
 
 Perf probes require `-p PID`, `-c 'shell command'`, or `-- executable args...`.
@@ -180,8 +219,9 @@ thread/probe rather than one per CPU. There is no system-wide mode.
 
 Samples are buffered and handled asynchronously in userspace; this is not a
 synchronous debugger or kernel probe engine. Per-stream order is preserved,
-but streams are not globally timestamp-sorted. IPs are raw user addresses;
-stack unwinding, symbolization, arbitrary process-memory access, kprobes,
+but streams are not globally timestamp-sorted. `ip` remains a raw user address;
+user callchains and ELF symbols are available through `ustack`. Arbitrary
+process-memory access, kprobes,
 uprobes, tracepoints, USDT, BTF, loops, structs, and the rest of bpftrace's
 language are outside this implementation. Counter samples are not exact
 counter totals: `count()` counts delivered samples, while `sum(period)` sums

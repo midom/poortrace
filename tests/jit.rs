@@ -196,3 +196,61 @@ fn multiple_probe_specs_share_one_native_handler() {
     assert_eq!(p.clauses[0].probes.len(), 2);
     assert!(p.ir.contains("define void @probe_0"));
 }
+
+#[test]
+fn user_stacks_are_typed_keys_and_strings_live_through_the_handler() {
+    let program = Program::compile(
+        r#"profile:hz:99 {
+        @stacks[comm, ustack] = count();
+        @short[ustack(1)] = count();
+        if (ustack == ustack()) { @equal++; }
+        printf("%s|%s", ustack(1), ustack(2));
+    }"#,
+    )
+    .unwrap();
+    assert!(program.needs_ustack());
+    let mut output = Vec::new();
+    {
+        let mut state = program.state(&mut output);
+        let mut frames = vec![0x1234, 0x5678];
+        for _ in 0..2 {
+            let event = Event::new(c"test", c"synthetic").with_ustack(&frames);
+            program.invoke(0, &mut state, &event);
+        }
+        // Map keys own the stack after the Event and its backing frames disappear.
+        frames.clear();
+        state.print_all();
+        state.flush().unwrap();
+    }
+    let text = String::from_utf8(output).unwrap();
+    assert!(
+        text.contains("    0x1234\n|    0x1234\n    0x5678\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("@stacks[\"test\", \n    0x1234\n    0x5678\n]: 2"),
+        "{text}"
+    );
+    assert!(text.contains("@short[\n    0x1234\n]: 2"), "{text}");
+    assert!(text.contains("@equal: 2"), "{text}");
+    assert!(!Program::compile("BEGIN { @x++; }").unwrap().needs_ustack());
+    for source in [
+        "BEGIN { @x[ustack(0)]++; }",
+        "BEGIN { @x[ustack(128)]++; }",
+        "BEGIN { @x[ustack(pid)]++; }",
+        "BEGIN { @x[ustack(1, 2)]++; }",
+        "BEGIN { @x[ustack]++; @x[comm]++; }",
+        "BEGIN { @x = ustack + 1; }",
+        "BEGIN { printf(\"%d\", ustack); }",
+    ] {
+        assert!(Program::compile(source).is_err(), "{source}");
+    }
+    let text = execute(r#"BEGIN { printf("%s", ustack); }"#, &[0]);
+    assert!(text.contains("<no user stack>"));
+}
+
+#[test]
+fn event_layout_matches_the_jit_stack_abi() {
+    assert_eq!(std::mem::size_of::<Event<'_>>(), 80);
+    assert_eq!(std::mem::offset_of!(Event<'_>, period), 40);
+}

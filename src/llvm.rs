@@ -131,6 +131,7 @@ impl Engine {
             }
             let owner = Self { engine, context };
             let mappings: &[(&CStr, Ref)] = &[
+                (c"pt_ustack", runtime::ustack as *const () as Ref),
                 (c"pt_map_update", runtime::map_update as *const () as Ref),
                 (c"pt_map_get", runtime::map_get as *const () as Ref),
                 (c"pt_printf", runtime::print as *const () as Ref),

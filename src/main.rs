@@ -20,7 +20,7 @@ use std::{
 #[command(
     version,
     about = "LLVM JIT tracing scripts over unprivileged, user-mode Linux perf events",
-    after_help = "Examples:\n  poortrace -e 'interval:ms:100 { @ticks = count(); }' --duration 1\n  poortrace -e 'profile:hz:99 { @[comm, ip] = count(); }' -- ./workload\n  poortrace -p 1234 -e 'software:page-faults:1 { @[tid] = count(); }'\n\nPerf policy and PMU support are enforced by the host. No BPF programs are loaded."
+    after_help = "Examples:\n  poortrace -e 'interval:ms:100 { @ticks = count(); }' --duration 1\n  poortrace -e 'profile:hz:99 { @[comm, ip] = count(); }' -- ./workload\n  poortrace -p 1234 -e 'profile:hz:99 { @[ustack] = count(); }'\n  poortrace -p 1234 -e 'software:page-faults:1 { @[tid] = count(); }'\n\nPerf policy and PMU support are enforced by the host. No BPF programs are loaded."
 )]
 struct Args {
     /// Inline script (otherwise supply a script file)
@@ -370,7 +370,9 @@ fn attach(
                 {
                     continue;
                 }
-                let event = if on_exec {
+                let event = if program.needs_ustack() {
+                    PerfEvent::open_with_ustack(*tid, probe, pages, on_exec)
+                } else if on_exec {
                     PerfEvent::open_on_exec(*tid, probe, pages)
                 } else {
                     PerfEvent::open(*tid, probe, pages)
@@ -468,7 +470,8 @@ fn invoke(
         }
     };
     let name = CString::new(name).unwrap();
-    let mut event = Event::new(comm, &name);
+    let mut event =
+        Event::new(comm, &name).with_ustack(sample.map(|s| s.callchain.as_slice()).unwrap_or(&[]));
     event.pid = pid as u64;
     event.tid = tid as u64;
     event.cpu = sample.map(|s| s.cpu as u64).unwrap_or(0);

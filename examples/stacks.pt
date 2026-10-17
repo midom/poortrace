@@ -1,0 +1,2 @@
+// Build native targets with frame pointers for caller frames (e.g. -fno-omit-frame-pointer).
+profile:hz:99 { @[comm, ustack(32)] = count(); }

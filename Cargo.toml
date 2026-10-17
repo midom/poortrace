@@ -13,6 +13,9 @@ static-llvm = []
 [dependencies]
 libc = "0.2"
 clap = { version = "4.5", features = ["derive"] }
+object = { version = "0.36.7", default-features = false, features = ["read_core", "elf", "std", "unaligned"] }
+cpp_demangle = "0.4.5"
+rustc-demangle = "0.1"
 
 [profile.release]
 lto = "thin"

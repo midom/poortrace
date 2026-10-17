@@ -1,7 +1,7 @@
 use crate::Result;
 use std::{
     collections::BTreeMap,
-    ffi::{CStr, c_char},
+    ffi::{CStr, CString, c_char},
     io::Write,
 };
 
@@ -15,6 +15,8 @@ pub struct Event<'a> {
     pub period: u64,
     comm: *const c_char,
     probe: *const c_char,
+    stack: *const u64,
+    stack_len: u64,
     lifetime: std::marker::PhantomData<&'a CStr>,
 }
 impl<'a> Event<'a> {
@@ -28,15 +30,24 @@ impl<'a> Event<'a> {
             period: 0,
             comm: comm.as_ptr(),
             probe: probe.as_ptr(),
+            stack: [].as_ptr(),
+            stack_len: 0,
             lifetime: std::marker::PhantomData,
         }
+    }
+    pub fn with_ustack(mut self, frames: &'a [u64]) -> Self {
+        self.stack = frames.as_ptr();
+        self.stack_len = frames.len() as u64;
+        self
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u64)]
 pub enum Type {
-    Number,
-    String,
+    Number = 0,
+    String = 1,
+    Stack = 2,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u64)]
@@ -182,6 +193,7 @@ impl Format {
 enum Key {
     Number(i64),
     String(String),
+    Stack(String),
 }
 #[derive(Clone, Debug, Default)]
 struct Cell {
@@ -209,6 +221,8 @@ pub struct State<'a> {
     pub stopped: bool,
     pub error: Option<String>,
     pub max_entries: usize,
+    pub(crate) stack_strings: Vec<CString>,
+    symbols: crate::symbols::Symbolizer,
 }
 impl<'a> State<'a> {
     pub(crate) fn new(
@@ -226,6 +240,8 @@ impl<'a> State<'a> {
             stopped: false,
             error: None,
             max_entries: 65536,
+            stack_strings: Vec::new(),
+            symbols: crate::symbols::Symbolizer::default(),
         }
     }
     fn write(&mut self, text: &str) {
@@ -267,6 +283,10 @@ impl<'a> State<'a> {
                     match k {
                         Key::Number(n) => out.push_str(&n.to_string()),
                         Key::String(s) => out.push_str(&format!("{s:?}")),
+                        Key::Stack(s) => {
+                            out.push('\n');
+                            out.push_str(s);
+                        }
                     }
                 }
                 out.push(']');
@@ -291,7 +311,7 @@ impl<'a> State<'a> {
 }
 
 fn string(raw: u64) -> String {
-    // All pointers originate from JIT-owned constants or the current Event's CStrings.
+    // Pointers originate from JIT constants, Event strings, or State stack_strings.
     unsafe {
         CStr::from_ptr(raw as *const c_char)
             .to_string_lossy()
@@ -301,18 +321,16 @@ fn string(raw: u64) -> String {
 #[repr(C)]
 pub(crate) struct RawKey {
     pub value: u64,
-    pub string: u64,
+    pub kind: u64,
 }
 unsafe fn keys(raw: *const RawKey, len: u64) -> Vec<Key> {
     // The compiler emits a properly aligned array with exactly len initialized entries.
     unsafe { std::slice::from_raw_parts(raw, len as usize) }
         .iter()
-        .map(|k| {
-            if k.string == 0 {
-                Key::Number(k.value as i64)
-            } else {
-                Key::String(string(k.value))
-            }
+        .map(|k| match k.kind {
+            0 => Key::Number(k.value as i64),
+            1 => Key::String(string(k.value)),
+            _ => Key::Stack(string(k.value)),
         })
         .collect()
 }
@@ -408,4 +426,37 @@ pub(crate) unsafe extern "C" fn stopped(state: *mut State<'_>) -> u64 {
 }
 pub(crate) unsafe extern "C" fn streq(a: *const c_char, b: *const c_char) -> u64 {
     unsafe { (CStr::from_ptr(a).to_bytes() == CStr::from_ptr(b).to_bytes()) as u64 }
+}
+
+pub(crate) unsafe extern "C" fn ustack(
+    state: *mut State<'_>,
+    event: *const Event<'_>,
+    depth: u64,
+) -> u64 {
+    let state = unsafe { &mut *state };
+    let event = unsafe { &*event };
+    let frames =
+        unsafe { std::slice::from_raw_parts(event.stack, (event.stack_len.min(depth)) as usize) };
+    let text = state.symbols.stack(event.pid as u32, frames);
+    // ELF names and proc paths can contain NULs. Keep them out of the C ABI.
+    let text = CString::new(text.replace('\0', "\\0")).unwrap();
+    let pointer = text.as_ptr() as u64;
+    state.stack_strings.push(text);
+    pointer
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn stack_fields_and_key_tags_match_the_llvm_abi() {
+        assert_eq!(std::mem::offset_of!(Event<'_>, stack), 64);
+        assert_eq!(std::mem::offset_of!(Event<'_>, stack_len), 72);
+        assert_eq!(std::mem::size_of::<RawKey>(), 16);
+        assert_eq!(std::mem::offset_of!(RawKey, kind), 8);
+        assert_eq!(
+            [Type::Number as u64, Type::String as u64, Type::Stack as u64],
+            [0, 1, 2]
+        );
+    }
 }

@@ -8,5 +8,6 @@ pub mod language;
 mod llvm;
 pub mod perf;
 pub mod runtime;
+mod symbols;
 
 pub type Result<T> = std::result::Result<T, String>;

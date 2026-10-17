@@ -31,6 +31,7 @@ pub struct Sample {
     pub time: u64,
     pub ip: u64,
     pub period: u64,
+    pub callchain: Vec<u64>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Record {
@@ -47,17 +48,27 @@ pub struct PerfEvent {
     offset: usize,
     size: usize,
     tail: u64,
+    callchain: bool,
 }
 impl PerfEvent {
     pub fn open(tid: i32, probe: &Probe, pages: usize) -> Result<Self> {
-        Self::open_inner(tid, probe, pages, false)
+        Self::open_inner(tid, probe, pages, false, false)
     }
     /// Leave the event disabled until the target calls exec, excluding the
     /// launcher's setup work between fork and exec from command measurements.
     pub fn open_on_exec(tid: i32, probe: &Probe, pages: usize) -> Result<Self> {
-        Self::open_inner(tid, probe, pages, true)
+        Self::open_inner(tid, probe, pages, true, false)
     }
-    fn open_inner(tid: i32, probe: &Probe, pages: usize, on_exec: bool) -> Result<Self> {
+    pub fn open_with_ustack(tid: i32, probe: &Probe, pages: usize, on_exec: bool) -> Result<Self> {
+        Self::open_inner(tid, probe, pages, on_exec, true)
+    }
+    fn open_inner(
+        tid: i32,
+        probe: &Probe,
+        pages: usize,
+        on_exec: bool,
+        callchain: bool,
+    ) -> Result<Self> {
         if tid <= 0 {
             return Err("perf target TID must be positive".into());
         }
@@ -78,7 +89,7 @@ impl PerfEvent {
             size: size_of::<Attr>() as u32,
             config: *config,
             sample_period: *period,
-            sample_type: SAMPLE_TYPE,
+            sample_type: SAMPLE_TYPE | if callchain { 1 << 5 } else { 0 },
             // Per-thread, user-mode only, initially disabled. Inherit is deliberately
             // off: inherited events with cpu=-1 cannot use an mmap sample buffer.
             flags: 1
@@ -86,6 +97,7 @@ impl PerfEvent {
                 | (1 << 6)
                 | (1 << 9)
                 | if *frequency { 1 << 10 } else { 0 }
+                | if callchain { 1 << 21 } else { 0 }
                 | if on_exec { 1 << 12 } else { 0 },
             wakeup_events: 1,
             ..Attr::default()
@@ -129,6 +141,7 @@ impl PerfEvent {
             offset: page_size,
             size: pages * page_size,
             tail: 0,
+            callchain,
         };
         // UAPI offsets in perf_event_mmap_page are architecture independent.
         let offset = unsafe { event.base().add(1040).cast::<u64>().read_volatile() } as usize;
@@ -185,7 +198,7 @@ impl PerfEvent {
             }
             let mut bytes = vec![0; size];
             self.copy(self.tail, &mut bytes);
-            records.push(decode(&bytes)?);
+            records.push(decode(&bytes, self.callchain)?);
             self.tail = self.tail.wrapping_add(size as u64);
         }
         // The kernel must not reuse these bytes until all our reads complete.
@@ -238,7 +251,7 @@ fn open_error(tid: i32, error: io::Error) -> String {
     )
 }
 
-fn decode(bytes: &[u8]) -> Result<Record> {
+fn decode(bytes: &[u8], callchain: bool) -> Result<Record> {
     if bytes.len() < 8 {
         return Err("short perf header".into());
     }
@@ -250,14 +263,42 @@ fn decode(bytes: &[u8]) -> Result<Record> {
     let u64_at = |i| u64::from_ne_bytes(bytes[i..i + 8].try_into().unwrap());
     let u32_at = |i| u32::from_ne_bytes(bytes[i..i + 4].try_into().unwrap());
     match kind {
-        9 if bytes.len() >= 48 => Ok(Record::Sample(Sample {
-            ip: u64_at(8),
-            pid: u32_at(16),
-            tid: u32_at(20),
-            time: u64_at(24),
-            cpu: u32_at(32),
-            period: u64_at(40),
-        })),
+        9 if bytes.len() >= 48 => {
+            let mut frames = Vec::new();
+            if callchain {
+                if bytes.len() < 56 {
+                    return Err("truncated perf callchain".into());
+                }
+                let count = u64_at(48);
+                if count > ((bytes.len() - 56) / 8) as u64 || bytes.len() - 56 != count as usize * 8
+                {
+                    return Err("invalid perf callchain length".into());
+                }
+                let mut user = true;
+                for frame in bytes[56..].chunks_exact(8) {
+                    let ip = u64::from_ne_bytes(frame.try_into().unwrap());
+                    if ip >= (-4095i64) as u64 {
+                        user = ip == (-512i64) as u64; // PERF_CONTEXT_USER
+                    } else if user && ip != 0 && frames.len() < 127 {
+                        frames.push(ip);
+                    }
+                }
+                if frames.is_empty() && u64_at(8) != 0 {
+                    frames.push(u64_at(8));
+                }
+            } else if bytes.len() != 48 {
+                return Err("invalid perf sample length".into());
+            }
+            Ok(Record::Sample(Sample {
+                ip: u64_at(8),
+                pid: u32_at(16),
+                tid: u32_at(20),
+                time: u64_at(24),
+                cpu: u32_at(32),
+                period: u64_at(40),
+                callchain: frames,
+            }))
+        }
         2 if bytes.len() >= 24 => Ok(Record::Lost(u64_at(16))),
         13 if bytes.len() >= 16 => Ok(Record::Lost(u64_at(8))),
         3 if bytes.len() >= 17 => {
@@ -298,25 +339,26 @@ mod tests {
         p.extend(0u32.to_ne_bytes());
         p.extend(100u64.to_ne_bytes());
         assert_eq!(
-            decode(&record(9, &p)).unwrap(),
+            decode(&record(9, &p), false).unwrap(),
             Record::Sample(Sample {
                 ip: 0x1234,
                 pid: 10,
                 tid: 11,
                 time: 55,
                 cpu: 3,
-                period: 100
+                period: 100,
+                callchain: vec![],
             })
         );
         assert_eq!(
-            decode(&record(
-                2,
-                &[0u64.to_ne_bytes(), 7u64.to_ne_bytes()].concat()
-            ))
+            decode(
+                &record(2, &[0u64.to_ne_bytes(), 7u64.to_ne_bytes()].concat()),
+                false
+            )
             .unwrap(),
             Record::Lost(7)
         );
-        assert!(decode(&record(9, &[])).is_err());
+        assert!(decode(&record(9, &[]), false).is_err());
     }
     #[test]
     fn command_names_and_malformed_records() {
@@ -325,7 +367,7 @@ mod tests {
         payload.extend(11u32.to_ne_bytes());
         payload.extend(b"worker\0\0");
         assert_eq!(
-            decode(&record(3, &payload)).unwrap(),
+            decode(&record(3, &payload), false).unwrap(),
             Record::Comm {
                 pid: 10,
                 tid: 11,
@@ -333,11 +375,11 @@ mod tests {
             }
         );
         payload.truncate(14); // no terminator
-        assert!(decode(&record(3, &payload)).is_err());
-        assert!(decode(&[0; 4]).is_err());
+        assert!(decode(&record(3, &payload), false).is_err());
+        assert!(decode(&[0; 4], false).is_err());
         let mut bad_size = record(13, &42u64.to_ne_bytes());
         bad_size[6] = 0;
-        assert!(decode(&bad_size).is_err());
+        assert!(decode(&bad_size, false).is_err());
     }
     #[test]
     fn wrapped_ring_and_tail_publication() {
@@ -361,6 +403,7 @@ mod tests {
             offset: 4096,
             size: 4096,
             tail: 4092,
+            callchain: false,
         };
         let bytes = record(13, &42u64.to_ne_bytes());
         for (i, b) in bytes.iter().enumerate() {
@@ -379,5 +422,48 @@ mod tests {
     fn attr_matches_version_zero_abi() {
         assert_eq!(size_of::<Attr>(), 64);
         assert_eq!(std::mem::offset_of!(Attr, flags), 40);
+    }
+
+    #[test]
+    fn user_callchains_are_bounded_and_context_markers_are_not_frames() {
+        let mut payload = vec![0; 40];
+        payload[..8].copy_from_slice(&0x1234u64.to_ne_bytes());
+        let ips = [
+            (-128i64) as u64,
+            0xffff_0000_0000_1234,
+            (-512i64) as u64,
+            0x1234,
+            0x2345,
+            0,
+        ];
+        payload.extend((ips.len() as u64).to_ne_bytes());
+        for ip in ips {
+            payload.extend(ip.to_ne_bytes());
+        }
+        let Record::Sample(sample) = decode(&record(9, &payload), true).unwrap() else {
+            panic!()
+        };
+        assert_eq!(sample.callchain, [0x1234, 0x2345]);
+        assert!(decode(&record(9, &payload), false).is_err());
+        payload[40..48].copy_from_slice(&u64::MAX.to_ne_bytes());
+        assert!(decode(&record(9, &payload), true).is_err());
+        payload.truncate(40);
+        assert!(decode(&record(9, &payload), true).is_err());
+        payload.extend(0u64.to_ne_bytes());
+        let Record::Sample(sample) = decode(&record(9, &payload), true).unwrap() else {
+            panic!()
+        };
+        assert_eq!(sample.callchain, [0x1234]);
+        payload.truncate(40);
+        payload.extend(200u64.to_ne_bytes());
+        for _ in 0..200 {
+            payload.extend(0x1234u64.to_ne_bytes());
+        }
+        let Record::Sample(sample) = decode(&record(9, &payload), true).unwrap() else {
+            panic!()
+        };
+        assert_eq!(sample.callchain.len(), 127);
+        payload.pop();
+        assert!(decode(&record(9, &payload), true).is_err());
     }
 }

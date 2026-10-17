@@ -32,6 +32,11 @@ fn begin_end_and_compilation_modes() {
     assert!(out.status.success());
     assert!(output(&out).contains("define void @probe_0"));
     assert!(trace(&["--list"]).status.success());
+    let out = trace(&["--check", "-e", "profile:hz:99 { @[ustack] = count(); }"]);
+    assert!(out.status.success(), "{}", errors(&out));
+    let out = trace(&["-q", "-e", r#"BEGIN { printf("%s", ustack); }"#]);
+    assert!(out.status.success(), "{}", errors(&out));
+    assert!(output(&out).contains("<no user stack>"));
 }
 
 #[test]
@@ -167,4 +172,47 @@ fn live_perf_launch_and_existing_pid() {
     workload.wait().unwrap();
     assert!(out.status.success(), "{}", errors(&out));
     assert!(output(&out).contains("@[\"sh\"]:"), "{}", output(&out));
+}
+
+#[test]
+#[ignore = "requires host permission for unprivileged software perf sampling"]
+fn live_user_stack_capture_and_resolution() {
+    let directory = std::env::temp_dir().join(format!("poortrace-stack-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let binary = directory.join("stack-fixture");
+    let compile = Command::new("cc")
+        .args([
+            "-O1",
+            "-fno-omit-frame-pointer",
+            "-mno-omit-leaf-frame-pointer",
+            "-fno-optimize-sibling-calls",
+            "-fPIE",
+            "-pie",
+        ])
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/stack.c"
+        ))
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .unwrap();
+    assert!(compile.status.success(), "{}", errors(&compile));
+    let out = trace(&[
+        "-q",
+        "-d",
+        "0.3",
+        "-e",
+        "profile:hz:99 { @[ustack(8)] = count(); }",
+        "--",
+        binary.to_str().unwrap(),
+    ]);
+    std::fs::remove_dir_all(directory).unwrap();
+    assert!(out.status.success(), "{}", errors(&out));
+    let text = output(&out);
+    assert!(text.contains("@[\n    "), "{text}");
+    assert!(text.contains("/"), "expected resolved module paths: {text}");
+    assert!(text.contains("stack_leaf+0x"), "{text}");
+    assert!(text.contains("stack_caller+0x"), "{text}");
+    assert!(!text.contains("<no user stack>"), "{text}");
 }
