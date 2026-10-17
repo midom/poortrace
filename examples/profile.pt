@@ -1,0 +1,3 @@
+BEGIN { printf("Sampling target PID %d; Ctrl-C to stop\n", pid); }
+profile:hz:99 { @[comm, ip] = count(); }
+END { printf("Finished\n"); }
