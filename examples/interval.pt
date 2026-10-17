@@ -1,0 +1,6 @@
+interval:ms:100 {
+    @ticks++;
+    printf("tick %d\n", @ticks);
+    if (@ticks == 5) { exit(); }
+}
+END { printf("Done\n"); }

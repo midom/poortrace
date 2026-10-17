@@ -1,0 +1,2 @@
+software:page-faults:100 { @[comm, tid] = count(); }
+interval:s:1 { print(@); clear(@); }

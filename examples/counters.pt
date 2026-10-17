@@ -1,0 +1,2 @@
+hardware:instructions:1000000 { @samples[comm] = count(); @instructions = sum(period); }
+hardware:cache-misses:10000 { @miss_samples[comm] = count(); }

@@ -1,0 +1,16 @@
+[package]
+name = "poortrace"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A bpftrace-inspired userspace LLVM JIT tracer for unprivileged Linux perf events"
+license = "MIT"
+build = "build.rs"
+
+[dependencies]
+libc = "0.2"
+clap = { version = "4.5", features = ["derive"] }
+
+[profile.release]
+lto = "thin"
+

@@ -1,0 +1,18 @@
+name: Rust
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: sudo apt-get update && sudo apt-get install -y llvm-18-dev
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+        env:
+          LLVM_CONFIG: llvm-config-18
+      - run: cargo test --locked
+        env:
+          LLVM_CONFIG: llvm-config-18
