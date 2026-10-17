@@ -43,6 +43,7 @@ pub struct UserRegs {
 }
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Capture {
+    pub ptrace_functions: bool,
     pub callchain: bool,
     pub dwarf_stack: u32,
     pub branches: bool,
@@ -124,8 +125,20 @@ impl PerfEvent {
         probe: &Probe,
         pages: usize,
         on_exec: bool,
-        mut capture: Capture,
+        capture: Capture,
     ) -> Result<Self> {
+        Self::try_open_config(tid, probe, pages, on_exec, capture)?
+            .ok_or_else(|| format!("perf target TID {tid} exited during attachment"))
+    }
+    /// None means the task exited during the perf syscall, including the window
+    /// where /proc still exposes a dying task but perf rejects it with ESRCH.
+    pub fn try_open_config(
+        tid: i32,
+        probe: &Probe,
+        pages: usize,
+        on_exec: bool,
+        mut capture: Capture,
+    ) -> Result<Option<Self>> {
         if tid <= 0 {
             return Err("perf target TID must be positive".into());
         }
@@ -256,6 +269,9 @@ impl PerfEvent {
         };
         if fd < 0 {
             let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                return Ok(None);
+            }
             if capture.uprobe && matches!(error.raw_os_error(), Some(libc::EACCES | libc::EPERM)) {
                 return Err(format!(
                     "dynamic perf uprobes require privileged kernel access (commonly CAP_SYS_ADMIN); use --uprobe-backend ptrace for unprivileged function probes: {}",
@@ -307,7 +323,7 @@ impl PerfEvent {
         {
             return Err("invalid perf ring metadata".into());
         }
-        Ok(event)
+        Ok(Some(event))
     }
     fn base(&self) -> *mut u8 {
         self.mapping.as_ptr().cast()

@@ -19,10 +19,17 @@ jobs:
       - run: cargo test --locked --features '${{ matrix.features }}'
         env:
           LLVM_CONFIG: llvm-config-18
-      - name: Unprivileged ptrace function and syscall tests
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Native ptrace, SDT, typed argument, CPython, and Node tests
         run: |
           cargo test --locked --features '${{ matrix.features }}' --test cli live_uprobes -- --ignored
           cargo test --locked --features '${{ matrix.features }}' --test cli live_syscalls -- --ignored
+          cargo test --locked --features '${{ matrix.features }}' --test cli live_process_tree -- --ignored
+          cargo test --locked --features '${{ matrix.features }}' --test cli live_usdt -- --ignored
+          cargo test --locked --features '${{ matrix.features }}' --test cli live_python -- --ignored
+          cargo test --locked --features '${{ matrix.features }}' --test cli live_node -- --ignored
         env:
           LLVM_CONFIG: llvm-config-18
   fully-static:
@@ -36,6 +43,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: sudo apt-get update && sudo apt-get install -y llvm-18-dev zlib1g-dev libzstd-dev libtinfo-dev libxml2-dev
       - run: cargo test --locked
+      - run: cargo test --locked --test cli live_process_tree -- --ignored
+      - run: cargo test --locked --test cli live_usdt -- --ignored
       - run: cargo build --release --locked
       - name: Verify static executable and JIT
         run: |

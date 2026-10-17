@@ -619,3 +619,361 @@ fn live_uprobes_restore_attached_text_and_launch_gate() {
     assert!(!output(&out).contains("total="), "{}", output(&out));
     std::fs::remove_dir_all(directory).unwrap();
 }
+
+#[test]
+fn recording_roundtrip_and_corrupt_helper_types() {
+    let directory =
+        std::env::temp_dir().join(format!("poortrace-recording-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("events.jsonl");
+    let path = path.to_str().unwrap();
+    let script = r#"fn label($s)=strcat($s,"!"); BEGIN { $s=label("record"); repeat(3){ @calls[$s]++; } printf("%s %d\n",$s,strlen($s)); } END {printf("end\n");}"#;
+    let live = trace(&["-q", "--record", path, "-e", script]);
+    assert!(live.status.success(), "{}", errors(&live));
+    let replay = trace(&["-q", "--replay", path]);
+    assert!(replay.status.success(), "{}", errors(&replay));
+    assert_eq!(output(&live), output(&replay));
+    let data = std::fs::read_to_string(path).unwrap();
+    let mut lines: Vec<serde_json::Value> = data
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    lines[1]["helpers"][0]["text"] = serde_json::Value::Null;
+    std::fs::write(
+        path,
+        lines
+            .into_iter()
+            .map(|line| line.to_string() + "\n")
+            .collect::<String>(),
+    )
+    .unwrap();
+    let out = trace(&["--replay", path]);
+    assert_eq!(out.status.code(), Some(1), "{}", errors(&out));
+    assert!(errors(&out).contains("wrong type"), "{}", errors(&out));
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+#[ignore = "requires ptrace, perf software sampling, and C compiler"]
+fn live_mixed_probes_forks_and_discovery() {
+    native_tree_cases("mixed", true);
+}
+#[test]
+#[ignore = "requires ptrace and C compiler"]
+fn live_process_tree_exec_and_wakeups() {
+    native_tree_cases("tree", false);
+}
+fn native_tree_cases(label: &str, perf: bool) {
+    let (directory, binary) = compile_functions(label);
+    let path = binary.to_str().unwrap();
+    let listing = trace(&["--list-functions", path, "--function-filter", "traced_*"]);
+    assert!(listing.status.success(), "{}", errors(&listing));
+    assert!(output(&listing).contains("traced_add"));
+    let script = format!(
+        "uprobe:{path:?}:traced_a* {{ @calls=count(); }} uretprobe:{path:?}:traced_add {{ @returns=sum(retval); }} syscall:enter:write {{ @writes=count(); @stack[ustack(3)]=count(); }} software:cpu-clock:100000 {{ @samples=count(); }}"
+    );
+    let script = if perf {
+        script
+    } else {
+        script.replace(" software:cpu-clock:100000 { @samples=count(); }", "")
+    };
+    for (mode, calls, returns) in [
+        ("fork", 6, 132),
+        ("threads", 9, 198),
+        ("shared", 6, 132),
+        ("vfork", 3, 66),
+    ] {
+        let out = trace(&["-q", "-f", "-d", "5", "-e", &script, "--", path, mode]);
+        assert!(out.status.success(), "{mode}: {}", errors(&out));
+        let text = output(&out);
+        assert!(text.contains(&format!("@calls: {calls}")), "{mode}: {text}");
+        assert!(
+            text.contains(&format!("@returns: {returns}")),
+            "{mode}: {text}"
+        );
+        assert!(!text.contains("<no user stack>"), "{text}");
+    }
+    for (mode, code) in [("orphan-exec", 7), ("thread-exec", 0)] {
+        let script = format!(
+            "uprobe:{path:?}:traced_add {{ @calls=count(); }} syscall:enter:write {{ @writes=count(); }}"
+        );
+        let out = trace(&["-q", "-f", "-d", "5", "-e", &script, "--", path, mode]);
+        assert_eq!(out.status.code(), Some(code), "{mode}: {}", errors(&out));
+        assert!(
+            output(&out).contains("@calls: 3"),
+            "{mode}: {}",
+            output(&out)
+        );
+    }
+    let out = trace(&[
+        "-q",
+        "-f",
+        "-d",
+        "0.2",
+        "-e",
+        "syscall:enter:write { @writes=count(); }",
+        "--",
+        path,
+        "orphan-sleep",
+    ]);
+    assert_eq!(out.status.code(), Some(7), "{}", errors(&out));
+    let text = output(&out);
+    let pid = text
+        .lines()
+        .find_map(|line| line.strip_prefix("orphan="))
+        .unwrap()
+        .parse::<i32>()
+        .unwrap();
+    assert!(
+        !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        "owned orphan {pid} was not reaped: {text}"
+    );
+    let out = trace(&[
+        "-q",
+        "-e",
+        "wakeup:ms:2 { @observed=count(); @time=hist(latency); }",
+        "--",
+        path,
+        "wait",
+    ]);
+    assert!(out.status.success(), "{}", errors(&out));
+    assert!(output(&out).contains("@observed:"), "{}", output(&out));
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+#[ignore = "requires ptrace and C compiler"]
+fn live_usdt_and_typed_arguments() {
+    let directory = std::env::temp_dir().join(format!("poortrace-typed-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    for fixture in ["usdt", "typed"] {
+        let binary = directory.join(fixture);
+        let source = format!("{}/tests/fixtures/{fixture}.c", env!("CARGO_MANIFEST_DIR"));
+        let compile = Command::new("cc")
+            .args(["-g", "-O1", "-no-pie", &source, "-o"])
+            .arg(&binary)
+            .output()
+            .unwrap();
+        assert!(compile.status.success(), "{}", errors(&compile));
+        let path = binary.to_str().unwrap();
+        let script = if fixture == "usdt" {
+            format!(
+                "usdt:{path}:poortrace:* {{ @calls=count(); @sum=sum(arg0); @small=sum(arg1); @memory=sum(arg2); }}"
+            )
+        } else {
+            format!(
+                "uprobe:{path}:inspect {{ @quantity=field(arg0,\"Payload\",\"quantity\"); @nested=field(arg0,\"Payload\",\"nested.value\"); printf(\"ratio=%s\\n\",fieldstr(arg0,\"Payload\",\"ratio\")); }} uprobe:{path}:floating {{ printf(\"args=%s,%s\\n\",farg(0,\"f64\"),farg(1,\"f32\")); }} uprobe:{path}:stack_words {{ @stackword=sarg(0); }}"
+            )
+        };
+        let out = trace(&[
+            "-q",
+            "-d",
+            "5",
+            "--record",
+            directory.join("capture.jsonl").to_str().unwrap(),
+            "-e",
+            &script,
+            "--",
+            path,
+        ]);
+        assert!(out.status.success(), "{fixture}: {}", errors(&out));
+        let text = output(&out);
+        if fixture == "usdt" {
+            assert!(
+                text.contains("@calls: 3")
+                    && text.contains("@sum: 6")
+                    && text.contains("semaphore=1")
+                    && text.contains("@small: -15")
+                    && text.contains("@memory: -297"),
+                "{text}"
+            );
+        } else {
+            for expected in [
+                "@quantity: -7",
+                "@nested: 42",
+                "ratio=1.25",
+                "args=1.25,1.5",
+            ] {
+                assert!(text.contains(expected), "{expected}: {text}");
+            }
+            #[cfg(target_arch = "x86_64")]
+            assert!(text.contains("@stackword: 7"), "{text}");
+            #[cfg(target_arch = "aarch64")]
+            assert!(text.contains("@stackword: 9"), "{text}");
+        }
+        let replay = trace(&[
+            "-q",
+            "--replay",
+            directory.join("capture.jsonl").to_str().unwrap(),
+        ]);
+        assert!(replay.status.success(), "{}", errors(&replay));
+        if fixture == "usdt" {
+            use std::io::BufRead;
+            struct Target(std::process::Child);
+            impl Drop for Target {
+                fn drop(&mut self) {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+            let mut target = Target(
+                Command::new(path)
+                    .arg("attach")
+                    .stdout(Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            );
+            let mut reader = std::io::BufReader::new(target.0.stdout.take().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let address = u64::from_str_radix(line.trim(), 16).unwrap();
+            let out = trace(&[
+                "-q",
+                "-d",
+                "0.05",
+                "-p",
+                &target.0.id().to_string(),
+                "-e",
+                &script,
+            ]);
+            assert!(out.status.success(), "{}", errors(&out));
+            let bytes = poortrace::memory::read(target.0.id(), address, 2, false).unwrap();
+            assert_eq!(u16::from_ne_bytes(bytes.try_into().unwrap()), 0);
+            assert!(target.0.try_wait().unwrap().is_none());
+        }
+    }
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+#[ignore = "requires CPython 3.12 and ptrace"]
+fn live_python_frames_and_wait_snapshots() {
+    let code =
+        "import os\ndef leaf():\n os.write(1,b'MARKER\\n')\ndef caller():\n leaf()\ncaller()";
+    let out = trace(&[
+        "-q",
+        "-d",
+        "10",
+        "-e",
+        "syscall:enter:write { printf(\"%s\",pystack); }",
+        "--",
+        "/usr/bin/python3.12",
+        "-c",
+        code,
+    ]);
+    assert!(out.status.success(), "{}", errors(&out));
+    let text = output(&out);
+    assert!(
+        text.contains("leaf (") && text.contains("caller ("),
+        "{text}"
+    );
+    let out = trace(&[
+        "-q",
+        "-e",
+        "wait:ms:5 { @wait[wait_reason]=count(); }",
+        "--",
+        "/bin/sleep",
+        "0.1",
+    ]);
+    assert!(out.status.success(), "{}", errors(&out));
+    assert!(
+        output(&out).contains("syscall=clock_nanosleep"),
+        "{}",
+        output(&out)
+    );
+}
+
+#[test]
+#[ignore = "requires Node 22 (V8 12.4) and ptrace"]
+fn live_node_javascript_frames_and_replay() {
+    let node = std::process::Command::new("node")
+        .args(["-p", "process.execPath"])
+        .output()
+        .expect("Node must be installed for this opt-in test");
+    assert!(node.status.success());
+    let node = String::from_utf8(node.stdout).unwrap();
+    let node = node.trim();
+    let directory = std::env::temp_dir().join(format!("poortrace-node-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("events.jsonl");
+    let path = path.to_str().unwrap();
+    let code = r#"const fs=require('fs'); function leaf(){fs.writeSync(1,'MARKER\n');} function caller(){leaf();} caller();"#;
+    for flags in [vec![], vec!["--jitless"], vec!["--allow-natives-syntax"]] {
+        let optimized = r#"const fs=require('fs'); const fd=fs.openSync('/dev/null','w'); function leaf(fd){fs.writeSync(fd,'MARKER\n');} function caller(){leaf(1);} %PrepareFunctionForOptimization(leaf); for(let i=0;i<30;i++)leaf(fd); %OptimizeFunctionOnNextCall(leaf); caller();"#;
+        let code = if flags.contains(&"--allow-natives-syntax") {
+            optimized
+        } else {
+            code
+        };
+        let mut args = vec![
+            "-q",
+            "--record",
+            path,
+            "-e",
+            "syscall:enter:write /arg0 == 1/ { printf(\"%s\",jsstack); @frames[jsstack(2)]=count(); }",
+            "--",
+            node,
+        ];
+        args.extend(flags);
+        args.extend(["-e", code]);
+        let live = trace(&args);
+        assert!(live.status.success(), "{}", errors(&live));
+        let text = output(&live);
+        assert!(
+            text.contains("leaf ([eval])") && text.contains("caller ([eval])"),
+            "{text}"
+        );
+        let replay = trace(&["-q", "--replay", path]);
+        assert!(replay.status.success(), "{}", errors(&replay));
+        assert_eq!(text.replace("MARKER\n", ""), output(&replay));
+    }
+    let worker = trace(&[
+        "-q",
+        "--track-threads",
+        "-e",
+        "syscall:enter:write /arg0==1/ { printf(\"%s\",jsstack); }",
+        "--",
+        node,
+        "-e",
+        r#"const {Worker}=require('worker_threads');new Worker(String.raw`function workerLeaf(){require('fs').writeSync(1,'WORKER\n')} function workerCaller(){workerLeaf()} workerCaller()`,{eval:true});"#,
+    ]);
+    assert!(worker.status.success(), "{}", errors(&worker));
+    let text = output(&worker);
+    assert!(
+        text.contains("workerLeaf (") && text.contains("workerCaller ("),
+        "{text}"
+    );
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+#[ignore = "requires Node 22 (V8 12.4) and software perf sampling"]
+fn live_perf_node_javascript_frames() {
+    let node = std::process::Command::new("node")
+        .args(["-p", "process.execPath"])
+        .output()
+        .unwrap();
+    assert!(node.status.success());
+    let node = String::from_utf8(node.stdout).unwrap();
+    let node = node.trim();
+    // Perf uses the sampled FP and stack bytes, rather than ptrace registers.
+    let sampled = trace(&[
+        "-q",
+        "-d",
+        "2",
+        "--mmap-pages",
+        "128",
+        "-e",
+        "profile:hz:49 { @frames[jsstack(12)]=count(); }",
+        "--",
+        node,
+        "-e",
+        "function leaf(){let x=0;for(let i=0;i<50000000;i++)x+=Math.sqrt(i);return x;} function caller(){while(true)leaf();} caller();",
+    ]);
+    assert!(sampled.status.success(), "{}", errors(&sampled));
+    let text = output(&sampled);
+    assert!(
+        text.contains("leaf ([eval])") && text.contains("caller ([eval])"),
+        "{text}"
+    );
+}

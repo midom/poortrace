@@ -1,0 +1,8 @@
+fn label($name) = strcat($name, "!");
+fn twice($value) = $value * 2;
+BEGIN {
+    $name = label("worker");
+    $i = 0;
+    repeat(4) { $values[$i] = twice($i + 1); $i++; }
+    printf("%s %d\n", $name, $values[3]);
+}

@@ -13,6 +13,7 @@ pub struct Spec {
     pub ret: bool,
 }
 struct Binding {
+    usdt: Option<crate::usdt::Site>,
     offset: u64,
     inode: u64,
     device: u64,
@@ -30,10 +31,12 @@ struct Identity {
     device: u64,
     offset: u64,
 }
+#[derive(Clone)]
 struct Word {
     original: u64,
     identity: Identity,
 }
+#[derive(Clone)]
 struct Call {
     binding: usize,
     address: u64,
@@ -44,6 +47,7 @@ struct Call {
 #[derive(Clone, Debug)]
 pub struct Event {
     pub binding: usize,
+    pub syscall: Option<crate::syscall::Event>,
     pub tid: i32,
     pub args: [u64; 6],
     pub retval: i64,
@@ -207,8 +211,25 @@ fn trap_address(ip: u64) -> Option<u64> {
     Some(ip)
 }
 
+#[derive(Clone)]
+struct Semaphore {
+    site: u64,
+    identity: Identity,
+}
+#[derive(Clone, Default)]
+struct AddressSpace {
+    semaphores: BTreeMap<u64, Semaphore>,
+    words: BTreeMap<u64, Word>,
+    breakpoints: BTreeMap<u64, Breakpoint>,
+    active: bool,
+    unresolved: bool,
+}
 pub struct Tracer {
     pid: i32,
+    root: i32,
+    follow: bool,
+    spaces: BTreeMap<i32, AddressSpace>,
+    owners: BTreeMap<i32, i32>,
     bindings: Vec<Binding>,
     tids: BTreeSet<i32>,
     stopped: BTreeSet<i32>,
@@ -216,6 +237,7 @@ pub struct Tracer {
     listening: BTreeSet<i32>,
     pending: VecDeque<(i32, i32)>,
     signals: BTreeMap<i32, i32>,
+    semaphores: BTreeMap<u64, Semaphore>,
     words: BTreeMap<u64, Word>,
     breakpoints: BTreeMap<u64, Breakpoint>,
     calls: BTreeMap<i32, Vec<Call>>,
@@ -223,6 +245,9 @@ pub struct Tracer {
     vfork: BTreeMap<i32, i32>,
     foreign: BTreeSet<i32>,
     active: bool,
+    syscalls: bool,
+    decoder: crate::syscall::Decoder,
+    discovered: Vec<i32>,
     unresolved: bool,
     refreshed: Instant,
     pub exits: BTreeMap<i32, i32>,
@@ -243,6 +268,7 @@ impl Tracer {
             let path = resolved.path.to_str().map_err(|e| e.to_string())?;
             let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
             bindings.push(Binding {
+                usdt: crate::usdt::encoded(&spec.function)?,
                 offset: resolved.offset,
                 inode: meta.ino(),
                 device: meta.dev(),
@@ -251,6 +277,10 @@ impl Tracer {
         }
         let mut tracer = Self {
             pid,
+            root: pid,
+            follow: false,
+            spaces: BTreeMap::new(),
+            owners: BTreeMap::from([(pid, pid)]),
             bindings,
             tids: BTreeSet::new(),
             stopped: BTreeSet::new(),
@@ -258,6 +288,7 @@ impl Tracer {
             listening: BTreeSet::new(),
             pending: VecDeque::new(),
             signals: BTreeMap::new(),
+            semaphores: BTreeMap::new(),
             words: BTreeMap::new(),
             breakpoints: BTreeMap::new(),
             calls: BTreeMap::new(),
@@ -265,6 +296,9 @@ impl Tracer {
             vfork: BTreeMap::new(),
             foreign: BTreeSet::new(),
             active: !launched,
+            syscalls: false,
+            decoder: crate::syscall::Decoder::default(),
+            discovered: Vec::new(),
             unresolved: true,
             refreshed: Instant::now(),
             exits: BTreeMap::new(),
@@ -286,6 +320,49 @@ impl Tracer {
         }
         Ok(tracer)
     }
+    pub fn take_discovered(&mut self) -> Vec<i32> {
+        std::mem::take(&mut self.discovered)
+    }
+    pub fn follow_forks(&mut self, follow: bool) {
+        self.follow = follow;
+    }
+    fn snapshot(&self) -> AddressSpace {
+        AddressSpace {
+            semaphores: self.semaphores.clone(),
+            words: self.words.clone(),
+            breakpoints: self.breakpoints.clone(),
+            active: self.active,
+            unresolved: self.unresolved,
+        }
+    }
+    fn select(&mut self, tid: i32) {
+        if !self.follow {
+            return;
+        }
+        let group = tgid(tid).unwrap_or(tid);
+        let owner = *self.owners.get(&group).unwrap_or(&group);
+        if owner == self.pid {
+            return;
+        }
+        self.spaces.insert(self.pid, self.snapshot());
+        let state = self.spaces.remove(&owner).unwrap_or(AddressSpace {
+            active: true,
+            unresolved: true,
+            ..Default::default()
+        });
+        self.pid = owner;
+        self.semaphores = state.semaphores;
+        self.words = state.words;
+        self.breakpoints = state.breakpoints;
+        self.active = state.active;
+        self.unresolved = state.unresolved;
+    }
+    pub fn trace_syscalls(&mut self, enabled: bool) {
+        self.syscalls = enabled;
+    }
+    pub fn targets(&self) -> BTreeSet<i32> {
+        self.tids.iter().filter_map(|tid| tgid(*tid)).collect()
+    }
     pub fn is_empty(&self) -> bool {
         self.tids.is_empty()
     }
@@ -296,9 +373,11 @@ impl Tracer {
             self.initial.remove(&tid);
             self.listening.remove(&tid);
             self.calls.remove(&tid);
-            if self.foreign.remove(&tid) {
+            let foreign = self.foreign.remove(&tid);
+            if foreign {
                 self.vfork.retain(|_, child| *child != tid);
-            } else {
+            }
+            if !foreign || self.follow {
                 self.exits.insert(
                     tid,
                     if libc::WIFEXITED(status) {
@@ -317,6 +396,18 @@ impl Tracer {
         self.stopped.insert(tid);
         self.listening.remove(&tid);
         let event = status >> 16;
+        if event == libc::PTRACE_EVENT_EXEC {
+            let mut old = 0usize;
+            control(
+                libc::PTRACE_GETEVENTMSG,
+                tid,
+                0,
+                (&mut old as *mut usize) as usize,
+            )?;
+            if old as i32 != tid {
+                self.forget(old as i32);
+            }
+        }
         if matches!(
             event,
             libc::PTRACE_EVENT_CLONE | libc::PTRACE_EVENT_FORK | libc::PTRACE_EVENT_VFORK
@@ -331,7 +422,7 @@ impl Tracer {
             self.tids.insert(child as i32);
             self.initial.insert(child as i32);
             if event != libc::PTRACE_EVENT_VFORK
-                && tgid(child as i32).is_some_and(|tgid| tgid != self.pid)
+                && tgid(child as i32).is_some_and(|tgid| tgid != self.root)
             {
                 let regs = Registers::read(tid)?;
                 let flags = if regs.syscall_number() == libc::SYS_clone {
@@ -350,8 +441,63 @@ impl Tracer {
                 self.foreign.insert(child as i32);
             }
         }
+        if self.follow
+            && matches!(
+                event,
+                libc::PTRACE_EVENT_CLONE | libc::PTRACE_EVENT_FORK | libc::PTRACE_EVENT_VFORK
+            )
+        {
+            let mut child = 0usize;
+            control(
+                libc::PTRACE_GETEVENTMSG,
+                tid,
+                0,
+                (&mut child as *mut usize) as usize,
+            )?;
+            if self.owners.len() >= 1024 {
+                return Err("followed process limit (1024) exceeded".into());
+            }
+            let child = child as i32;
+            let group = tgid(child).unwrap_or(child);
+            let parent = tgid(tid).unwrap_or(tid);
+            let parent_owner = *self.owners.get(&parent).unwrap_or(&parent);
+            if group != parent {
+                if self.foreign.contains(&child) {
+                    self.owners.insert(group, parent_owner);
+                } else {
+                    let state = if parent_owner == self.pid {
+                        self.snapshot()
+                    } else {
+                        self.spaces.get(&parent_owner).cloned().unwrap_or_default()
+                    };
+                    let mut state = state;
+                    for breakpoint in state.breakpoints.values_mut() {
+                        breakpoint.returns = 0;
+                    }
+                    if let Some(calls) = self.calls.get(&tid).cloned() {
+                        for call in &calls {
+                            if let Some(breakpoint) = state.breakpoints.get_mut(&call.address) {
+                                breakpoint.returns += 1;
+                            }
+                        }
+                        self.calls.insert(child, calls);
+                    }
+                    self.spaces.insert(group, state);
+                    self.owners.insert(group, group);
+                }
+            }
+        }
         self.pending.push_back((tid, status));
         Ok(())
+    }
+    fn forget(&mut self, tid: i32) {
+        self.tids.remove(&tid);
+        self.stopped.remove(&tid);
+        self.initial.remove(&tid);
+        self.listening.remove(&tid);
+        self.signals.remove(&tid);
+        self.calls.remove(&tid);
+        self.decoder.clear(tid);
     }
     fn stop_world(&mut self) -> Result<()> {
         for &tid in &self.tids {
@@ -368,6 +514,22 @@ impl Tracer {
                 && !self.listening.contains(tid)
                 && !self.vfork.contains_key(tid)
         }) {
+            let vanished: Vec<_> = self
+                .tids
+                .iter()
+                .filter(|tid| !std::path::Path::new(&format!("/proc/{tid}")).exists())
+                .copied()
+                .collect();
+            for tid in vanished {
+                self.forget(tid);
+            }
+            if self.tids.iter().all(|tid| {
+                self.stopped.contains(tid)
+                    || self.listening.contains(tid)
+                    || self.vfork.contains_key(tid)
+            }) {
+                break;
+            }
             let mut status = 0;
             let tid = unsafe { libc::waitpid(-1, &mut status, libc::__WALL | libc::WNOHANG) };
             if tid > 0 {
@@ -401,7 +563,14 @@ impl Tracer {
     fn memory_tid(&self) -> Result<i32> {
         self.stopped
             .iter()
-            .find(|tid| !self.foreign.contains(tid))
+            .find(|tid| {
+                if self.follow {
+                    let group = tgid(**tid).unwrap_or(**tid);
+                    self.owners.get(&group).copied().unwrap_or(group) == self.pid
+                } else {
+                    !self.foreign.contains(tid)
+                }
+            })
             .copied()
             .or_else(|| self.stopped.first().copied())
             .ok_or_else(|| "no stopped thread for breakpoint memory access".into())
@@ -493,6 +662,9 @@ impl Tracer {
             return Ok(());
         }
         let current = self.current_maps()?;
+        self.semaphores.retain(|_, semaphore| {
+            Self::identity(semaphore.site, &current) == Some(semaphore.identity)
+        });
         // Never restore stale bytes into an unmapped/replaced image.
         let stale: Vec<_> = self
             .words
@@ -524,6 +696,25 @@ impl Tracer {
                 self.unresolved = true;
             }
             for address in addresses {
+                if let Some(delta) = self.bindings[index]
+                    .usdt
+                    .as_ref()
+                    .and_then(|s| s.semaphore_delta)
+                {
+                    let semaphore = address.wrapping_add(delta as u64);
+                    if !self.semaphores.contains_key(&semaphore) {
+                        let identity =
+                            Self::identity(address, &current).ok_or("SDT site mapping vanished")?;
+                        adjust_semaphore(self.memory_tid()?, semaphore, 1)?;
+                        self.semaphores.insert(
+                            semaphore,
+                            Semaphore {
+                                site: address,
+                                identity,
+                            },
+                        );
+                    }
+                }
                 self.ensure(address)?;
                 self.breakpoints
                     .get_mut(&address)
@@ -559,7 +750,7 @@ impl Tracer {
             if self.listening.contains(&tid) {
                 control(libc::PTRACE_LISTEN, tid, 0, 0)?;
             } else {
-                let op = if !self.active || self.unresolved {
+                let op = if !self.active || self.unresolved || self.syscalls {
                     libc::PTRACE_SYSCALL
                 } else {
                     libc::PTRACE_CONT
@@ -587,6 +778,17 @@ impl Tracer {
             } else if self.active && self.refreshed.elapsed() >= Duration::from_millis(100) {
                 self.stop_world()?;
                 if !self.stopped.is_empty() {
+                    if self.follow
+                        && !self.stopped.iter().any(|tid| {
+                            tgid(*tid).is_some_and(|group| {
+                                self.owners.get(&group).copied().unwrap_or(group) == self.pid
+                            })
+                        })
+                    {
+                        if let Some(&tid) = self.stopped.first() {
+                            self.select(tid);
+                        }
+                    }
                     self.refresh()?;
                 }
             }
@@ -595,11 +797,13 @@ impl Tracer {
             if !self.tids.contains(&tid) || !self.stopped.contains(&tid) {
                 continue;
             }
+            self.select(tid);
             let initial = self.initial.remove(&tid);
             let event = status >> 16;
             let signal = libc::WSTOPSIG(status);
             if initial
-                && tgid(tid).is_some_and(|tgid| tgid != self.pid)
+                && !self.follow
+                && tgid(tid).is_some_and(|tgid| tgid != self.root)
                 && !self.foreign.contains(&tid)
             {
                 for (&address, word) in &self.words {
@@ -610,12 +814,49 @@ impl Tracer {
                         word.original as usize,
                     );
                 }
+                for &semaphore in self.semaphores.keys() {
+                    let _ = adjust_semaphore(tid, semaphore, -1);
+                }
                 control(libc::PTRACE_DETACH, tid, 0, 0)?;
                 self.tids.remove(&tid);
                 self.stopped.remove(&tid);
                 continue;
             }
             if event == libc::PTRACE_EVENT_EXEC {
+                if self.follow {
+                    let group = tgid(tid).unwrap_or(tid);
+                    // Exec creates a fresh mm even for a vfork/CLONE_VM child.
+                    let old_owner = self.owners.get(&group).copied().unwrap_or(group);
+                    if old_owner != group {
+                        self.spaces.insert(self.pid, self.snapshot());
+                        self.pid = group;
+                        self.owners.insert(group, group);
+                    } else {
+                        let aliases: Vec<_> = self
+                            .owners
+                            .iter()
+                            .filter(|(other, owner)| **other != group && **owner == old_owner)
+                            .map(|(other, _)| *other)
+                            .collect();
+                        if let Some(&keeper) = aliases.first() {
+                            self.spaces.insert(keeper, self.snapshot());
+                            for alias in aliases {
+                                self.owners.insert(alias, keeper);
+                            }
+                        }
+                    }
+                    self.foreign.remove(&tid);
+                    self.semaphores.clear();
+                    self.words.clear();
+                    self.breakpoints.clear();
+                    self.calls
+                        .retain(|task, _| tgid(*task).unwrap_or(*task) != group);
+                    self.active = true;
+                    self.unresolved = true;
+                    self.decoder.clear(tid);
+                    self.refresh()?;
+                    continue;
+                }
                 if self.foreign.remove(&tid) {
                     control(libc::PTRACE_DETACH, tid, 0, 0)?;
                     self.tids.remove(&tid);
@@ -623,9 +864,20 @@ impl Tracer {
                     continue;
                 }
                 // A non-thread CLONE_VM child can retain the old mm across our exec.
+                let mut restored_semaphores = false;
                 for child in self.foreign.clone() {
                     if self.stopped.contains(&child) {
                         if let Ok(current) = maps(child) {
+                            if !restored_semaphores {
+                                for (&address, semaphore) in &self.semaphores {
+                                    if Self::identity(semaphore.site, &current)
+                                        == Some(semaphore.identity)
+                                    {
+                                        let _ = adjust_semaphore(child, address, -1);
+                                    }
+                                }
+                                restored_semaphores = true;
+                            }
                             if let Ok(mut regs) = Registers::read(child) {
                                 if let Some(address) = trap_address(regs.user().ip)
                                     .filter(|address| self.breakpoints.contains_key(address))
@@ -656,10 +908,12 @@ impl Tracer {
                         self.foreign.remove(&child);
                     }
                 }
+                self.semaphores.clear();
                 self.words.clear();
                 self.breakpoints.clear();
                 self.calls.clear();
                 self.active = true;
+                self.decoder.clear(tid);
                 self.refresh()?;
                 continue;
             }
@@ -673,6 +927,11 @@ impl Tracer {
             ) {
                 continue;
             }
+            if initial && event == libc::PTRACE_EVENT_STOP && signal == libc::SIGTRAP {
+                self.discovered.push(tid);
+                self.pending.push_front((tid, status));
+                return Ok(Vec::new());
+            }
             if event == libc::PTRACE_EVENT_STOP {
                 if signal != libc::SIGTRAP {
                     self.listening.insert(tid);
@@ -681,7 +940,22 @@ impl Tracer {
             }
             if signal == (libc::SIGTRAP | 0x80) {
                 if self.active {
-                    self.refresh()?;
+                    if self.syscalls && (self.follow || !self.foreign.contains(&tid)) {
+                        if let Some(event) = self.decoder.stop(tid)? {
+                            return Ok(vec![Event {
+                                binding: usize::MAX,
+                                args: event.args,
+                                retval: event.retval,
+                                latency: event.latency,
+                                regs: Registers::read(tid)?.user(),
+                                tid,
+                                syscall: Some(event),
+                            }]);
+                        }
+                    }
+                    if self.unresolved {
+                        self.refresh()?;
+                    }
                 }
                 continue;
             }
@@ -701,7 +975,7 @@ impl Tracer {
                 let user = regs.user();
                 let args = regs.args();
                 let mut output = Vec::new();
-                if !self.foreign.contains(&tid) {
+                if self.follow || !self.foreign.contains(&tid) {
                     let calls = self.calls.entry(tid).or_default();
                     while calls
                         .last()
@@ -713,6 +987,7 @@ impl Tracer {
                         }
                         output.push(Event {
                             binding: call.binding,
+                            syscall: None,
                             tid,
                             args: call.args,
                             retval: regs.retval(),
@@ -747,8 +1022,13 @@ impl Tracer {
                         } else {
                             output.push(Event {
                                 binding: index,
+                                syscall: None,
                                 tid,
-                                args,
+                                args: if let Some(site) = &self.bindings[index].usdt {
+                                    sdt_arguments(tid, &regs, site)?
+                                } else {
+                                    args
+                                },
                                 retval: 0,
                                 latency: 0,
                                 regs: user,
@@ -779,6 +1059,16 @@ impl Tracer {
             let mut status = 0;
             let result = unsafe { libc::waitpid(tid, &mut status, libc::__WALL | libc::WNOHANG) };
             if result == tid {
+                // A queued PTRACE_INTERRUPT can stop SINGLESTEP before the
+                // original instruction executes. Complete the step before
+                // re-arming the breakpoint, otherwise this becomes a duplicate hit.
+                if libc::WIFSTOPPED(status)
+                    && status >> 16 == libc::PTRACE_EVENT_STOP
+                    && libc::WSTOPSIG(status) == libc::SIGTRAP
+                {
+                    control(libc::PTRACE_SINGLESTEP, tid, 0, 0)?;
+                    continue;
+                }
                 if libc::WIFSTOPPED(status)
                     && libc::WSTOPSIG(status) == libc::SIGTRAP
                     && status >> 16 == 0
@@ -837,7 +1127,8 @@ impl Tracer {
         let _ = self.stop_world();
         // Queued INT3 stops have advanced RIP. Rewind before restoring their bytes.
         let mut owned_traps = BTreeSet::new();
-        for &(tid, status) in &self.pending {
+        for (tid, status) in self.pending.clone() {
+            self.select(tid);
             if trap(tid, status) {
                 if let Ok(mut regs) = Registers::read(tid) {
                     if let Some(address) = trap_address(regs.user().ip)
@@ -853,11 +1144,27 @@ impl Tracer {
         // Restore each address space, including fork children still pending their
         // initial stop. Thread groups share an mm; CLONE_VM groups may share too.
         let mut restored = BTreeSet::new();
-        for &tid in &self.stopped {
-            if !restored.insert(tgid(tid).unwrap_or(tid)) {
+        for tid in self.stopped.clone() {
+            self.select(tid);
+            let group = tgid(tid).unwrap_or(tid);
+            let owner =
+                self.owners
+                    .get(&group)
+                    .copied()
+                    .unwrap_or(if self.foreign.contains(&tid) {
+                        self.root
+                    } else {
+                        group
+                    });
+            if !restored.insert(owner) {
                 continue;
             }
             if let Ok(current) = maps(tid) {
+                for (&address, semaphore) in &self.semaphores {
+                    if Self::identity(semaphore.site, &current) == Some(semaphore.identity) {
+                        let _ = adjust_semaphore(tid, address, -1);
+                    }
+                }
                 for (&address, word) in &self.words {
                     if Self::identity(address, &current) == Some(word.identity) {
                         let _ = control(
@@ -913,4 +1220,259 @@ fn step_trap(tid: i32) -> bool {
     )
     .is_ok()
         && info.si_code == libc::TRAP_TRACE
+}
+
+/// Read native user unwind registers while the task is ptrace-stopped.
+pub fn user_registers(tid: i32) -> Result<UserRegs> {
+    Ok(Registers::read(tid)?.user())
+}
+
+fn adjust_semaphore(tid: i32, address: u64, delta: i16) -> Result<()> {
+    if address % 2 != 0 {
+        return Err("SDT semaphore must be 2-byte aligned".into());
+    }
+    let aligned = address & !7;
+    let at = (address & 7) as usize;
+    let mut bytes =
+        (control(libc::PTRACE_PEEKDATA, tid, aligned as usize, 0)? as u64).to_ne_bytes();
+    let count = u16::from_ne_bytes(bytes[at..at + 2].try_into().unwrap());
+    let next = if delta > 0 {
+        count.checked_add(1).ok_or("SDT semaphore overflow")?
+    } else {
+        count.saturating_sub(1)
+    };
+    bytes[at..at + 2].copy_from_slice(&next.to_ne_bytes());
+    control(
+        libc::PTRACE_POKEDATA,
+        tid,
+        aligned as usize,
+        u64::from_ne_bytes(bytes) as usize,
+    )?;
+    Ok(())
+}
+
+impl Registers {
+    fn named(&self, name: &str) -> Result<u64> {
+        let name = name.trim().trim_start_matches('%');
+        #[cfg(target_arch = "aarch64")]
+        {
+            if name == "sp" {
+                return Ok(self.user().sp);
+            }
+            if name == "wsp" {
+                return Ok(self.user().sp & 0xffff_ffff);
+            }
+            if name == "fp" {
+                return Ok(self.data[29]);
+            }
+            if name == "lr" {
+                return Ok(self.data[30]);
+            }
+            if name == "xzr" || name == "wzr" {
+                return Ok(0);
+            }
+            if let Some(index) = name
+                .strip_prefix('x')
+                .or_else(|| name.strip_prefix('w'))
+                .and_then(|s| s.parse::<usize>().ok())
+                .filter(|i| *i <= 30)
+            {
+                return Ok(if name.starts_with('w') {
+                    self.data[index] & 0xffff_ffff
+                } else {
+                    self.data[index]
+                });
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            let names = [
+                ("r15", 0),
+                ("r14", 1),
+                ("r13", 2),
+                ("r12", 3),
+                ("rbp", 4),
+                ("rbx", 5),
+                ("r11", 6),
+                ("r10", 7),
+                ("r9", 8),
+                ("r8", 9),
+                ("rax", 10),
+                ("rcx", 11),
+                ("rdx", 12),
+                ("rsi", 13),
+                ("rdi", 14),
+                ("rip", 16),
+                ("rsp", 19),
+            ];
+            if let Some((_, index)) = names.iter().find(|(n, _)| *n == name) {
+                return Ok(self.data[*index]);
+            }
+            let alias = match name {
+                "eax" => "rax",
+                "ebx" => "rbx",
+                "ecx" => "rcx",
+                "edx" => "rdx",
+                "esi" => "rsi",
+                "edi" => "rdi",
+                "ebp" => "rbp",
+                "esp" => "rsp",
+                _ => "",
+            };
+            if !alias.is_empty() {
+                return Ok(self.named(alias)? & 0xffff_ffff);
+            }
+            let short = match name {
+                "ax" => ("rax", 16, 0),
+                "al" => ("rax", 8, 0),
+                "ah" => ("rax", 8, 8),
+                "bx" => ("rbx", 16, 0),
+                "bl" => ("rbx", 8, 0),
+                "bh" => ("rbx", 8, 8),
+                "cx" => ("rcx", 16, 0),
+                "cl" => ("rcx", 8, 0),
+                "ch" => ("rcx", 8, 8),
+                "dx" => ("rdx", 16, 0),
+                "dl" => ("rdx", 8, 0),
+                "dh" => ("rdx", 8, 8),
+                "si" => ("rsi", 16, 0),
+                "sil" => ("rsi", 8, 0),
+                "di" => ("rdi", 16, 0),
+                "dil" => ("rdi", 8, 0),
+                "bp" => ("rbp", 16, 0),
+                "bpl" => ("rbp", 8, 0),
+                "sp" => ("rsp", 16, 0),
+                "spl" => ("rsp", 8, 0),
+                _ => ("", 0, 0),
+            };
+            if !short.0.is_empty() {
+                return Ok((self.named(short.0)? >> short.2) & ((1u64 << short.1) - 1));
+            }
+            for (suffix, bits) in [('w', 16), ('b', 8)] {
+                if let Some(base) = name.strip_suffix(suffix) {
+                    if base.starts_with('r') {
+                        return Ok(self.named(base)? & ((1u64 << bits) - 1));
+                    }
+                }
+            }
+            if let Some(base) = name.strip_suffix('d') {
+                if base.starts_with('r') {
+                    return Ok(self.named(base)? & 0xffff_ffff);
+                }
+            }
+        }
+        Err(format!("unsupported SDT register {name}"))
+    }
+}
+fn sdt_arguments(tid: i32, regs: &Registers, site: &crate::usdt::Site) -> Result<[u64; 6]> {
+    fn integer(s: &str) -> Result<u64> {
+        let s = s.trim().trim_start_matches(['$', '#']);
+        let (negative, n) = s.strip_prefix('-').map(|n| (true, n)).unwrap_or((false, s));
+        let n = if let Some(n) = n.strip_prefix("0x") {
+            u64::from_str_radix(n, 16)
+        } else {
+            n.parse()
+        }
+        .map_err(|e| e.to_string())?;
+        Ok(if negative { n.wrapping_neg() } else { n })
+    }
+    let mut out = [0; 6];
+    for (index, arg) in site.arguments.iter().enumerate() {
+        let expression = arg.expression.trim();
+        let mut address = None;
+        let mut value = if expression.starts_with(['$', '#']) {
+            integer(expression)?
+        } else if expression.starts_with('[') && expression.ends_with(']') {
+            let pieces: Vec<_> = expression[1..expression.len() - 1]
+                .split(',')
+                .map(str::trim)
+                .collect();
+            let offset = if pieces.len() == 2 {
+                integer(pieces[1])?
+            } else if pieces.len() == 1 {
+                0
+            } else {
+                return Err("unsupported SDT ARM addressing".into());
+            };
+            address = Some(regs.named(pieces[0])?.wrapping_add(offset));
+            0
+        } else if let Some((offset, operand)) = expression.split_once('(') {
+            let operand = operand
+                .strip_suffix(')')
+                .ok_or("invalid SDT memory operand")?;
+            let pieces: Vec<_> = operand.split(',').collect();
+            if pieces.len() > 3 {
+                return Err("unsupported SDT memory operand".into());
+            }
+            let mut at = if pieces[0].is_empty() {
+                0
+            } else {
+                regs.named(pieces[0])?
+            };
+            if pieces.len() > 1 && !pieces[1].is_empty() {
+                let scale = if pieces.len() > 2 {
+                    integer(pieces[2])?
+                } else {
+                    1
+                };
+                if ![1, 2, 4, 8].contains(&scale) {
+                    return Err("invalid SDT memory scale".into());
+                }
+                at = at.wrapping_add(regs.named(pieces[1])?.wrapping_mul(scale));
+            }
+            address = Some(at.wrapping_add(if offset.is_empty() {
+                0
+            } else {
+                integer(offset)?
+            }));
+            0
+        } else {
+            regs.named(expression)?
+        };
+        if let Some(address) = address {
+            let bytes =
+                crate::memory::read(tid as u32, address, arg.size.unsigned_abs() as usize, false)?;
+            let mut raw = [0; 8];
+            raw[..bytes.len()].copy_from_slice(&bytes);
+            value = u64::from_ne_bytes(raw);
+        }
+        let bits = arg.size.unsigned_abs() as u32 * 8;
+        out[index] = if bits == 64 {
+            value
+        } else if arg.size < 0 {
+            ((value << (64 - bits)) as i64 >> (64 - bits)) as u64
+        } else {
+            value & ((1u64 << bits) - 1)
+        };
+    }
+    Ok(out)
+}
+
+/// Read an FP/SIMD argument register at a ptrace stop; return its raw low bits.
+pub fn floating_argument(tid: i32, index: usize, single: bool) -> Result<u64> {
+    if index >= 8 {
+        return Err("floating register index must be 0..7".into());
+    }
+    let mut bytes = [0u8; 528];
+    let mut iov = libc::iovec {
+        iov_base: bytes.as_mut_ptr().cast(),
+        iov_len: bytes.len(),
+    };
+    control(
+        libc::PTRACE_GETREGSET,
+        tid,
+        2,
+        (&mut iov as *mut libc::iovec) as usize,
+    )?;
+    #[cfg(target_arch = "x86_64")]
+    let offset = 160 + index * 16;
+    #[cfg(target_arch = "aarch64")]
+    let offset = index * 16;
+    let size = if single { 4 } else { 8 };
+    if offset + size > iov.iov_len {
+        return Err("incomplete FP register set".into());
+    }
+    let mut value = [0; 8];
+    value[..size].copy_from_slice(&bytes[offset..offset + size]);
+    Ok(u64::from_ne_bytes(value))
 }

@@ -35,6 +35,9 @@ pub fn locate(tid: i32, path: &str, function: &str, ret: bool) -> Result<Resolve
     if object.architecture() != arch {
         return Err("uprobe ELF architecture differs from this tracer".into());
     }
+    let sdt = crate::usdt::encoded(function)?;
+    let offset_name = sdt.as_ref().map(|s| format!("0x{:x}", s.offset));
+    let function = offset_name.as_deref().unwrap_or(function);
     let (name, delta) = function
         .rsplit_once('+')
         .and_then(|(name, offset)| number(offset).map(|offset| (name, offset)))
@@ -140,5 +143,105 @@ fn number(text: &str) -> Option<u64> {
         u64::from_str_radix(hex, 16).ok()
     } else {
         text.parse().ok()
+    }
+}
+
+/// A file-backed native function, suitable for discovery and wildcard expansion.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Function {
+    pub offset: u64,
+    pub name: String,
+    pub demangled: String,
+}
+/// Match '*' and '?' without recursive backtracking.
+pub fn matches(pattern: &str, name: &str) -> bool {
+    let (p, n) = (pattern.as_bytes(), name.as_bytes());
+    let (mut i, mut j, mut star, mut retry) = (0, 0, None, 0);
+    while j < n.len() {
+        if i < p.len() && (p[i] == b'?' || p[i] == n[j]) {
+            i += 1;
+            j += 1;
+        } else if i < p.len() && p[i] == b'*' {
+            star = Some(i);
+            i += 1;
+            retry = j;
+        } else if let Some(s) = star {
+            retry += 1;
+            j = retry;
+            i = s + 1;
+        } else {
+            return false;
+        }
+    }
+    while i < p.len() && p[i] == b'*' {
+        i += 1;
+    }
+    i == p.len()
+}
+pub fn functions(tid: i32, path: &str, pattern: &str) -> Result<Vec<Function>> {
+    let target = if path.starts_with('/') {
+        format!("/proc/{tid}/root{path}")
+    } else {
+        path.into()
+    };
+    let file = std::fs::File::open(&target).map_err(|e| format!("{path}: {e}"))?;
+    if file.metadata().map_err(|e| e.to_string())?.len() > 128 * 1024 * 1024 {
+        return Err("function ELF exceeds 128 MiB".into());
+    }
+    let mut bytes = Vec::new();
+    file.take(128 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() > 128 * 1024 * 1024 {
+        return Err("function ELF exceeds 128 MiB".into());
+    }
+    let object = object::File::parse(bytes.as_slice()).map_err(|e| e.to_string())?;
+    let mut found = BTreeSet::new();
+    for symbol in object.symbols().chain(object.dynamic_symbols()) {
+        if symbol.kind() != SymbolKind::Text || symbol.is_undefined() {
+            continue;
+        }
+        let Ok(name) = symbol.name() else {
+            continue;
+        };
+        let demangled = crate::symbols::demangle(name);
+        if !matches(pattern, name) && !matches(pattern, &demangled) {
+            continue;
+        }
+        let offset = object.segments().find_map(|segment| {
+            let (offset, size) = segment.file_range();
+            (matches!(segment.flags(), SegmentFlags::Elf {p_flags} if p_flags & 1 != 0)
+                && symbol.address() >= segment.address()
+                && symbol.address() - segment.address() < size)
+                .then(|| offset + symbol.address() - segment.address())
+        });
+        if let Some(offset) = offset {
+            found.insert(Function {
+                offset,
+                name: name.into(),
+                demangled,
+            });
+            if found.len() > 250_000 {
+                return Err("function symbol limit exceeded".into());
+            }
+        }
+    }
+    Ok(found.into_iter().collect())
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+    #[test]
+    fn wildcard_edges() {
+        for (p, n, yes) in [
+            ("*", "", true),
+            ("foo*bar", "fooXXbar", true),
+            ("a?c", "abc", true),
+            ("*x", "abc", false),
+            ("a*b*c", "axbyc", true),
+        ] {
+            assert_eq!(matches(p, n), yes);
+        }
     }
 }

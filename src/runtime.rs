@@ -13,8 +13,8 @@ pub struct Event<'a> {
     pub nsecs: u64,
     pub ip: u64,
     pub period: u64,
-    comm: *const c_char,
-    probe: *const c_char,
+    pub(crate) comm: *const c_char,
+    pub(crate) probe: *const c_char,
     stack: *const u64,
     stack_len: u64,
     pub addr: u64,
@@ -24,7 +24,7 @@ pub struct Event<'a> {
     pub retval: i64,
     pub latency: u64,
     pub args: [u64; 6],
-    syscall: *const c_char,
+    pub(crate) syscall: *const c_char,
     branches: *const crate::perf::Branch,
     branch_len: u64,
     lifetime: std::marker::PhantomData<&'a CStr>,
@@ -253,8 +253,18 @@ pub struct State<'a> {
     pub error: Option<String>,
     pub max_entries: usize,
     pub(crate) stack_strings: Vec<CString>,
+    pub(crate) fuel: u32,
+    pub(crate) scratch: BTreeMap<u32, Vec<u64>>,
     symbols: crate::symbols::Symbolizer,
+    python: crate::python::Reader,
+    javascript: crate::javascript::Reader,
+    pub js_snapshot: Option<(crate::perf::UserRegs, Vec<u8>)>,
+    types: crate::types::Reader,
     pub report: crate::report::Options,
+    pub wait_reason: Option<String>,
+    pub recorder: Option<crate::recording::Recorder>,
+    pub(crate) journal: Vec<crate::recording::Helper>,
+    pub(crate) replay: Option<std::collections::VecDeque<crate::recording::Helper>>,
 }
 impl<'a> State<'a> {
     pub(crate) fn new(
@@ -273,8 +283,18 @@ impl<'a> State<'a> {
             error: None,
             max_entries: 65536,
             stack_strings: Vec::new(),
+            fuel: 4096,
+            scratch: BTreeMap::new(),
             symbols: crate::symbols::Symbolizer::default(),
+            python: crate::python::Reader::default(),
+            javascript: crate::javascript::Reader::default(),
+            js_snapshot: None,
+            types: crate::types::Reader::default(),
             report: crate::report::Options::default(),
+            wait_reason: None,
+            recorder: None,
+            journal: Vec::new(),
+            replay: None,
         }
     }
     fn write(&mut self, text: &str) {
@@ -285,8 +305,10 @@ impl<'a> State<'a> {
             self.fail(format!("output: {e}"));
         }
     }
-    fn fail(&mut self, e: String) {
-        self.error = Some(e);
+    pub(crate) fn fail(&mut self, e: String) {
+        if self.error.is_none() {
+            self.error = Some(e);
+        }
         self.stopped = true;
     }
     pub fn flush(&mut self) -> Result<()> {
@@ -298,6 +320,15 @@ impl<'a> State<'a> {
     }
     pub fn unwind_sample(&mut self, sample: &crate::perf::Sample) -> Vec<u64> {
         self.symbols.unwind(sample)
+    }
+    pub fn replay_helpers(&mut self, helpers: Vec<crate::recording::Helper>) {
+        self.replay = Some(helpers.into());
+    }
+    pub fn live_snapshot(&mut self) {
+        if unsafe { libc::isatty(1) } == 1 {
+            self.write("\x1b[2J\x1b[H");
+        }
+        self.print_all();
     }
     pub fn clear_all(&mut self) {
         for map in &mut self.maps {
@@ -329,7 +360,12 @@ impl<'a> State<'a> {
                 let buckets = cell
                     .buckets
                     .iter()
-                    .map(|(bucket, count)| (bucket_label(*bucket, spec), *count))
+                    .map(|(bucket, count)| {
+                        (
+                            bucket_label(*bucket, spec),
+                            (*count).min(i64::MAX as u64) as i64,
+                        )
+                    })
                     .collect();
                 rows.push(crate::report::Row {
                     map: spec.name.clone(),
@@ -438,6 +474,10 @@ pub(crate) unsafe extern "C" fn map_update(
     let key = unsafe { keys(raw, len) };
     let linear = state.specs[id as usize].linear;
     let map = &mut state.maps[id as usize];
+    if op == 8 {
+        map.remove(&key);
+        return;
+    }
     if !map.contains_key(&key) && map.len() >= state.max_entries {
         state.fail(format!(
             "map @{} reached the {} entry limit",
@@ -529,11 +569,7 @@ pub(crate) unsafe extern "C" fn streq(a: *const c_char, b: *const c_char) -> u64
     unsafe { (CStr::from_ptr(a).to_bytes() == CStr::from_ptr(b).to_bytes()) as u64 }
 }
 
-pub(crate) unsafe extern "C" fn ustack(
-    state: *mut State<'_>,
-    event: *const Event<'_>,
-    depth: u64,
-) -> u64 {
+unsafe fn ustack_inner(state: *mut State<'_>, event: *const Event<'_>, depth: u64) -> u64 {
     let state = unsafe { &mut *state };
     let event = unsafe { &*event };
     let frames =
@@ -564,7 +600,7 @@ fn bucket_label(bucket: i32, spec: &MapSpec) -> String {
     }
 }
 
-pub(crate) unsafe extern "C" fn helper(
+unsafe fn helper_inner(
     state: *mut State<'_>,
     event: *const Event<'_>,
     op: u64,
@@ -605,6 +641,185 @@ pub(crate) unsafe extern "C" fn helper(
                 }
             };
         }
+        70 => Ok(state
+            .wait_reason
+            .clone()
+            .unwrap_or_else(|| "<no wait snapshot>".into())),
+        60 => {
+            match crate::functions::floating_argument(
+                event.tid as i32,
+                value as usize,
+                length == 32,
+            ) {
+                Ok(bits) => Ok(if length == 32 {
+                    f32::from_bits(bits as u32).to_string()
+                } else {
+                    f64::from_bits(bits).to_string()
+                }),
+                Err(error) => Err(error),
+            }
+        }
+        61 => {
+            let result = (|| -> Result<u64> {
+                let regs = crate::functions::user_registers(event.tid as i32)?;
+                #[cfg(target_arch = "x86_64")]
+                let skip = 1;
+                #[cfg(target_arch = "aarch64")]
+                let skip = 0;
+                let address = regs
+                    .sp
+                    .checked_add((value + skip) * 8)
+                    .ok_or("stack argument overflow")?;
+                let bytes = crate::memory::read(event.tid as u32, address, 8, false)?;
+                Ok(u64::from_ne_bytes(bytes.try_into().unwrap()))
+            })();
+            return match result {
+                Ok(value) => value,
+                Err(error) => {
+                    state.fail(error);
+                    0
+                }
+            };
+        }
+        40..=43 => {
+            let descriptor = unsafe { CStr::from_ptr(length as *const c_char) }.to_string_lossy();
+            let result = (|| -> Result<u64> {
+                let (path, name, field): (String, String, String) =
+                    serde_json::from_str(&descriptor).map_err(|e| e.to_string())?;
+                let layout = state.types.layout(event.pid as u32, &path, &name, &field)?;
+                if op == 41 {
+                    return Ok(layout.offset);
+                }
+                if op == 42 {
+                    return Ok(layout.size);
+                }
+                if !layout.scalar || ![1, 2, 4, 8].contains(&layout.size) {
+                    return Err("field reads require a 1/2/4/8-byte scalar".into());
+                }
+                let bytes = crate::memory::read(
+                    event.pid as u32,
+                    value
+                        .checked_add(layout.offset)
+                        .ok_or("field address overflow")?,
+                    layout.size as usize,
+                    false,
+                )?;
+                let mut raw = [0; 8];
+                raw[..bytes.len()].copy_from_slice(&bytes);
+                let value = u64::from_ne_bytes(raw);
+                if op == 43 {
+                    let text = if layout.float && layout.size == 4 {
+                        f32::from_bits(value as u32).to_string()
+                    } else if layout.float && layout.size == 8 {
+                        f64::from_bits(value).to_string()
+                    } else if layout.signed {
+                        ((value << (64 - layout.size * 8)) as i64 >> (64 - layout.size * 8))
+                            .to_string()
+                    } else {
+                        value.to_string()
+                    };
+                    let text = CString::new(text).unwrap();
+                    let ptr = text.as_ptr() as u64;
+                    state.stack_strings.push(text);
+                    return Ok(ptr);
+                }
+                if layout.float {
+                    return Err("use fieldstr for floating-point fields".into());
+                }
+                Ok(if layout.signed && layout.size < 8 {
+                    ((value << (64 - layout.size * 8)) as i64 >> (64 - layout.size * 8)) as u64
+                } else {
+                    value
+                })
+            })();
+            return match result {
+                Ok(value) => value,
+                Err(error) => {
+                    state.fail(error);
+                    if op == 43 {
+                        let empty = CString::default();
+                        let ptr = empty.as_ptr() as u64;
+                        state.stack_strings.push(empty);
+                        ptr
+                    } else {
+                        0
+                    }
+                }
+            };
+        }
+        51 => Ok(state
+            .javascript
+            .stack(
+                event.pid as u32,
+                event.tid as u32,
+                length as usize,
+                state.js_snapshot.as_ref(),
+            )
+            .unwrap_or_else(|error| {
+                format!(
+                    "    <JavaScript stack unavailable: {}>\n",
+                    error.replace(['\n', '\r'], "?")
+                )
+            })),
+        50 => Ok(state
+            .python
+            .stack(event.pid as u32, event.tid as u32, length as usize)
+            .unwrap_or_else(|error| {
+                format!(
+                    "    <Python stack unavailable: {}>\n",
+                    error.replace(['\n', '\r'], "?")
+                )
+            })),
+        30 | 31 => {
+            let index = (value & 0xffff_ffff) as usize;
+            let id = (value >> 32) as u32;
+            if index >= 256 || id >= 128 {
+                state.fail("local array index must be 0..255".into());
+                return 0;
+            }
+            let array = state.scratch.entry(id).or_insert_with(|| vec![0; 256]);
+            if op == 31 {
+                array[index] = length;
+            }
+            return array[index];
+        }
+        20 => {
+            if state.fuel == 0 {
+                state.fail("handler exceeded 4096 loop iterations".into());
+                return 0;
+            }
+            state.fuel -= 1;
+            return 1;
+        }
+        11..=16 => {
+            let first = unsafe { CStr::from_ptr(value as *const c_char) }.to_string_lossy();
+            if op == 11 {
+                return first.len() as u64;
+            }
+            if op == 16 {
+                let start = (length >> 32) as usize;
+                let size = (length & 0xffff_ffff) as usize;
+                let bytes = first.as_bytes();
+                Ok(String::from_utf8_lossy(
+                    &bytes[start.min(bytes.len())..start.saturating_add(size).min(bytes.len())],
+                )
+                .into_owned())
+            } else {
+                let second = unsafe { CStr::from_ptr(length as *const c_char) }.to_string_lossy();
+                match op {
+                    12 => return first.contains(second.as_ref()) as u64,
+                    13 => return first.starts_with(second.as_ref()) as u64,
+                    14 => return first.ends_with(second.as_ref()) as u64,
+                    _ => {
+                        if first.len() + second.len() > 4096 {
+                            Err("strcat result exceeds 4096 bytes".into())
+                        } else {
+                            Ok(format!("{first}{second}"))
+                        }
+                    }
+                }
+            }
+        }
         10 => {
             let branches =
                 unsafe { std::slice::from_raw_parts(event.branches, event.branch_len as usize) };
@@ -634,6 +849,102 @@ pub(crate) unsafe extern "C" fn helper(
     let pointer = text.as_ptr() as u64;
     state.stack_strings.push(text);
     pointer
+}
+
+unsafe fn recorded_helper(
+    state: *mut State<'_>,
+    event: *const Event<'_>,
+    op: u64,
+    value: u64,
+    length: u64,
+) -> u64 {
+    let s = unsafe { &mut *state };
+    let string_result = matches!(op, 0 | 1 | 2 | 10 | 15 | 16 | 43 | 50 | 51 | 60 | 70 | 100);
+    let empty = if string_result {
+        c"".as_ptr() as u64
+    } else {
+        0
+    };
+    if let Some(queue) = &mut s.replay {
+        let Some(item) = queue.pop_front() else {
+            s.fail("recording helper stream exhausted".into());
+            return empty;
+        };
+        if item.op != op
+            || (!(11..=16).contains(&op)
+                && !(40..=43).contains(&op)
+                && (item.value, item.length) != (value, length))
+            || (40..=43).contains(&op) && item.value != value
+            || op == 16 && item.length != length
+        {
+            s.fail("recording helper call does not match script".into());
+            return empty;
+        }
+        if item.text.is_some() != string_result {
+            s.fail("recording helper result has the wrong type".into());
+            return empty;
+        }
+        if let Some(error) = item.error {
+            s.fail(error);
+        }
+        if let Some(text) = item.text {
+            let text = CString::new(text.replace('\0', "\\0")).unwrap();
+            let ptr = text.as_ptr() as u64;
+            s.stack_strings.push(text);
+            return ptr;
+        }
+        if op == 20 || op == 30 || op == 31 {
+            let actual = unsafe { helper_inner(state, event, op, value, length) };
+            let s = unsafe { &mut *state };
+            if actual != item.number && s.error.is_none() {
+                s.fail("recording deterministic helper result mismatch".into());
+            }
+            return actual;
+        }
+        return item.number;
+    }
+    let result = if op == 100 {
+        unsafe { ustack_inner(state, event, value) }
+    } else {
+        unsafe { helper_inner(state, event, op, value, length) }
+    };
+    let s = unsafe { &mut *state };
+    if s.recorder.is_some() {
+        let text = if matches!(op, 0 | 1 | 2 | 10 | 15 | 16 | 43 | 50 | 51 | 60 | 70 | 100) {
+            Some(
+                unsafe { CStr::from_ptr(result as *const c_char) }
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        } else {
+            None
+        };
+        s.journal.push(crate::recording::Helper {
+            op,
+            value,
+            length,
+            number: if text.is_some() { 0 } else { result },
+            text,
+            error: s.error.clone(),
+        });
+    }
+    result
+}
+pub(crate) unsafe extern "C" fn helper(
+    state: *mut State<'_>,
+    event: *const Event<'_>,
+    op: u64,
+    value: u64,
+    length: u64,
+) -> u64 {
+    unsafe { recorded_helper(state, event, op, value, length) }
+}
+pub(crate) unsafe extern "C" fn ustack(
+    state: *mut State<'_>,
+    event: *const Event<'_>,
+    depth: u64,
+) -> u64 {
+    unsafe { recorded_helper(state, event, 100, depth, 0) }
 }
 
 #[cfg(test)]

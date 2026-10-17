@@ -6,6 +6,8 @@ pub enum Probe {
     Begin,
     End,
     Interval(Duration),
+    Wait(Duration),
+    Wakeup(Duration),
     OffCpu,
     Uprobe {
         path: String,
@@ -59,6 +61,20 @@ pub const HARDWARE: &[(&str, u64)] = &[
 
 impl Probe {
     pub fn parse(text: &str) -> Result<Self> {
+        if let Some(rest) = text.strip_prefix("usdt:") {
+            let Self::Uprobe { path, function, .. } = Self::parse(&format!("uprobe:{rest}"))?
+            else {
+                unreachable!()
+            };
+            if !function.contains(':') {
+                return Err("usdt requires PATH:PROVIDER:NAME".into());
+            }
+            return Ok(Self::Uprobe {
+                path,
+                function: format!("__usdt__{function}"),
+                ret: false,
+            });
+        }
         if let Some((rest, ret)) = text
             .strip_prefix("uprobe:")
             .map(|rest| (rest, false))
@@ -98,6 +114,9 @@ impl Probe {
             };
             let path = component(&rest[..split])?;
             let function = component(&rest[split + 1..])?;
+            if function.starts_with("__sdt__") || function.starts_with("__usdt__") {
+                return Err("reserved internal probe encoding; use usdt:PATH:PROVIDER:NAME".into());
+            }
             if path.is_empty() || function.is_empty() {
                 return Err("uprobe needs a nonempty path and function".into());
             }
@@ -216,7 +235,11 @@ impl Probe {
                     frequency: false,
                 })
             }
-            [provider @ ("interval" | "profile"), unit, amount] => {
+            [
+                provider @ ("interval" | "profile" | "wait" | "wakeup"),
+                unit,
+                amount,
+            ] => {
                 let amount = positive(amount)?;
                 if *unit == "hz" {
                     if amount > 1_000_000_000 {
@@ -230,7 +253,18 @@ impl Probe {
                             frequency: true,
                         });
                     }
-                    return Ok(Self::Interval(Duration::from_nanos(1_000_000_000 / amount)));
+                    let period = Duration::from_nanos(1_000_000_000 / amount);
+                    if *provider == "wait" || *provider == "wakeup" {
+                        if period < Duration::from_millis(1) {
+                            return Err("wait snapshots require intervals of at least 1 ms".into());
+                        }
+                        return Ok(if *provider == "wakeup" {
+                            Self::Wakeup(period)
+                        } else {
+                            Self::Wait(period)
+                        });
+                    }
+                    return Ok(Self::Interval(period));
                 }
                 let scale = match *unit {
                     "ns" => 1,
@@ -242,6 +276,16 @@ impl Probe {
                 let ns = amount
                     .checked_mul(scale)
                     .ok_or("probe period overflows u64")?;
+                if *provider == "wait" || *provider == "wakeup" {
+                    if ns < 1_000_000 {
+                        return Err("wait snapshots require intervals of at least 1 ms".into());
+                    }
+                    return Ok(if *provider == "wakeup" {
+                        Self::Wakeup(Duration::from_nanos(ns))
+                    } else {
+                        Self::Wait(Duration::from_nanos(ns))
+                    });
+                }
                 if *provider == "interval" {
                     Ok(Self::Interval(Duration::from_nanos(ns)))
                 } else {
@@ -325,6 +369,8 @@ pub enum Expr {
     String(String),
     Builtin(String),
     Local(String),
+    Array(String, Box<Expr>),
+    Inline(Vec<(String, Expr)>, Box<Expr>),
     Map(String, Vec<Expr>),
     Call(String, Vec<Expr>),
     Unary(String, Box<Expr>),
@@ -336,6 +382,7 @@ pub enum Stmt {
     Increment(Expr, i64),
     Call(String, Vec<Expr>),
     If(Expr, Vec<Stmt>, Vec<Stmt>),
+    Repeat(u32, Vec<Stmt>),
 }
 
 #[derive(Clone, Debug)]
@@ -483,6 +530,8 @@ struct Parser<'a> {
     tokens: Vec<Token>,
     at: usize,
     depth: usize,
+    functions: std::collections::BTreeMap<String, (Vec<String>, Expr)>,
+    expanded: usize,
 }
 pub fn parse(src: &str) -> Result<Vec<Clause>> {
     let mut p = Parser {
@@ -490,13 +539,46 @@ pub fn parse(src: &str) -> Result<Vec<Clause>> {
         tokens: lex(src)?,
         at: 0,
         depth: 0,
+        functions: Default::default(),
+        expanded: 0,
     };
     let mut clauses = Vec::new();
     while !matches!(p.token().kind, TokenKind::Eof) {
+        if p.eat("fn") {
+            let name = p.word()?;
+            p.expect("(")?;
+            let mut parameters = Vec::new();
+            if !p.eat(")") {
+                loop {
+                    p.expect("$")?;
+                    let parameter = p.word()?;
+                    if parameters.contains(&parameter) {
+                        return Err(p.error("duplicate function parameter"));
+                    }
+                    parameters.push(parameter);
+                    if parameters.len() > 16 {
+                        return Err(p.error("function has more than 16 parameters"));
+                    }
+                    if p.eat(")") {
+                        break;
+                    }
+                    p.expect(",")?;
+                }
+            }
+            p.expect("=")?;
+            let expression = p.expr(0)?;
+            p.expect(";")?;
+            if p.functions.len() >= 128
+                || p.functions.insert(name, (parameters, expression)).is_some()
+            {
+                return Err(p.error("too many or duplicate function definitions"));
+            }
+            continue;
+        }
         let mut probes = Vec::new();
         loop {
             let start = p.token().start;
-            let is_uprobe = matches!(&p.token().kind,TokenKind::Word(name) if name=="uprobe"||name=="uretprobe");
+            let is_uprobe = matches!(&p.token().kind,TokenKind::Word(name) if name=="uprobe"||name=="uretprobe"||name=="usdt");
             let mut colons = 0;
             while !p.is("{")
                 && !(p.is("/") && (!is_uprobe || colons >= 2))
@@ -602,6 +684,16 @@ impl Parser<'_> {
         self.expect("{")?;
         let mut stmts = Vec::new();
         while !self.eat("}") {
+            if self.eat("repeat") {
+                self.expect("(")?;
+                let count = match self.expr(0)? {
+                    Expr::Number(n) if (1..=1024).contains(&n) => n as u32,
+                    _ => return Err(self.error("repeat requires a constant count from 1 to 1024")),
+                };
+                self.expect(")")?;
+                stmts.push(Stmt::Repeat(count, self.block()?));
+                continue;
+            }
             if self.eat("if") {
                 self.expect("(")?;
                 let e = self.expr(0)?;
@@ -663,7 +755,14 @@ impl Parser<'_> {
             self.expect(")")?;
             e
         } else if self.eat("$") {
-            Expr::Local(self.word()?)
+            let name = self.word()?;
+            if self.eat("[") {
+                let index = self.expr(0)?;
+                self.expect("]")?;
+                Expr::Array(name, Box::new(index))
+            } else {
+                Expr::Local(name)
+            }
         } else if self.eat("@") {
             let name = if matches!(self.token().kind, TokenKind::Word(_)) {
                 self.word()?
@@ -690,7 +789,38 @@ impl Parser<'_> {
                 TokenKind::Word(w) => {
                     self.at += 1;
                     if self.eat("(") {
-                        Expr::Call(w, self.args(")")?)
+                        let args = self.args(")")?;
+                        if let Some((parameters, body)) = self.functions.get(&w) {
+                            if args.len() != parameters.len() {
+                                return Err(self.error("function argument count mismatch"));
+                            }
+                            fn cost(e: &Expr) -> usize {
+                                match e {
+                                    Expr::Inline(args, body) => {
+                                        1 + args.iter().map(|(_, e)| cost(e)).sum::<usize>()
+                                            + cost(body)
+                                    }
+                                    Expr::Call(_, args) | Expr::Map(_, args) => {
+                                        1 + args.iter().map(cost).sum::<usize>()
+                                    }
+                                    Expr::Unary(_, e) | Expr::Array(_, e) => 1 + cost(e),
+                                    Expr::Binary(_, a, b) => 1 + cost(a) + cost(b),
+                                    _ => 1,
+                                }
+                            }
+                            self.expanded = self.expanded.saturating_add(cost(body));
+                            if self.expanded > 50_000 {
+                                return Err(
+                                    self.error("expanded function expression limit exceeded")
+                                );
+                            }
+                            Expr::Inline(
+                                parameters.iter().cloned().zip(args).collect(),
+                                Box::new(body.clone()),
+                            )
+                        } else {
+                            Expr::Call(w, args)
+                        }
                     } else {
                         Expr::Builtin(w)
                     }

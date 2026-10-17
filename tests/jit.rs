@@ -135,7 +135,7 @@ fn malformed_and_inconsistent_scripts_are_rejected() {
         "BEGIN { @x[comm]++; @x[pid]++; }",
         "BEGIN { @x[1]++; printf(\"%d\", @x); }",
         "BEGIN { @x = hist(1); @y = @x; }",
-        "BEGIN { $x = comm; }",
+        "BEGIN { $x = comm; $x = 3; }",
         "BEGIN { printf(\"%d\", missing); }",
         "BEGIN { printf(\"%d\", $missing); }",
         "kprobe:do_sys_open { @x++; }",
@@ -347,4 +347,86 @@ fn linear_histograms_and_report_controls() {
     ] {
         assert!(Program::compile(source).is_err(), "{source}");
     }
+}
+
+#[test]
+fn strings_functions_arrays_loops_and_deletion() {
+    let text = execute(
+        r#"
+        fn identity($x) = $x;
+        fn decorate($s) = identity(strcat($s,"!"));
+        fn twice($x) = $x * 2;
+        BEGIN {
+            $s=decorate("hello"); $i=0;
+            repeat(4) { $a[$i]=twice($i+1); $i++; }
+            @sum=$a[0]+$a[3]; @by[$s]++;
+            @remove[1]++; delete(@remove[1]);
+            printf("%s %d %d %d %s %d %d\n",$s,strlen($s),strcontains($s,"ell"),startswith($s,"he"),substr($s,1,3),i8(255),u8(-1));
+        }
+    "#,
+        &[0],
+    );
+    assert!(text.contains("hello! 6 1 1 ell -1 255\n"), "{text}");
+    assert!(text.contains("@sum: 10"), "{text}");
+    assert!(text.contains("@by[\"hello!\"]: 1"), "{text}");
+    assert!(!text.contains("@remove"), "{text}");
+    for source in [
+        "BEGIN { repeat(1025) { @x++; } }",
+        "fn x($a,$a) = $a; BEGIN { @x++; }",
+        "fn x($a) = $a; BEGIN { @x=x(); }",
+        "BEGIN { $s=\"x\"; $s++; }",
+    ] {
+        assert!(Program::compile(source).is_err(), "{source}");
+    }
+    for (source, message) in [
+        ("BEGIN { $a[-1]=3; }", "array index"),
+        (
+            "BEGIN { repeat(1024) {repeat(1024){@x++;}} }",
+            "loop iterations",
+        ),
+    ] {
+        let program = Program::compile(source).unwrap();
+        let mut state = program.state(Vec::new());
+        program.invoke(0, &mut state, &Event::new(c"x", c"x"));
+        assert!(
+            state.error.as_ref().is_some_and(|e| e.contains(message)),
+            "{:?}",
+            state.error
+        );
+    }
+}
+
+#[test]
+fn javascript_stack_types_depth_and_recorded_results() {
+    let source = r#"BEGIN { $stack=jsstack(2); @frames[$stack]=count(); printf("%s",jsstack); }"#;
+    let program = Program::compile(source).unwrap();
+    assert!(program.needs_jsstack());
+    assert!(!program.needs_ustack());
+    for bad in ["jsstack(0)", "jsstack(128)", "jsstack(pid)", "jsstack(1,2)"] {
+        assert!(Program::compile(&format!("BEGIN {{ printf(\"%s\",{bad}); }}")).is_err());
+    }
+    let mut output = Vec::new();
+    {
+        let mut state = program.state(&mut output);
+        // Replay does not need a live process or any V8 metadata.
+        state.replay_helpers(
+            [2, 127]
+                .into_iter()
+                .map(|length| poortrace::recording::Helper {
+                    op: 51,
+                    value: 0,
+                    length,
+                    number: 0,
+                    text: Some("    leaf (example.js)\n".into()),
+                    error: None,
+                })
+                .collect(),
+        );
+        program.invoke(0, &mut state, &Event::new(c"node", c"synthetic"));
+        state.print_all();
+        state.flush().unwrap();
+    }
+    let text = String::from_utf8(output).unwrap();
+    assert!(text.contains("leaf (example.js)"));
+    assert!(text.contains(": 1"));
 }

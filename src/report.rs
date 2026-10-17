@@ -14,7 +14,7 @@ pub struct Row {
     pub keys: Vec<Key>,
     pub value: i64,
     #[serde(default)]
-    pub buckets: Vec<(String, u64)>,
+    pub buckets: Vec<(String, i64)>,
 }
 #[derive(Clone, Debug, Default)]
 pub struct Options {
@@ -24,6 +24,7 @@ pub struct Options {
     pub rate: bool,
     pub elapsed: f64,
     pub baseline: Vec<Row>,
+    pub quantiles: Vec<f64>,
 }
 
 pub fn baseline(path: &std::path::Path) -> Result<Vec<Row>> {
@@ -46,18 +47,35 @@ pub fn render(rows: &[Row], options: &Options) -> Result<String> {
     let mut rows = rows.to_vec();
     let mut old = BTreeMap::new();
     for row in &options.baseline {
-        old.insert(identity(row), row.value);
+        old.insert(identity(row), row.clone());
     }
     if !options.baseline.is_empty() {
         for row in &mut rows {
-            row.value = row
-                .value
-                .saturating_sub(old.remove(&identity(row)).unwrap_or(0));
+            if let Some(previous) = old.remove(&identity(row)) {
+                row.value = row.value.saturating_sub(previous.value);
+                let mut buckets: BTreeMap<_, _> = row.buckets.iter().cloned().collect();
+                for (label, count) in previous.buckets {
+                    let current = buckets.entry(label).or_default();
+                    *current = current.saturating_sub(count);
+                }
+                row.buckets = buckets.into_iter().collect();
+                row.buckets.sort_by_key(|(label, _)| {
+                    label
+                        .trim_start_matches('[')
+                        .split(',')
+                        .next()
+                        .and_then(|v| v.parse::<i128>().ok())
+                        .unwrap_or(i128::MIN)
+                });
+            }
         }
         for row in &options.baseline {
             if old.remove(&identity(row)).is_some() {
                 let mut missing = row.clone();
                 missing.value = missing.value.saturating_neg();
+                for (_, count) in &mut missing.buckets {
+                    *count = count.saturating_neg();
+                }
                 rows.push(missing);
             }
         }
@@ -111,6 +129,23 @@ pub fn render(rows: &[Row], options: &Options) -> Result<String> {
                     for (label, count) in &row.buckets {
                         out.push_str(&format!("  {label}: {count}\n"));
                     }
+                    if row.buckets.iter().all(|(_, count)| *count >= 0) {
+                        let total: u128 = row.buckets.iter().map(|(_, n)| *n as u128).sum();
+                        for quantile in &options.quantiles {
+                            let target = (total as f64 * quantile).ceil() as u128;
+                            let mut seen = 0;
+                            let bucket = row.buckets.iter().find(|(_, n)| {
+                                seen += *n as u128;
+                                seen >= target.max(1)
+                            });
+                            if let Some((label, _)) = bucket {
+                                out.push_str(&format!(
+                                    "  p{}: {label} (bucket estimate)\n",
+                                    quantile * 100.0
+                                ));
+                            }
+                        }
+                    }
                     continue;
                 }
                 out.push_str(&format!(": {}", row.value));
@@ -137,13 +172,13 @@ pub fn render(rows: &[Row], options: &Options) -> Result<String> {
     }
 }
 
-fn stacks(rows: &[Row]) -> Result<Vec<(Vec<String>, u64)>> {
+fn stacks(rows: &[Row], signed: bool) -> Result<Vec<(Vec<String>, i64)>> {
     let mut output = Vec::new();
     for row in rows {
         if !row.keys.iter().any(|key| key.kind == "stack") {
             continue;
         }
-        if row.value < 0 {
+        if row.value < 0 && !signed {
             return Err(
                 "stack profiles require nonnegative weights; use text or JSON for comparisons"
                     .into(),
@@ -172,12 +207,12 @@ fn stacks(rows: &[Row]) -> Result<Vec<(Vec<String>, u64)>> {
                 "stack exports support at most 256 frames per row, including key labels".into(),
             );
         }
-        output.push((frames, row.value as u64));
+        output.push((frames, row.value));
     }
     Ok(output)
 }
 fn profile(rows: &[Row], format: &str) -> Result<String> {
-    let stacks = stacks(rows)?;
+    let stacks = stacks(rows, format == "flamegraph")?;
     if format == "folded" {
         return Ok(stacks
             .iter()
@@ -221,17 +256,20 @@ fn profile(rows: &[Row], format: &str) -> Result<String> {
     #[derive(Default)]
     struct Node {
         weight: f64,
+        delta: i128,
         children: BTreeMap<String, Node>,
     }
     let mut root = Node::default();
     let mut depth = 0;
     for (frames, weight) in stacks {
-        root.weight += weight as f64;
+        root.weight += weight.unsigned_abs() as f64;
+        root.delta += weight as i128;
         depth = depth.max(frames.len());
         let mut node = &mut root;
         for frame in frames {
             node = node.children.entry(frame).or_default();
-            node.weight += weight as f64;
+            node.weight += weight.unsigned_abs() as f64;
+            node.delta += weight as i128;
         }
     }
     fn escape(text: &str) -> String {
@@ -244,11 +282,8 @@ fn profile(rows: &[Row], format: &str) -> Result<String> {
         let mut at = x;
         for (name, child) in &node.children {
             let w = width * child.weight / node.weight;
-            let color = name
-                .bytes()
-                .fold(0u32, |sum, b| sum.wrapping_mul(31).wrapping_add(b as u32))
-                % 70;
-            out.push_str(&format!("<g><title>{}: {}</title><rect x=\"{at:.3}\" y=\"{y}\" width=\"{w:.3}\" height=\"19\" fill=\"hsl({color},85%,65%)\" stroke=\"white\"/>", escape(name), child.weight));
+            let hue = if child.delta < 0 { 220 } else { 0 };
+            out.push_str(&format!("<g><title>{}: {}</title><rect x=\"{at:.3}\" y=\"{y}\" width=\"{w:.3}\" height=\"19\" fill=\"hsl({hue},85%,65%)\" stroke=\"white\"/>", escape(name), child.delta));
             if w > 40.0 {
                 let label: String = name.chars().take((w / 7.0) as usize).collect();
                 out.push_str(&format!(
@@ -331,5 +366,61 @@ mod tests {
         )
         .unwrap();
         assert!(text.ends_with(": 0\n"));
+    }
+    #[test]
+    fn signed_histogram_differences_and_percentile_buckets() {
+        let current = vec![Row {
+            map: "h".into(),
+            keys: vec![],
+            value: 0,
+            buckets: vec![("[1, 2)".into(), 1), ("[2, 4)".into(), 3)],
+        }];
+        let old = vec![Row {
+            map: "h".into(),
+            keys: vec![],
+            value: 0,
+            buckets: vec![("[1, 2)".into(), 2), ("[4, 8)".into(), 1)],
+        }];
+        let text = render(
+            &current,
+            &Options {
+                format: "text".into(),
+                baseline: old,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            text.contains("[1, 2): -1") && text.contains("[4, 8): -1"),
+            "{text}"
+        );
+        let text = render(
+            &current,
+            &Options {
+                format: "text".into(),
+                quantiles: vec![0.5],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(text.contains("p50: [2, 4) (bucket estimate)"), "{text}");
+        let negative = vec![Row {
+            map: "cpu".into(),
+            keys: vec![Key {
+                kind: "stack".into(),
+                value: "    leaf\n".into(),
+            }],
+            value: -3,
+            buckets: vec![],
+        }];
+        let svg = render(
+            &negative,
+            &Options {
+                format: "flamegraph".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(svg.contains("hsl(220") && svg.contains("leaf: -3"), "{svg}");
     }
 }

@@ -7,6 +7,7 @@
 #include <pthread.h>
 #include <sys/wait.h>
 #include <sys/prctl.h>
+#include <time.h>
 __attribute__((noinline)) long traced_add(long a,long b,long c,long d,long e,long f) {
     __asm__ __volatile__("" ::: "memory");
     return a+b+c+d+e+f;
@@ -23,7 +24,20 @@ static long run(void) {
 }
 static void* worker(void* unused) { (void)unused; return (void*)run(); }
 static int shared_worker(void* arg) {(void)arg;run();return 0;}
+static void* execute_worker(void* path) {execl((char*)path,(char*)path,(char*)0);_exit(8);}
 int main(int argc,char** argv) {
+    if(argc>1 && !strcmp(argv[1],"wait")) {
+        for(int i=0;i<3;i++){usleep(20000);clock_t start=clock();while(clock()-start<CLOCKS_PER_SEC/40){__asm__ __volatile__("" ::: "memory");}}return 0;
+    }
+    if(argc>1 && !strcmp(argv[1],"thread-exec")) {pthread_t thread;pthread_create(&thread,0,execute_worker,argv[0]);while(1)pause();}
+
+    if(argc>1 && !strcmp(argv[1],"orphan-sleep")) {
+        pid_t child=fork();if(child==0){setsid();close(1);close(2);sleep(30);_exit(0);}
+        printf("orphan=%ld\n",(long)child);fflush(stdout);_exit(7);
+    }
+    if(argc>1 && !strcmp(argv[1],"orphan-exec")) {
+        pid_t child=fork(); if(child==0){execl(argv[0],argv[0],(char*)0);_exit(8);} _exit(7);
+    }
     if(argc>1 && !strcmp(argv[1],"attach")) {
         prctl(PR_SET_PTRACER,PR_SET_PTRACER_ANY,0,0,0);
         printf("%llx\n",(unsigned long long)(unsigned long)&traced_add);fflush(stdout);

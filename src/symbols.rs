@@ -271,6 +271,7 @@ impl Image {
 }
 
 struct Process {
+    jit: Vec<(u64, u64, String)>,
     refreshed: Instant,
     maps: Vec<Mapping>,
 }
@@ -396,6 +397,7 @@ impl Symbolizer {
                 self.processes.insert(
                     pid,
                     Process {
+                        jit: jit_symbols(pid),
                         refreshed: Instant::now(),
                         maps: maps.lines().filter_map(Mapping::parse).collect(),
                     },
@@ -413,7 +415,7 @@ impl Symbolizer {
                     .iter()
                     .find(|map| lookup >= map.start && lookup < map.end)
             });
-            let frame = if let Some(mapping) = mapping {
+            let mut frame = if let Some(mapping) = mapping {
                 let file_offset = mapping.offset.checked_add(lookup - mapping.start);
                 let key = (pid, mapping.path.clone(), mapping.device, mapping.inode);
                 if self.images.len() >= 128 && !self.images.contains_key(&key) {
@@ -435,6 +437,15 @@ impl Symbolizer {
             } else {
                 format!("0x{ip:x}")
             };
+            if frame.starts_with("0x") {
+                if let Some((start, _, name)) = self.processes.get(&pid).and_then(|p| {
+                    p.jit
+                        .iter()
+                        .find(|(start, size, _)| lookup >= *start && lookup - *start < *size)
+                }) {
+                    frame = format!("{name}+0x{:x} (JIT)", lookup - start);
+                }
+            }
             result.push_str("    ");
             result.push_str(&frame.replace(['\n', '\r'], "?"));
             result.push('\n');
@@ -454,6 +465,47 @@ pub(crate) fn demangle(name: &str) -> String {
     } else {
         name
     }
+}
+
+fn jit_symbols(pid: u32) -> Vec<(u64, u64, String)> {
+    let inner = std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()
+        .and_then(|text| {
+            text.lines().find_map(|line| {
+                line.strip_prefix("NSpid:")
+                    .and_then(|v| v.split_whitespace().last()?.parse::<u32>().ok())
+            })
+        })
+        .unwrap_or(pid);
+    let path = format!("/proc/{pid}/root/tmp/perf-{inner}.map");
+    let Ok(file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    if file.metadata().is_ok_and(|m| {
+        m.len() > 16 * 1024 * 1024
+            || std::fs::metadata(format!("/proc/{pid}")).is_ok_and(|p| p.uid() != m.uid())
+    }) {
+        return Vec::new();
+    }
+    let mut text = String::new();
+    if file
+        .take(16 * 1024 * 1024 + 1)
+        .read_to_string(&mut text)
+        .is_err()
+        || text.len() > 16 * 1024 * 1024
+    {
+        return Vec::new();
+    }
+    text.lines()
+        .take(250_000)
+        .filter_map(|line| {
+            let mut parts = line.splitn(3, ' ');
+            let start = u64::from_str_radix(parts.next()?, 16).ok()?;
+            let size = u64::from_str_radix(parts.next()?, 16).ok()?;
+            let name = parts.next()?.chars().take(4096).collect();
+            Some((start, size, name))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -514,5 +566,19 @@ mod tests {
             "demo::worker"
         );
         assert_eq!(demangle("_Z6workeri"), "worker(int)");
+    }
+    #[test]
+    fn target_owned_perf_maps_name_anonymous_jit_code() {
+        let pid = std::process::id();
+        let path = format!("/tmp/perf-{pid}.map");
+        let previous = std::fs::read(&path).ok();
+        std::fs::write(&path, b"dead0000 100 jit_fixture_name\n").unwrap();
+        let text = Symbolizer::default().stack(pid, &[0xdead0010]);
+        if let Some(previous) = previous {
+            std::fs::write(&path, previous).unwrap();
+        } else {
+            std::fs::remove_file(&path).unwrap();
+        }
+        assert!(text.contains("jit_fixture_name+0x10 (JIT)"), "{text}");
     }
 }

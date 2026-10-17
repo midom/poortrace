@@ -57,6 +57,9 @@ pub struct Tracer {
     pub exits: BTreeMap<i32, i32>,
     active: bool,
     held: BTreeSet<i32>,
+    follow: bool,
+    observe_syscalls: bool,
+    discovered: Vec<i32>,
 }
 fn ptrace(request: libc::c_uint, tid: i32, address: usize, data: usize) -> Result<libc::c_long> {
     let value = unsafe {
@@ -86,9 +89,15 @@ impl Tracer {
             exits: BTreeMap::new(),
             active: !launched,
             held: BTreeSet::new(),
+            follow: false,
+            observe_syscalls: true,
+            discovered: Vec::new(),
         };
-        let flags =
-            libc::PTRACE_O_TRACESYSGOOD | libc::PTRACE_O_TRACECLONE | libc::PTRACE_O_TRACEEXEC;
+        let flags = libc::PTRACE_O_TRACESYSGOOD
+            | libc::PTRACE_O_TRACECLONE
+            | libc::PTRACE_O_TRACEEXEC
+            | libc::PTRACE_O_TRACEFORK
+            | libc::PTRACE_O_TRACEVFORK;
         for tid in tids {
             ptrace(libc::PTRACE_SEIZE, tid, 0, flags as usize)?;
             tracer.tids.insert(tid);
@@ -96,6 +105,18 @@ impl Tracer {
             ptrace(libc::PTRACE_INTERRUPT, tid, 0, 0)?;
         }
         Ok(tracer)
+    }
+    pub fn trace_syscalls(&mut self, enabled: bool) {
+        self.observe_syscalls = enabled;
+    }
+    pub fn take_discovered(&mut self) -> Vec<i32> {
+        std::mem::take(&mut self.discovered)
+    }
+    pub fn follow_forks(&mut self, follow: bool) {
+        self.follow = follow;
+    }
+    pub fn targets(&self) -> BTreeSet<i32> {
+        self.tids.iter().filter_map(|tid| tgid(*tid)).collect()
     }
     pub fn is_empty(&self) -> bool {
         self.tids.is_empty()
@@ -142,7 +163,7 @@ impl Tracer {
                                 .and_then(|value| value.trim().parse::<i32>().ok())
                         })
                     });
-                if tgid.is_some_and(|tgid| tgid != self.pid) {
+                if !self.follow && tgid.is_some_and(|tgid| tgid != self.pid) {
                     let _ = ptrace(libc::PTRACE_DETACH, tid, 0, 0);
                     self.tids.remove(&tid);
                     self.initial.remove(&tid);
@@ -152,9 +173,12 @@ impl Tracer {
             self.tids.insert(tid);
             let signal = libc::WSTOPSIG(status);
             let event = status >> 16;
-            self.initial.remove(&tid);
+            let initial = self.initial.remove(&tid);
             let mut deliver = 0;
-            if event == libc::PTRACE_EVENT_CLONE {
+            if matches!(
+                event,
+                libc::PTRACE_EVENT_CLONE | libc::PTRACE_EVENT_FORK | libc::PTRACE_EVENT_VFORK
+            ) {
                 let mut child = 0usize;
                 ptrace(
                     libc::PTRACE_GETEVENTMSG,
@@ -165,6 +189,18 @@ impl Tracer {
                 self.tids.insert(child as i32);
                 self.initial.insert(child as i32);
             } else if event == libc::PTRACE_EVENT_EXEC {
+                let mut old = 0usize;
+                ptrace(
+                    libc::PTRACE_GETEVENTMSG,
+                    tid,
+                    0,
+                    (&mut old as *mut usize) as usize,
+                )?;
+                if old as i32 != tid {
+                    self.tids.remove(&(old as i32));
+                    self.initial.remove(&(old as i32));
+                    self.entries.remove(&(old as i32));
+                }
                 self.active = true;
                 self.entries.remove(&tid);
             } else if signal == (libc::SIGTRAP | 0x80) {
@@ -225,18 +261,42 @@ impl Tracer {
             } else {
                 deliver = signal;
             }
+            if initial && event == libc::PTRACE_EVENT_STOP && signal == libc::SIGTRAP {
+                self.discovered.push(tid);
+                self.held.insert(tid);
+                return Ok(output);
+            }
             // Dispatch each stop before resuming so memory helpers observe the stopped task.
             if !output.is_empty() {
                 self.held.insert(tid);
                 return Ok(output);
             }
-            ptrace(libc::PTRACE_SYSCALL, tid, 0, deliver as usize)?;
+            ptrace(
+                if self.observe_syscalls {
+                    libc::PTRACE_SYSCALL
+                } else {
+                    libc::PTRACE_CONT
+                },
+                tid,
+                0,
+                deliver as usize,
+            )?;
         }
         Ok(output)
     }
     pub fn resume(&mut self, tid: i32) -> Result<()> {
         self.held.remove(&tid);
-        ptrace(libc::PTRACE_SYSCALL, tid, 0, 0).map(|_| ())
+        ptrace(
+            if self.observe_syscalls {
+                libc::PTRACE_SYSCALL
+            } else {
+                libc::PTRACE_CONT
+            },
+            tid,
+            0,
+            0,
+        )
+        .map(|_| ())
     }
 }
 impl Tracer {
@@ -311,6 +371,72 @@ mod tests {
         assert_eq!(number("-1"), None);
         for (&number, &name) in names() {
             assert_eq!(super::number(name), Some(number));
+        }
+    }
+}
+
+pub fn tgid(tid: i32) -> Option<i32> {
+    std::fs::read_to_string(format!("/proc/{tid}/status"))
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("Tgid:")?.trim().parse().ok())
+}
+
+/// Decode native syscall stops for the shared function/syscall dispatcher.
+#[derive(Default)]
+pub struct Decoder {
+    entries: BTreeMap<i32, Entry>,
+}
+impl Decoder {
+    pub fn clear(&mut self, tid: i32) {
+        self.entries.remove(&tid);
+    }
+    pub fn stop(&mut self, tid: i32) -> Result<Option<Event>> {
+        let mut info = [0u8; 88];
+        let n = ptrace(0x420e, tid, info.len(), info.as_mut_ptr() as usize)? as usize;
+        if n < 24 {
+            return Err("PTRACE_GET_SYSCALL_INFO requires Linux 5.3+".into());
+        }
+        #[cfg(target_arch = "x86_64")]
+        let arch = 0xc000003eu32;
+        #[cfg(target_arch = "aarch64")]
+        let arch = 0xc00000b7u32;
+        if u32::from_ne_bytes(info[4..8].try_into().unwrap()) != arch {
+            return Err("native 64-bit syscall ABI required".into());
+        }
+        let word = |at| u64::from_ne_bytes(info[at..at + 8].try_into().unwrap());
+        if info[0] == 1 && n >= 80 {
+            let number = word(24) as i64;
+            let args = std::array::from_fn(|i| word(32 + i * 8));
+            self.entries.insert(
+                tid,
+                Entry {
+                    number,
+                    args,
+                    start: Instant::now(),
+                },
+            );
+            Ok(Some(Event {
+                tid,
+                enter: true,
+                number,
+                args,
+                retval: 0,
+                latency: 0,
+                ip: word(8),
+            }))
+        } else if info[0] == 2 && n >= 33 {
+            Ok(self.entries.remove(&tid).map(|e| Event {
+                tid,
+                enter: false,
+                number: e.number,
+                args: e.args,
+                retval: word(24) as i64,
+                latency: e.start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                ip: word(8),
+            }))
+        } else {
+            Ok(None)
         }
     }
 }

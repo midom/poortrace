@@ -19,3 +19,15 @@ pub type Result<T> = std::result::Result<T, String>;
 pub mod uprobe;
 
 pub mod functions;
+
+pub mod recording;
+
+pub mod usdt;
+
+pub mod python;
+
+pub mod types;
+
+pub mod wait;
+
+pub mod javascript;

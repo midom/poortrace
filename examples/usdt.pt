@@ -1,0 +1,2 @@
+// Replace the path/provider/name with values from --list-usdt /path/to/app.
+usdt:/path/to/app:provider:request* { @[probe, arg0] = count(); }

@@ -22,6 +22,12 @@ Serde for profile/report formats; LLVM is accessed through direct C API bindings
 - `src/runtime.rs`: event ABI, typed map keys, aggregations, formatting, output,
   and callbacks called by generated code.
 - `src/symbols.rs`: target mappings, ELF symbol lookup, and user-stack rendering.
+- `src/recording.rs`: bounded, versioned invocation/helper journals and offline replay.
+- `src/python.rs`: read-only, version-checked CPython frame walking.
+- `src/javascript.rs`: V8 metadata discovery and read-only JavaScript frames.
+- `src/types.rs`: bounded DWARF scalar/structure layout reads.
+- `src/usdt.rs`: SystemTap SDT notes and native argument descriptors.
+- `src/wait.rs`: sleeping-thread snapshots and observed wakeup transitions, not exact scheduler events.
 - `src/report.rs`: text/JSON reports, comparisons, folded stacks, Speedscope, and SVG flamegraphs.
 - `src/memory.rs`: bounded read-only process_vm_readv helpers.
 - `src/counters.rs`: grouped per-thread counter reads and scheduling-time scaling.
@@ -89,8 +95,9 @@ Do not change host perf policy to make tests pass.
   excluded, and inheritance disabled.
 - Existing threads are attached individually; new threads are currently found
   by scanning `/proc/PID/task` every 100 ms. Early events and threads that finish
-  between scans can be missed. Child processes are not followed. Do not describe
-  this as complete or immediate thread coverage.
+  between scans can be missed. Opt-in --track-threads attaches perf streams at
+  ptrace clone stops; --follow-forks also follows descendants across exec. Initial
+  attachment races remain. Do not describe default scanning as complete coverage.
 - Perf inheritance with `cpu=-1` has mmap sampling restrictions. Account for
   those restrictions when changing thread attachment.
 - Launched commands wait behind a pipe gate until attachment and `BEGIN` finish.
@@ -98,12 +105,15 @@ Do not change host perf policy to make tests pass.
 - Shutdown runs `END` and prints maps unless disabled. Early termination cleans
   up a launched process group; attached processes must never be signaled.
 - Perf samples are asynchronous, ordered within each stream, and not globally sorted.
-- Syscall probes use a separate ptrace backend; do not mix them with perf probes.
-  Use seize/interrupt and preserve signals/group stops; detach attached targets.
+- Syscall/function stops can share a run with perf samples. One ptracer owns
+  each target; preserve signals/group stops, launch gating, and detach cleanup.
+  Keep address-space breakpoint/semaphore state separate across private forks
+  and exec, and coordinate CLONE_VM/vfork address spaces.
 - Function probes default to ptrace. Restore patched text and rewind pending INT3
   stops before detach, coordinate all threads while stepping, and restore inherited
   breakpoints in fork children. Never silently fall back between intrusive backends.
-  Kernel perf uprobes are an explicit privileged alternative; no BPF is loaded.
+  Restore active SDT semaphores only in their matching images. Kernel perf
+  uprobes are an explicit privileged alternative; no BPF is loaded.
 - Off-CPU intervals require complete switch pairs; clear pending pairs on loss.
   Switch records do not carry a blocking stack or establish why a task waited.
 - Counter reads distinguish raw counts, scheduling times, and scaled estimates.
@@ -129,3 +139,12 @@ Do not change host perf policy to make tests pass.
 - Retain parser/resource limits and type checks when extending the language.
   Update `README.md`, examples, CLI help, and tests when user-visible behavior
   changes.
+
+- Script repeats share a 4096-iteration invocation budget; local arrays and
+  inlined expression functions must retain parser, expansion, and type limits.
+- Replay must validate helper result types before exposing pointers to JIT code.
+  Never read current target memory to reconstruct a recorded helper result.
+- CPython and V8 ScopeInfo layouts are explicitly version gated; unavailable/racy
+  frames are observable labels. V8 heap reads are bounded and read-only; sampled
+  stack slots must come from the captured stack rather than a later live stack.
+- Polling wait/wakeup observations do not identify wakers or exact sleep times.

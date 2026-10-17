@@ -46,6 +46,30 @@ struct Args {
     /// List supported probes/events
     #[arg(short = 'l', long)]
     list: bool,
+    /// Save handler events and helper results for offline replay
+    #[arg(long, conflicts_with_all=["replay","stat"])]
+    record: Option<PathBuf>,
+    /// Replay a recording without attaching to a live target
+    #[arg(long, conflicts_with_all=["expression","script","pid","shell_command","command","stat","check","emit_llvm","list","list_functions","list_usdt","track_threads","follow_forks","live","window","duration"])]
+    replay: Option<PathBuf>,
+    /// Sort recorded events globally by monotonic timestamp during replay
+    #[arg(long, requires = "replay")]
+    sort_events: bool,
+    /// List SystemTap SDT probes without attaching
+    #[arg(long)]
+    list_usdt: Option<String>,
+    /// List ELF functions and file offsets without attaching
+    #[arg(long)]
+    list_functions: Option<String>,
+    /// Glob used by --list-functions (raw or demangled names)
+    #[arg(long, default_value = "*")]
+    function_filter: String,
+    /// Track thread creation with ptrace instead of periodic discovery
+    #[arg(long)]
+    track_threads: bool,
+    /// Follow child processes (uses ptrace lifecycle tracking)
+    #[arg(short = 'f', long)]
+    follow_forks: bool,
     /// Function probe backend: ptrace works without privileged perf uprobes
     #[arg(long,default_value="ptrace",value_parser=["ptrace","perf"])]
     uprobe_backend: String,
@@ -69,12 +93,18 @@ struct Args {
     /// Show the largest N entries in each map
     #[arg(long,value_parser=clap::value_parser!(u32).range(1..))]
     top: Option<u32>,
+    /// Histogram quantiles (0..1); reports the bucket containing each rank
+    #[arg(long, value_delimiter = ',')]
+    quantiles: Vec<f64>,
     /// Add percentages to text map reports
     #[arg(long)]
     percent: bool,
     /// Add per-second rates to text map reports
     #[arg(long)]
     rate: bool,
+    /// Refresh cumulative text maps at this interval; redraw terminals in place
+    #[arg(long,value_parser=duration,conflicts_with_all=["window","output"])]
+    live: Option<Duration>,
     /// Print and clear text maps on this wall-clock interval
     #[arg(long,value_parser=duration)]
     window: Option<Duration>,
@@ -84,7 +114,7 @@ struct Args {
     /// Stack unwinder: frame pointers or sampled-stack DWARF CFI
     #[arg(long,default_value="fp",value_parser=["fp","dwarf"])]
     stack_mode: String,
-    /// Bytes of target stack captured per DWARF sample; multiple of 8
+    /// Bytes of target stack captured for DWARF/jsstack; multiple of 8
     #[arg(long,default_value_t=16384,value_parser=clap::value_parser!(u32).range(8..=32768))]
     stack_bytes: u32,
     /// Capture user branch history where the PMU supports it
@@ -147,8 +177,36 @@ fn main() {
     }
 }
 fn run(args: Args) -> Result<i32> {
+    if let Some(path) = &args.list_usdt {
+        for site in poortrace::usdt::sites(args.pid.unwrap_or(std::process::id() as i32), path)? {
+            println!(
+                "{}:{} 0x{:x} args={} semaphore={:?}",
+                site.provider,
+                site.name,
+                site.offset,
+                site.arguments.len(),
+                site.semaphore_delta
+            );
+        }
+        return Ok(0);
+    }
+    if let Some(path) = &args.list_functions {
+        for function in poortrace::uprobe::functions(
+            args.pid.unwrap_or(std::process::id() as i32),
+            path,
+            &args.function_filter,
+        )? {
+            println!(
+                "0x{:x} {} [{}]",
+                function.offset, function.name, function.demangled
+            );
+        }
+        return Ok(0);
+    }
     if args.list {
-        println!("BEGIN\nEND\ninterval:{{ns,us,ms,s,hz}}:N\nprofile:{{ns,us,ms,s,hz}}:N");
+        println!(
+            "BEGIN\nEND\ninterval:{{ns,us,ms,s,hz}}:N\nprofile:{{ns,us,ms,s,hz}}:N\nwait:{{ms,s,hz}}:N\nwakeup:{{ms,s,hz}}:N\nuprobe:PATH:FUNCTION\nuretprobe:PATH:FUNCTION\nusdt:PATH:PROVIDER:NAME"
+        );
         println!(
             "offcpu\nwatchpoint:ADDRESS:LENGTH:{{r,w,rw,x}}\nraw:CONFIG[:PERIOD]\npmu:NAME:CONFIG[:PERIOD]\ncache:CACHE:OP:RESULT[:PERIOD]\nsyscall:{{enter,exit}}:{{NAME,NUMBER,*}}"
         );
@@ -166,14 +224,32 @@ fn run(args: Args) -> Result<i32> {
     if args.stack_bytes % 8 != 0 {
         return Err("--stack-bytes must be a multiple of 8".into());
     }
+    if args.live.is_some() && args.output_format != "text" {
+        return Err("--live requires text output".into());
+    }
     if args.window.is_some() && (args.output_format != "text" || args.output.is_some()) {
         return Err("--window supports text reports on stdout; omit --output".into());
     }
-    if args.compare.is_some() && !matches!(args.output_format.as_str(), "text" | "json") {
-        return Err("--compare supports signed text or JSON reports".into());
+    if !args.quantiles.is_empty() && args.output_format != "text" {
+        return Err("--quantiles applies to text reports".into());
+    }
+    if args
+        .quantiles
+        .iter()
+        .any(|n| !n.is_finite() || *n < 0.0 || *n > 1.0)
+    {
+        return Err("--quantiles must be finite values from 0 to 1".into());
+    }
+    if args.compare.is_some()
+        && !matches!(args.output_format.as_str(), "text" | "json" | "flamegraph")
+    {
+        return Err("--compare supports signed text, JSON, or flamegraph reports".into());
     }
     if (args.percent || args.rate) && args.output_format != "text" {
         return Err("--percent and --rate apply to text reports".into());
+    }
+    if let Some(path) = &args.replay {
+        return run_replay(&args, path);
     }
     if args.stat {
         return run_stat(&args);
@@ -195,7 +271,7 @@ fn run(args: Args) -> Result<i32> {
     } else {
         return Err("provide -e SCRIPT or a script file (see --help)".into());
     };
-    let program = Program::compile(&source)?;
+    let mut program = Program::compile(&source)?;
     if args.emit_llvm {
         print!("{}", program.ir);
         return Ok(0);
@@ -208,7 +284,91 @@ fn run(args: Args) -> Result<i32> {
         );
         return Ok(0);
     }
-    if (program.has_perf() || program.has_syscalls())
+    for clause in &mut program.clauses {
+        let mut probes = Vec::new();
+        for (name, probe) in &clause.probes {
+            if let Probe::Uprobe {
+                path,
+                function,
+                ret,
+            } = probe
+            {
+                if let Some(selector) = function.strip_prefix("__usdt__") {
+                    if args.uprobe_backend != "ptrace" {
+                        return Err("SDT probes require --uprobe-backend ptrace".into());
+                    }
+                    let (provider, marker) = selector
+                        .split_once(':')
+                        .ok_or("SDT requires PROVIDER:NAME")?;
+                    for site in
+                        poortrace::usdt::sites(args.pid.unwrap_or(std::process::id() as i32), path)?
+                    {
+                        if poortrace::uprobe::matches(provider, &site.provider)
+                            && poortrace::uprobe::matches(marker, &site.name)
+                        {
+                            probes.push((
+                                format!("usdt:{path}:{}:{}", site.provider, site.name),
+                                Probe::Uprobe {
+                                    path: path.clone(),
+                                    function: format!(
+                                        "__sdt__{}",
+                                        serde_json::to_string(&site).map_err(|e| e.to_string())?
+                                    ),
+                                    ret: false,
+                                },
+                            ));
+                        }
+                    }
+                    if probes.is_empty() {
+                        return Err(format!("no SDT probes matched {selector} in {path}"));
+                    }
+                } else if function.contains(['*', '?']) {
+                    let matches = poortrace::uprobe::functions(
+                        args.pid.unwrap_or(std::process::id() as i32),
+                        path,
+                        function,
+                    )?;
+                    if matches.is_empty() {
+                        return Err(format!(
+                            "function pattern {function:?} matched no symbols in {path}"
+                        ));
+                    }
+                    let mut offsets = BTreeSet::new();
+                    for found in matches {
+                        if offsets.insert(found.offset) {
+                            probes.push((
+                                format!(
+                                    "{}:{path}:{}",
+                                    if *ret { "uretprobe" } else { "uprobe" },
+                                    found.name
+                                ),
+                                Probe::Uprobe {
+                                    path: path.clone(),
+                                    function: format!("0x{:x}", found.offset),
+                                    ret: *ret,
+                                },
+                            ));
+                        }
+                    }
+                } else {
+                    probes.push((name.clone(), probe.clone()));
+                }
+            } else {
+                probes.push((name.clone(), probe.clone()));
+            }
+            if probes.len() > 256 {
+                return Err("expanded probe limit (256) exceeded".into());
+            }
+        }
+        clause.probes = probes;
+    }
+    if (program.has_perf()
+        || program.has_syscalls()
+        || program.clauses.iter().any(|c| {
+            c.probes
+                .iter()
+                .any(|(_, p)| matches!(p, Probe::Wait(_) | Probe::Wakeup(_)))
+        }))
         && args.pid.is_none()
         && args.command.is_empty()
         && args.shell_command.is_none()
@@ -222,28 +382,17 @@ fn run(args: Args) -> Result<i32> {
             .any(|(_, probe)| matches!(probe, Probe::Uprobe { .. }))
     }) && args.uprobe_backend == "ptrace"
     {
-        if program.has_syscalls()
-            || program.clauses.iter().any(|clause| {
-                clause
-                    .probes
-                    .iter()
-                    .any(|(_, probe)| probe.is_perf() && !matches!(probe, Probe::Uprobe { .. }))
-            })
-        {
-            return Err("ptrace function probes cannot mix with syscall or perf probes; BEGIN/END/interval handlers are supported".into());
-        }
         return run_functions(&args, &program);
     }
-    if program.has_syscalls() {
-        if program.has_perf() {
-            return Err("syscall probes use ptrace and cannot be mixed with perf probes; interval/BEGIN/END handlers are supported".into());
-        }
+    if program.has_syscalls() || args.follow_forks || args.track_threads {
         return run_syscalls(&args, &program);
     }
     let capture = Capture {
         addr: true,
         callchain: program.needs_ustack(),
-        dwarf_stack: if args.stack_mode == "dwarf" && program.needs_ustack() {
+        dwarf_stack: if (args.stack_mode == "dwarf" && program.needs_ustack())
+            || program.needs_jsstack()
+        {
             args.stack_bytes
         } else {
             0
@@ -260,7 +409,7 @@ fn run(args: Args) -> Result<i32> {
     let mut child = if command.is_empty() {
         None
     } else {
-        Some(Child::spawn(&command)?)
+        Some(Child::spawn(&command, args.follow_forks)?)
     };
     let target = child.as_ref().map(|c| c.pid).or(args.pid);
     if target.is_some_and(|pid| !alive(pid)) {
@@ -293,6 +442,7 @@ fn run(args: Args) -> Result<i32> {
     let stdout = io::stdout();
     let mut state = program.state(io::BufWriter::new(stdout.lock()));
     configure_report(&mut state, &args)?;
+    configure_record(&mut state, &args, &program)?;
     state.max_entries = args.max_map_entries as usize;
     invoke_kind(&program, &mut state, target, true);
     state.flush()?;
@@ -323,6 +473,8 @@ fn run(args: Args) -> Result<i32> {
         .collect();
     let mut lost = 0u64;
     let mut window_start = Instant::now();
+    let mut live_start = Instant::now();
+    let mut waits = poortrace::wait::Poller::new(&program, args.stack_bytes as usize);
     let result = (|| -> Result<()> {
         let mut refresh = Instant::now();
         loop {
@@ -331,6 +483,7 @@ fn run(args: Args) -> Result<i32> {
             } else {
                 false
             };
+            dispatch_waits(&program, &mut state, &mut waits, target)?;
             drain(&program, &mut state, &mut streams, &mut lost)?;
             if state.stopped || INTERRUPTED.load(Ordering::Relaxed) || child_done {
                 break;
@@ -375,6 +528,14 @@ fn run(args: Args) -> Result<i32> {
                 state.clear_all();
                 window_start = Instant::now();
             }
+            if args
+                .live
+                .is_some_and(|period| live_start.elapsed() >= period)
+            {
+                state.report.elapsed = start.elapsed().as_secs_f64();
+                state.live_snapshot();
+                live_start = Instant::now();
+            }
             state.flush()?;
             if state.stopped {
                 break;
@@ -382,7 +543,7 @@ fn run(args: Args) -> Result<i32> {
             if streams.is_empty() && timers.is_empty() && target.is_none() {
                 break;
             }
-            let mut wait = Duration::from_millis(20);
+            let mut wait = Duration::from_millis(20).min(waits.delay());
             for (_, _, _, deadline) in &timers {
                 wait = wait.min(deadline.saturating_duration_since(Instant::now()));
             }
@@ -465,9 +626,6 @@ fn attach(
     capture: Capture,
 ) -> Result<()> {
     if !program.has_perf() {
-        if !alive(pid) {
-            return Err(format!("PID {pid} does not exist or has exited"));
-        }
         return Ok(());
     }
     let tids = match threads(pid) {
@@ -477,7 +635,8 @@ fn attach(
     };
     for (clause, c) in program.clauses.iter().enumerate() {
         for (name, probe) in &c.probes {
-            if !probe.is_perf() {
+            if !probe.is_perf() || capture.ptrace_functions && matches!(probe, Probe::Uprobe { .. })
+            {
                 continue;
             }
             for tid in &tids {
@@ -487,9 +646,9 @@ fn attach(
                 {
                     continue;
                 }
-                let event = PerfEvent::open_config(*tid, probe, pages, on_exec, capture);
+                let event = PerfEvent::try_open_config(*tid, probe, pages, on_exec, capture);
                 match event {
-                    Ok(event) => {
+                    Ok(Some(event)) => {
                         if enabled {
                             event.enable()?;
                         }
@@ -504,8 +663,8 @@ fn attach(
                             switched_out: None,
                         });
                     }
-                    Err(_)
-                        if !std::path::Path::new(&format!("/proc/{pid}/task/{tid}")).exists() => {}
+                    Ok(None) => {}
+                    Err(_) if !alive(*tid) => {}
                     Err(e) => return Err(format!("{name}: {e}")),
                 }
             }
@@ -519,6 +678,21 @@ fn drain(
     streams: &mut Vec<Stream>,
     lost: &mut u64,
 ) -> Result<()> {
+    let mut fds: Vec<_> = streams
+        .iter()
+        .map(|s| libc::pollfd {
+            fd: s.event.fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        })
+        .collect();
+    let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 0) };
+    if result < 0 && io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+        return Err(io::Error::last_os_error().to_string());
+    }
+    for (stream, fd) in streams.iter_mut().zip(fds) {
+        stream.hup |= fd.revents & libc::POLLHUP != 0;
+    }
     for stream in streams.iter_mut() {
         for record in stream.event.drain()? {
             match record {
@@ -619,9 +793,13 @@ fn invoke(
         }
     };
     let name = CString::new(name).unwrap();
-    let frames = sample
-        .map(|sample| state.unwind_sample(sample))
-        .unwrap_or_default();
+    let frames = if program.needs_ustack() {
+        sample
+            .map(|sample| state.unwind_sample(sample))
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let mut event = Event::new(comm, &name).with_ustack(&frames).with_branches(
         sample
             .map(|sample| sample.branches.as_slice())
@@ -638,7 +816,13 @@ fn invoke(
     event.nsecs = sample.map(|s| s.time).unwrap_or_else(monotonic_ns);
     event.ip = sample.map(|s| s.ip).unwrap_or(0);
     event.period = sample.map(|s| s.period).unwrap_or(0);
+    state.js_snapshot = if program.needs_jsstack() {
+        sample.and_then(|sample| sample.regs.map(|regs| (regs, sample.stack.clone())))
+    } else {
+        None
+    };
     program.invoke(clause, state, &event);
+    state.js_snapshot = None;
 }
 fn invoke_kind(program: &Program, state: &mut State<'_>, target: Option<i32>, begin: bool) {
     for (id, c) in program.clauses.iter().enumerate() {
@@ -663,9 +847,16 @@ struct Child {
     pid: i32,
     gate: Option<OwnedFd>,
     status: Option<i32>,
+    descendants: std::collections::BTreeMap<i32, OwnedFd>,
 }
 impl Child {
-    fn spawn(args: &[String]) -> Result<Self> {
+    fn spawn(args: &[String], follow: bool) -> Result<Self> {
+        if follow && unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } < 0 {
+            return Err(format!(
+                "enabling owned descendant reaping: {}",
+                io::Error::last_os_error()
+            ));
+        }
         let args: Vec<CString> = args
             .iter()
             .map(|s| CString::new(s.as_str()).map_err(|_| "command contains NUL".to_string()))
@@ -718,7 +909,21 @@ impl Child {
             pid,
             gate: Some(write),
             status: None,
+            descendants: std::collections::BTreeMap::new(),
         })
+    }
+    fn kill_descendants(&self) {
+        for fd in self.descendants.values() {
+            unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    fd.as_raw_fd(),
+                    libc::SIGKILL,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0u32,
+                );
+            }
+        }
     }
     fn start(&mut self) -> Result<()> {
         if let Some(fd) = self.gate.take() {
@@ -757,6 +962,7 @@ impl Child {
 }
 impl Drop for Child {
     fn drop(&mut self) {
+        self.kill_descendants();
         if self.status.is_none() {
             unsafe {
                 libc::kill(-self.pid, libc::SIGKILL);
@@ -766,6 +972,14 @@ impl Drop for Child {
                 if unsafe { libc::waitpid(self.pid, std::ptr::null_mut(), 0) } >= 0
                     || io::Error::last_os_error().raw_os_error() != Some(libc::EINTR)
                 {
+                    break;
+                }
+            }
+        }
+        if !self.descendants.is_empty() {
+            loop {
+                let result = unsafe { libc::waitpid(-1, std::ptr::null_mut(), 0) };
+                if result < 0 && io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
                     break;
                 }
             }
@@ -785,6 +999,7 @@ fn configure_report(state: &mut State<'_>, args: &Args) -> Result<()> {
         top: args.top.map(|n| n as usize),
         percent: args.percent,
         rate: args.rate,
+        quantiles: args.quantiles.clone(),
         baseline: args
             .compare
             .as_ref()
@@ -796,6 +1011,9 @@ fn configure_report(state: &mut State<'_>, args: &Args) -> Result<()> {
     Ok(())
 }
 fn finish_report(state: &mut State<'_>, args: &Args, elapsed: Duration) -> Result<()> {
+    if let Some(recorder) = &mut state.recorder {
+        recorder.flush()?;
+    }
     state.report.elapsed = elapsed.as_secs_f64();
     if let Some(path) = &args.output {
         let report = state.render_report()?;
@@ -809,6 +1027,10 @@ fn run_stat(args: &Args) -> Result<i32> {
     if !matches!(args.output_format.as_str(), "text" | "json")
         || args.compare.is_some()
         || args.window.is_some()
+        || args.live.is_some()
+        || !args.quantiles.is_empty()
+        || args.percent
+        || args.rate
     {
         return Err("--stat supports final text or JSON counter reports".into());
     }
@@ -817,13 +1039,21 @@ fn run_stat(args: &Args) -> Result<i32> {
     let mut child = if command.is_empty() {
         None
     } else {
-        Some(Child::spawn(&command)?)
+        Some(Child::spawn(&command, args.follow_forks)?)
     };
     let pid = child
         .as_ref()
         .map(|c| c.pid)
         .or(args.pid)
         .ok_or("--stat requires -p PID or a command")?;
+    let mut monitor = if args.follow_forks || args.track_threads {
+        let mut monitor = poortrace::syscall::Tracer::seize(pid, threads(pid)?, child.is_some())?;
+        monitor.follow_forks(args.follow_forks);
+        monitor.trace_syscalls(false);
+        Some(monitor)
+    } else {
+        None
+    };
     let mut groups = std::collections::BTreeMap::new();
     for tid in threads(pid)? {
         groups.insert(
@@ -843,7 +1073,33 @@ fn run_stat(args: &Args) -> Result<i32> {
     let mut refresh = Instant::now();
     let mut readings = Vec::new();
     loop {
-        let done = if let Some(child) = &mut child {
+        let done = if let Some(monitor) = &mut monitor {
+            monitor.poll()?;
+            track_owned_descendants(&mut child, args.follow_forks, monitor.targets())?;
+            for tid in monitor.take_discovered() {
+                if let std::collections::btree_map::Entry::Vacant(entry) = groups.entry(tid) {
+                    let group = poortrace::counters::Group::open(tid, &args.stat_events, false)?;
+                    group.enable()?;
+                    entry.insert(group);
+                }
+                monitor.resume(tid)?;
+            }
+            if let Some(child) = &mut child {
+                if let Some(code) = (!monitor.targets().contains(&child.pid))
+                    .then(|| monitor.exits.remove(&child.pid))
+                    .flatten()
+                {
+                    child.status = Some(code);
+                    if !args.follow_forks {
+                        unsafe {
+                            libc::kill(-child.pid, libc::SIGKILL);
+                        }
+                    }
+                }
+            }
+            monitor.is_empty()
+                || !args.follow_forks && child.as_ref().is_some_and(|child| child.status.is_some())
+        } else if let Some(child) = &mut child {
             child.check()?.is_some()
         } else {
             !alive(pid)
@@ -855,7 +1111,14 @@ fn run_stat(args: &Args) -> Result<i32> {
             break;
         }
         if refresh.elapsed() >= Duration::from_millis(100) {
-            let tids = threads(pid).unwrap_or_default();
+            let targets = monitor
+                .as_ref()
+                .map(|monitor| monitor.targets())
+                .unwrap_or_else(|| BTreeSet::from([pid]));
+            let tids: BTreeSet<_> = targets
+                .into_iter()
+                .flat_map(|target| threads(target).unwrap_or_default())
+                .collect();
             let dead: Vec<_> = groups
                 .keys()
                 .filter(|tid| !tids.contains(tid))
@@ -873,9 +1136,7 @@ fn run_stat(args: &Args) -> Result<i32> {
                             group.enable()?;
                             entry.insert(group);
                         }
-                        Err(_)
-                            if !std::path::Path::new(&format!("/proc/{pid}/task/{tid}"))
-                                .exists() => {}
+                        Err(_) if !std::path::Path::new(&format!("/proc/{tid}")).exists() => {}
                         Err(error) => return Err(error),
                     }
                 }
@@ -883,7 +1144,23 @@ fn run_stat(args: &Args) -> Result<i32> {
             refresh = Instant::now();
         }
         unsafe {
-            libc::poll(std::ptr::null_mut(), 0, 20);
+            libc::poll(
+                std::ptr::null_mut(),
+                0,
+                if monitor.is_some() { 1 } else { 20 },
+            );
+        }
+    }
+    if let Some(monitor) = &mut monitor {
+        kill_owned_descendants(child.as_ref(), args.follow_forks, monitor.targets());
+        monitor.detach();
+        if let Some(child) = &mut child {
+            if let Some(code) = (!monitor.targets().contains(&child.pid))
+                .then(|| monitor.exits.remove(&child.pid))
+                .flatten()
+            {
+                child.status = Some(code);
+            }
         }
     }
     for group in groups.values() {
@@ -936,15 +1213,12 @@ fn run_stat(args: &Args) -> Result<i32> {
     Ok(child.as_ref().and_then(|child| child.status).unwrap_or(0))
 }
 fn run_syscalls(args: &Args, program: &Program) -> Result<i32> {
-    if args.branch_stack {
-        return Err("branch history is available with perf probes, not syscall probes".into());
-    }
     install_signals()?;
     let command = command_for(args);
     let mut child = if command.is_empty() {
         None
     } else {
-        Some(Child::spawn(&command)?)
+        Some(Child::spawn(&command, args.follow_forks)?)
     };
     let pid = child
         .as_ref()
@@ -952,19 +1226,55 @@ fn run_syscalls(args: &Args, program: &Program) -> Result<i32> {
         .or(args.pid)
         .ok_or("syscall probes require a target")?;
     let mut tracer = poortrace::syscall::Tracer::seize(pid, threads(pid)?, child.is_some())?;
+    tracer.follow_forks(args.follow_forks);
+    tracer.trace_syscalls(program.has_syscalls());
+    let capture = Capture {
+        ptrace_functions: false,
+        addr: true,
+        callchain: program.needs_ustack(),
+        dwarf_stack: if (args.stack_mode == "dwarf" && program.needs_ustack())
+            || program.needs_jsstack()
+        {
+            args.stack_bytes
+        } else {
+            0
+        },
+        branches: args.branch_stack || program.needs_branches(),
+        ..Default::default()
+    };
+    let mut streams = Vec::new();
+    attach(
+        program,
+        pid,
+        args.mmap_pages,
+        &mut streams,
+        false,
+        child.is_some(),
+        capture,
+    )?;
+    let mut lost = 0;
+    let mut refresh = Instant::now();
     let stdout = io::stdout();
     let mut state = program.state(io::BufWriter::new(stdout.lock()));
     configure_report(&mut state, args)?;
+    configure_record(&mut state, args, program)?;
     state.max_entries = args.max_map_entries as usize;
     invoke_kind(program, &mut state, Some(pid), true);
     state.flush()?;
     if !state.stopped {
+        for stream in &streams {
+            if !stream.on_exec {
+                stream.event.enable()?;
+            }
+        }
         if let Some(child) = &mut child {
             child.start()?;
         }
     }
     let start = Instant::now();
     let mut window_start = start;
+    let mut live_start = start;
+    let mut waits = poortrace::wait::Poller::new(program, args.stack_bytes as usize);
     let mut timers: Vec<_> = program
         .clauses
         .iter()
@@ -986,12 +1296,66 @@ fn run_syscalls(args: &Args, program: &Program) -> Result<i32> {
                 .duration
                 .is_some_and(|duration| start.elapsed() >= duration)
         {
+            dispatch_waits(program, &mut state, &mut waits, tracer.targets())?;
+            drain(program, &mut state, &mut streams, &mut lost)?;
+            if state.stopped {
+                break;
+            }
+            if refresh.elapsed() >= Duration::from_millis(10) {
+                for target in tracer.targets() {
+                    attach(
+                        program,
+                        target,
+                        args.mmap_pages,
+                        &mut streams,
+                        true,
+                        false,
+                        capture,
+                    )?;
+                }
+                refresh = Instant::now();
+            }
             let events = tracer.poll()?;
+            track_owned_descendants(&mut child, args.follow_forks, tracer.targets())?;
+            for tid in tracer.take_discovered() {
+                attach(
+                    program,
+                    poortrace::syscall::tgid(tid).unwrap_or(tid),
+                    args.mmap_pages,
+                    &mut streams,
+                    true,
+                    false,
+                    capture,
+                )?;
+                tracer.resume(tid)?;
+            }
             let idle = events.is_empty();
             for event in events {
                 let name = poortrace::syscall::name(event.number);
                 let syscall_name = CString::new(name).unwrap();
-                let comm = task_comm(pid, event.tid);
+                let event_pid = poortrace::syscall::tgid(event.tid).unwrap_or(pid);
+                let comm = task_comm(event_pid, event.tid);
+                let frames = if program.needs_ustack() {
+                    let regs = poortrace::functions::user_registers(event.tid)?;
+                    let stack = poortrace::memory::read(
+                        event.tid as u32,
+                        regs.sp,
+                        args.stack_bytes as usize,
+                        true,
+                    )
+                    .unwrap_or_default();
+                    state.unwind_sample(&poortrace::perf::Sample {
+                        pid: event_pid as u32,
+                        tid: event.tid as u32,
+                        ip: regs.ip,
+                        regs: Some(regs),
+                        stack,
+                        callchain: vec![regs.ip],
+                        ..Default::default()
+                    })
+                } else {
+                    Vec::new()
+                };
                 for (id, clause) in program.clauses.iter().enumerate() {
                     for (probe_name, probe) in &clause.probes {
                         if let Probe::Syscall { enter, number } = probe {
@@ -1001,9 +1365,10 @@ fn run_syscalls(args: &Args, program: &Program) -> Result<i32> {
                                 continue;
                             }
                             let probe_name = CString::new(probe_name.as_str()).unwrap();
-                            let mut sample =
-                                Event::new(&comm, &probe_name).with_syscall(&syscall_name);
-                            sample.pid = pid as u64;
+                            let mut sample = Event::new(&comm, &probe_name)
+                                .with_syscall(&syscall_name)
+                                .with_ustack(&frames);
+                            sample.pid = event_pid as u64;
                             sample.tid = event.tid as u64;
                             sample.nsecs = monotonic_ns();
                             sample.ip = event.ip;
@@ -1026,15 +1391,20 @@ fn run_syscalls(args: &Args, program: &Program) -> Result<i32> {
                 }
             }
             if let Some(child) = &mut child {
-                if let Some(code) = tracer.exits.remove(&child.pid) {
+                if let Some(code) = (!tracer.targets().contains(&child.pid))
+                    .then(|| tracer.exits.remove(&child.pid))
+                    .flatten()
+                {
                     child.status = Some(code);
-                    unsafe {
-                        libc::kill(-child.pid, libc::SIGKILL);
+                    if !args.follow_forks {
+                        unsafe {
+                            libc::kill(-child.pid, libc::SIGKILL);
+                        }
+                        break;
                     }
-                    break;
                 }
             }
-            if tracer.is_empty() || (!alive(pid) && idle) {
+            if tracer.is_empty() || (!args.follow_forks && !tracer.targets().contains(&pid)) {
                 break;
             }
             for (id, name, period, deadline) in &mut timers {
@@ -1052,6 +1422,14 @@ fn run_syscalls(args: &Args, program: &Program) -> Result<i32> {
                 state.clear_all();
                 window_start = Instant::now();
             }
+            if args
+                .live
+                .is_some_and(|period| live_start.elapsed() >= period)
+            {
+                state.report.elapsed = start.elapsed().as_secs_f64();
+                state.live_snapshot();
+                live_start = Instant::now();
+            }
             state.flush()?;
             if idle {
                 unsafe {
@@ -1062,10 +1440,23 @@ fn run_syscalls(args: &Args, program: &Program) -> Result<i32> {
         Ok(())
     })();
     // Detach before dropping an owned child or returning to an attached target.
+    let drain_result = (|| -> Result<()> {
+        for stream in &streams {
+            stream.event.disable()?;
+        }
+        if !state.stopped {
+            drain(program, &mut state, &mut streams, &mut lost)?;
+        }
+        Ok(())
+    })();
+    kill_owned_descendants(child.as_ref(), args.follow_forks, tracer.targets());
     tracer.detach();
     if let Some(child) = &mut child {
         if child.status.is_none() {
-            if let Some(code) = tracer.exits.remove(&child.pid) {
+            if let Some(code) = (!tracer.targets().contains(&child.pid))
+                .then(|| tracer.exits.remove(&child.pid))
+                .flatten()
+            {
                 child.status = Some(code);
                 unsafe {
                     libc::kill(-child.pid, libc::SIGKILL);
@@ -1079,19 +1470,20 @@ fn run_syscalls(args: &Args, program: &Program) -> Result<i32> {
     finish_report(&mut state, args, window_start.elapsed())?;
     state.flush()?;
     result?;
+    drain_result?;
+    if lost != 0 {
+        eprintln!("poortrace: lost {lost} perf samples");
+    }
     Ok(child.as_ref().and_then(|child| child.status).unwrap_or(0))
 }
 
 fn run_functions(args: &Args, program: &Program) -> Result<i32> {
-    if args.branch_stack || program.needs_branches() {
-        return Err("ptrace function probes do not capture PMU branch history".into());
-    }
     install_signals()?;
     let command = command_for(args);
     let mut child = if command.is_empty() {
         None
     } else {
-        Some(Child::spawn(&command)?)
+        Some(Child::spawn(&command, args.follow_forks)?)
     };
     let pid = child
         .as_ref()
@@ -1119,19 +1511,55 @@ fn run_functions(args: &Args, program: &Program) -> Result<i32> {
     }
     let mut tracer =
         poortrace::functions::Tracer::seize(pid, threads(pid)?, &specs, child.is_some())?;
+    tracer.trace_syscalls(program.has_syscalls());
+    tracer.follow_forks(args.follow_forks);
+    let capture = Capture {
+        ptrace_functions: true,
+        addr: true,
+        callchain: program.needs_ustack(),
+        dwarf_stack: if (args.stack_mode == "dwarf" && program.needs_ustack())
+            || program.needs_jsstack()
+        {
+            args.stack_bytes
+        } else {
+            0
+        },
+        branches: args.branch_stack || program.needs_branches(),
+        ..Default::default()
+    };
+    let mut streams = Vec::new();
+    attach(
+        program,
+        pid,
+        args.mmap_pages,
+        &mut streams,
+        false,
+        child.is_some(),
+        capture,
+    )?;
+    let mut lost = 0;
+    let mut refresh = Instant::now();
     let stdout = io::stdout();
     let mut state = program.state(io::BufWriter::new(stdout.lock()));
     configure_report(&mut state, args)?;
+    configure_record(&mut state, args, program)?;
     state.max_entries = args.max_map_entries as usize;
     invoke_kind(program, &mut state, Some(pid), true);
     state.flush()?;
     if !state.stopped {
+        for stream in &streams {
+            if !stream.on_exec {
+                stream.event.enable()?;
+            }
+        }
         if let Some(child) = &mut child {
             child.start()?;
         }
     }
     let start = Instant::now();
     let mut window_start = start;
+    let mut live_start = start;
+    let mut waits = poortrace::wait::Poller::new(program, args.stack_bytes as usize);
     let mut timers: Vec<_> = program
         .clauses
         .iter()
@@ -1153,12 +1581,73 @@ fn run_functions(args: &Args, program: &Program) -> Result<i32> {
                 .duration
                 .is_some_and(|duration| start.elapsed() >= duration)
         {
+            dispatch_waits(program, &mut state, &mut waits, tracer.targets())?;
+            drain(program, &mut state, &mut streams, &mut lost)?;
+            if state.stopped {
+                break;
+            }
+            if refresh.elapsed() >= Duration::from_millis(10) {
+                for target in tracer.targets() {
+                    attach(
+                        program,
+                        target,
+                        args.mmap_pages,
+                        &mut streams,
+                        true,
+                        false,
+                        capture,
+                    )?;
+                }
+                refresh = Instant::now();
+            }
             let events = tracer.poll()?;
+            track_owned_descendants(&mut child, args.follow_forks, tracer.targets())?;
+            for tid in tracer.take_discovered() {
+                attach(
+                    program,
+                    poortrace::syscall::tgid(tid).unwrap_or(tid),
+                    args.mmap_pages,
+                    &mut streams,
+                    true,
+                    false,
+                    capture,
+                )?;
+            }
             let idle = events.is_empty();
             for event in events {
-                let (id, name) = &bindings[event.binding];
-                let name = CString::new(name.as_str()).unwrap();
-                let comm = task_comm(pid, event.tid);
+                let destinations: Vec<(usize, String)> = if let Some(syscall) = &event.syscall {
+                    program
+                        .clauses
+                        .iter()
+                        .enumerate()
+                        .flat_map(|(id, clause)| {
+                            clause
+                                .probes
+                                .iter()
+                                .filter_map(move |(name, probe)| match probe {
+                                    Probe::Syscall { enter, number }
+                                        if *enter == syscall.enter
+                                            && number.is_none_or(|n| n == syscall.number) =>
+                                    {
+                                        Some((id, name.clone()))
+                                    }
+                                    _ => None,
+                                })
+                        })
+                        .collect()
+                } else {
+                    vec![bindings[event.binding].clone()]
+                };
+                let syscall_name = CString::new(
+                    event
+                        .syscall
+                        .as_ref()
+                        .map(|e| poortrace::syscall::name(e.number))
+                        .unwrap_or_default(),
+                )
+                .unwrap();
+                let event_pid = poortrace::syscall::tgid(event.tid).unwrap_or(pid);
+                let comm = task_comm(event_pid, event.tid);
                 let frames = if program.needs_ustack() {
                     let stack = poortrace::memory::read(
                         event.tid as u32,
@@ -1168,7 +1657,7 @@ fn run_functions(args: &Args, program: &Program) -> Result<i32> {
                     )
                     .unwrap_or_default();
                     state.unwind_sample(&poortrace::perf::Sample {
-                        pid: pid as u32,
+                        pid: event_pid as u32,
                         tid: event.tid as u32,
                         ip: event.regs.ip,
                         regs: Some(event.regs),
@@ -1179,15 +1668,24 @@ fn run_functions(args: &Args, program: &Program) -> Result<i32> {
                 } else {
                     Vec::new()
                 };
-                let mut sample = Event::new(&comm, &name).with_ustack(&frames);
-                sample.pid = pid as u64;
-                sample.tid = event.tid as u64;
-                sample.nsecs = monotonic_ns();
-                sample.ip = event.regs.ip;
-                sample.args = event.args;
-                sample.retval = event.retval;
-                sample.latency = event.latency;
-                program.invoke(*id, &mut state, &sample);
+                for (id, name) in destinations {
+                    let name = CString::new(name).unwrap();
+                    let mut sample = Event::new(&comm, &name)
+                        .with_ustack(&frames)
+                        .with_syscall(&syscall_name);
+                    sample.sysno = event.syscall.as_ref().map(|e| e.number as u64).unwrap_or(0);
+                    sample.pid = event_pid as u64;
+                    sample.tid = event.tid as u64;
+                    sample.nsecs = monotonic_ns();
+                    sample.ip = event.regs.ip;
+                    sample.args = event.args;
+                    sample.retval = event.retval;
+                    sample.latency = event.latency;
+                    program.invoke(id, &mut state, &sample);
+                    if state.stopped {
+                        break;
+                    }
+                }
                 if state.stopped {
                     break;
                 }
@@ -1196,15 +1694,20 @@ fn run_functions(args: &Args, program: &Program) -> Result<i32> {
                 tracer.resume_hit()?;
             }
             if let Some(child) = &mut child {
-                if let Some(code) = tracer.exits.remove(&child.pid) {
+                if let Some(code) = (!tracer.targets().contains(&child.pid))
+                    .then(|| tracer.exits.remove(&child.pid))
+                    .flatten()
+                {
                     child.status = Some(code);
-                    unsafe {
-                        libc::kill(-child.pid, libc::SIGKILL);
+                    if !args.follow_forks {
+                        unsafe {
+                            libc::kill(-child.pid, libc::SIGKILL);
+                        }
+                        break;
                     }
-                    break;
                 }
             }
-            if tracer.is_empty() || (!alive(pid) && idle) {
+            if tracer.is_empty() || (!args.follow_forks && !tracer.targets().contains(&pid)) {
                 break;
             }
             for (id, name, period, deadline) in &mut timers {
@@ -1222,6 +1725,14 @@ fn run_functions(args: &Args, program: &Program) -> Result<i32> {
                 state.clear_all();
                 window_start = Instant::now();
             }
+            if args
+                .live
+                .is_some_and(|period| live_start.elapsed() >= period)
+            {
+                state.report.elapsed = start.elapsed().as_secs_f64();
+                state.live_snapshot();
+                live_start = Instant::now();
+            }
             state.flush()?;
             if idle {
                 unsafe {
@@ -1231,10 +1742,23 @@ fn run_functions(args: &Args, program: &Program) -> Result<i32> {
         }
         Ok(())
     })();
+    let drain_result = (|| -> Result<()> {
+        for stream in &streams {
+            stream.event.disable()?;
+        }
+        if !state.stopped {
+            drain(program, &mut state, &mut streams, &mut lost)?;
+        }
+        Ok(())
+    })();
+    kill_owned_descendants(child.as_ref(), args.follow_forks, tracer.targets());
     tracer.detach();
     if let Some(child) = &mut child {
         if child.status.is_none() {
-            if let Some(code) = tracer.exits.remove(&child.pid) {
+            if let Some(code) = (!tracer.targets().contains(&child.pid))
+                .then(|| tracer.exits.remove(&child.pid))
+                .flatten()
+            {
                 child.status = Some(code);
                 unsafe {
                     libc::kill(-child.pid, libc::SIGKILL);
@@ -1248,5 +1772,163 @@ fn run_functions(args: &Args, program: &Program) -> Result<i32> {
     finish_report(&mut state, args, window_start.elapsed())?;
     state.flush()?;
     result?;
+    drain_result?;
+    if lost != 0 {
+        eprintln!("poortrace: lost {lost} perf samples");
+    }
     Ok(child.as_ref().and_then(|child| child.status).unwrap_or(0))
+}
+
+fn configure_record(state: &mut State<'_>, args: &Args, program: &Program) -> Result<()> {
+    if let Some(path) = &args.record {
+        state.recorder = Some(poortrace::recording::Recorder::create(
+            path,
+            &program.source,
+        )?);
+    }
+    Ok(())
+}
+fn run_replay(args: &Args, path: &std::path::Path) -> Result<i32> {
+    let (header, mut events) = poortrace::recording::read(path)?;
+    let program = Program::compile(&header.source)?;
+    if args.sort_events {
+        events.sort_by_key(|event| event.nsecs);
+    }
+    let mut state = program.state(io::stdout());
+    configure_report(&mut state, args)?;
+    state.max_entries = args.max_map_entries as usize;
+    let mut first = u64::MAX;
+    let mut last = 0;
+    for saved in events {
+        if saved.clause >= program.clauses.len() {
+            return Err("recording clause index is out of range".into());
+        }
+        let comm = CString::new(saved.comm).map_err(|e| e.to_string())?;
+        let probe = CString::new(saved.probe).map_err(|e| e.to_string())?;
+        let syscall = CString::new(saved.syscall).map_err(|e| e.to_string())?;
+        let mut event = Event::new(&comm, &probe).with_syscall(&syscall);
+        event.pid = saved.pid;
+        event.tid = saved.tid;
+        event.cpu = saved.cpu;
+        event.nsecs = saved.nsecs;
+        event.ip = saved.ip;
+        event.period = saved.period;
+        event.addr = saved.addr;
+        event.offcpu_ns = saved.offcpu_ns;
+        event.preempt = saved.preempt;
+        event.sysno = saved.sysno;
+        event.retval = saved.retval;
+        event.latency = saved.latency;
+        event.args = saved.args;
+        first = first.min(event.nsecs);
+        last = last.max(event.nsecs);
+        state.stopped = saved.stopped;
+        state.replay_helpers(saved.helpers);
+        program.invoke(saved.clause, &mut state, &event);
+        state.flush()?;
+    }
+    finish_report(
+        &mut state,
+        args,
+        Duration::from_nanos(last.saturating_sub(first)),
+    )?;
+    state.flush()?;
+    Ok(0)
+}
+
+fn dispatch_waits(
+    program: &Program,
+    state: &mut State<'_>,
+    waits: &mut poortrace::wait::Poller,
+    targets: impl IntoIterator<Item = i32>,
+) -> Result<()> {
+    for snapshot in waits.poll(targets)? {
+        if state.stopped {
+            break;
+        }
+        let frames = if program.needs_ustack() {
+            let stack = (*snapshot.stack).clone();
+            state.unwind_sample(&poortrace::perf::Sample {
+                pid: snapshot.pid,
+                tid: snapshot.tid,
+                ip: snapshot.ip,
+                regs: Some(snapshot.regs),
+                stack,
+                callchain: vec![snapshot.ip],
+                ..Default::default()
+            })
+        } else {
+            Vec::new()
+        };
+        let comm = task_comm(snapshot.pid as i32, snapshot.tid as i32);
+        let probe = CString::new(snapshot.probe).map_err(|e| e.to_string())?;
+        let syscall = CString::new(poortrace::syscall::name(snapshot.number)).unwrap();
+        let mut event = Event::new(&comm, &probe)
+            .with_ustack(&frames)
+            .with_syscall(&syscall);
+        event.pid = snapshot.pid as u64;
+        event.tid = snapshot.tid as u64;
+        event.ip = snapshot.ip;
+        event.nsecs = monotonic_ns();
+        event.period = snapshot.period;
+        event.latency = snapshot.latency;
+        event.args = snapshot.args;
+        event.sysno = snapshot.number as u64;
+        state.wait_reason = Some(snapshot.reason);
+        if program.needs_jsstack() {
+            state.js_snapshot = Some((snapshot.regs, (*snapshot.stack).clone()));
+        }
+        program.invoke(snapshot.clause, state, &event);
+        state.js_snapshot = None;
+        state.wait_reason = None;
+    }
+    Ok(())
+}
+
+fn kill_owned_descendants(child: Option<&Child>, follow: bool, _targets: BTreeSet<i32>) {
+    if follow {
+        if let Some(child) = child {
+            child.kill_descendants();
+        }
+    }
+}
+fn track_owned_descendants(
+    child: &mut Option<Child>,
+    follow: bool,
+    targets: BTreeSet<i32>,
+) -> Result<()> {
+    if !follow {
+        return Ok(());
+    }
+    let Some(child) = child else {
+        return Ok(());
+    };
+    child.descendants.retain(|pid, fd| {
+        if targets.contains(pid) {
+            return true;
+        }
+        let mut poll = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        (unsafe { libc::poll(&mut poll, 1, 0) }) <= 0 || poll.revents & libc::POLLIN == 0
+    });
+    for pid in targets {
+        if pid == child.pid || child.descendants.contains_key(&pid) {
+            continue;
+        }
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0u32) };
+        if fd < 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                continue;
+            }
+            return Err(format!("pidfd_open for owned descendant {pid}: {error}"));
+        }
+        child
+            .descendants
+            .insert(pid, unsafe { OwnedFd::from_raw_fd(fd as i32) });
+    }
+    Ok(())
 }

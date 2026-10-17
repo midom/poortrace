@@ -1,0 +1,2 @@
+// CPython 3.12 release builds; reads interpreter frames at event handling time.
+profile:hz:99 { @[comm, pystack(32)] = count(); }
