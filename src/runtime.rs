@@ -17,6 +17,16 @@ pub struct Event<'a> {
     probe: *const c_char,
     stack: *const u64,
     stack_len: u64,
+    pub addr: u64,
+    pub offcpu_ns: u64,
+    pub preempt: u64,
+    pub sysno: u64,
+    pub retval: i64,
+    pub latency: u64,
+    pub args: [u64; 6],
+    syscall: *const c_char,
+    branches: *const crate::perf::Branch,
+    branch_len: u64,
     lifetime: std::marker::PhantomData<&'a CStr>,
 }
 impl<'a> Event<'a> {
@@ -32,8 +42,27 @@ impl<'a> Event<'a> {
             probe: probe.as_ptr(),
             stack: [].as_ptr(),
             stack_len: 0,
+            addr: 0,
+            offcpu_ns: 0,
+            preempt: 0,
+            sysno: 0,
+            retval: 0,
+            latency: 0,
+            args: [0; 6],
+            syscall: c"".as_ptr(),
+            branches: [].as_ptr(),
+            branch_len: 0,
             lifetime: std::marker::PhantomData,
         }
+    }
+    pub fn with_syscall(mut self, name: &'a CStr) -> Self {
+        self.syscall = name.as_ptr();
+        self
+    }
+    pub fn with_branches(mut self, branches: &'a [crate::perf::Branch]) -> Self {
+        self.branches = branches.as_ptr();
+        self.branch_len = branches.len() as u64;
+        self
     }
     pub fn with_ustack(mut self, frames: &'a [u64]) -> Self {
         self.stack = frames.as_ptr();
@@ -59,12 +88,14 @@ pub enum Aggregate {
     Max,
     Avg,
     Hist,
+    Lhist,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MapSpec {
     pub name: String,
     pub keys: Vec<Type>,
     pub aggregate: Aggregate,
+    pub linear: Option<(i64, i64, i64)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -223,6 +254,7 @@ pub struct State<'a> {
     pub max_entries: usize,
     pub(crate) stack_strings: Vec<CString>,
     symbols: crate::symbols::Symbolizer,
+    pub report: crate::report::Options,
 }
 impl<'a> State<'a> {
     pub(crate) fn new(
@@ -242,6 +274,7 @@ impl<'a> State<'a> {
             max_entries: 65536,
             stack_strings: Vec::new(),
             symbols: crate::symbols::Symbolizer::default(),
+            report: crate::report::Options::default(),
         }
     }
     fn write(&mut self, text: &str) {
@@ -263,7 +296,67 @@ impl<'a> State<'a> {
             None => Ok(()),
         }
     }
+    pub fn unwind_sample(&mut self, sample: &crate::perf::Sample) -> Vec<u64> {
+        self.symbols.unwind(sample)
+    }
+    pub fn clear_all(&mut self) {
+        for map in &mut self.maps {
+            map.clear();
+        }
+    }
+    fn rows(&self, ids: impl Iterator<Item = usize>) -> Vec<crate::report::Row> {
+        let mut rows = Vec::new();
+        for id in ids {
+            let spec = &self.specs[id];
+            for (keys, cell) in &self.maps[id] {
+                let keys = keys
+                    .iter()
+                    .map(|key| match key {
+                        Key::Number(value) => crate::report::Key {
+                            kind: "number".into(),
+                            value: value.to_string(),
+                        },
+                        Key::String(value) => crate::report::Key {
+                            kind: "string".into(),
+                            value: value.clone(),
+                        },
+                        Key::Stack(value) => crate::report::Key {
+                            kind: "stack".into(),
+                            value: value.clone(),
+                        },
+                    })
+                    .collect();
+                let buckets = cell
+                    .buckets
+                    .iter()
+                    .map(|(bucket, count)| (bucket_label(*bucket, spec), *count))
+                    .collect();
+                rows.push(crate::report::Row {
+                    map: spec.name.clone(),
+                    keys,
+                    value: cell.number(spec.aggregate),
+                    buckets,
+                });
+            }
+        }
+        rows
+    }
+    pub fn render_report(&self) -> Result<String> {
+        crate::report::render(&self.rows(0..self.maps.len()), &self.report)
+    }
     pub fn print_all(&mut self) {
+        if !self.report.format.is_empty()
+            || self.report.top.is_some()
+            || self.report.percent
+            || self.report.rate
+            || !self.report.baseline.is_empty()
+        {
+            match self.render_report() {
+                Ok(text) => self.write(&text),
+                Err(error) => self.fail(error),
+            }
+            return;
+        }
         for i in 0..self.maps.len() {
             self.print_map(i);
         }
@@ -292,14 +385,10 @@ impl<'a> State<'a> {
                 out.push(']');
             }
             out.push_str(": ");
-            if spec.aggregate == Aggregate::Hist {
+            if matches!(spec.aggregate, Aggregate::Hist | Aggregate::Lhist) {
                 out.push('\n');
                 for (bucket, count) in &cell.buckets {
-                    let label = match bucket {
-                        -1 => "(-inf, 0)".into(),
-                        0 => "[0, 1)".into(),
-                        n => format!("[{}, {})", 1u64 << (n - 1), 1u64 << n),
-                    };
+                    let label = bucket_label(*bucket, spec);
                     out.push_str(&format!("  {label}: {count}\n"));
                 }
             } else {
@@ -347,6 +436,7 @@ pub(crate) unsafe extern "C" fn map_update(
 ) {
     let state = unsafe { &mut *state };
     let key = unsafe { keys(raw, len) };
+    let linear = state.specs[id as usize].linear;
     let map = &mut state.maps[id as usize];
     if !map.contains_key(&key) && map.len() >= state.max_entries {
         state.fail(format!(
@@ -381,6 +471,17 @@ pub(crate) unsafe extern "C" fn map_update(
                 0
             } else {
                 64 - (value as u64).leading_zeros() as i32
+            };
+            *cell.buckets.entry(bin).or_default() += 1;
+        }
+        7 => {
+            let (min, max, step) = linear.unwrap();
+            let bin = if value < min {
+                -1
+            } else if value >= max {
+                ((max as i128 - min as i128 + step as i128 - 1) / step as i128) as i32
+            } else {
+                ((value as i128 - min as i128) / step as i128) as i32
             };
             *cell.buckets.entry(bin).or_default() += 1;
         }
@@ -439,6 +540,96 @@ pub(crate) unsafe extern "C" fn ustack(
         unsafe { std::slice::from_raw_parts(event.stack, (event.stack_len.min(depth)) as usize) };
     let text = state.symbols.stack(event.pid as u32, frames);
     // ELF names and proc paths can contain NULs. Keep them out of the C ABI.
+    let text = CString::new(text.replace('\0', "\\0")).unwrap();
+    let pointer = text.as_ptr() as u64;
+    state.stack_strings.push(text);
+    pointer
+}
+
+fn bucket_label(bucket: i32, spec: &MapSpec) -> String {
+    if let Some((min, max, step)) = spec.linear {
+        if bucket < 0 {
+            return format!("(-inf, {min})");
+        }
+        let lower = min as i128 + bucket as i128 * step as i128;
+        if lower >= max as i128 {
+            return format!("[{max}, +inf)");
+        }
+        return format!("[{lower}, {})", (lower + step as i128).min(max as i128));
+    }
+    match bucket {
+        -1 => "(-inf, 0)".into(),
+        0 => "[0, 1)".into(),
+        n => format!("[{}, {})", 1u64 << (n - 1), 1u64 << n),
+    }
+}
+
+pub(crate) unsafe extern "C" fn helper(
+    state: *mut State<'_>,
+    event: *const Event<'_>,
+    op: u64,
+    value: u64,
+    length: u64,
+) -> u64 {
+    let state = unsafe { &mut *state };
+    let event = unsafe { &*event };
+    let result: Result<String> = match op {
+        0 => Ok(state.symbols.symbol(event.pid as u32, value)),
+        1 => crate::memory::read(event.pid as u32, value, length as usize, true).map(|bytes| {
+            let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+            String::from_utf8_lossy(&bytes[..end]).into_owned()
+        }),
+        2 => crate::memory::read(event.pid as u32, value, length as usize, false).map(|bytes| {
+            bytes
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        }),
+        3..=6 => {
+            let size = 1 << (op - 3);
+            return match crate::memory::read(event.pid as u32, value, size, false) {
+                Ok(bytes) => {
+                    let mut raw = [0; 8];
+                    raw[..size].copy_from_slice(&bytes);
+                    match size {
+                        1 => raw[0] as u64,
+                        2 => u16::from_ne_bytes(raw[..2].try_into().unwrap()) as u64,
+                        4 => u32::from_ne_bytes(raw[..4].try_into().unwrap()) as u64,
+                        _ => u64::from_ne_bytes(raw),
+                    }
+                }
+                Err(error) => {
+                    state.fail(error);
+                    0
+                }
+            };
+        }
+        10 => {
+            let branches =
+                unsafe { std::slice::from_raw_parts(event.branches, event.branch_len as usize) };
+            let mut out = String::new();
+            for branch in branches {
+                out.push_str(&format!(
+                    "    {} -> {}\n",
+                    state.symbols.symbol(event.pid as u32, branch.from),
+                    state.symbols.symbol(event.pid as u32, branch.to)
+                ));
+            }
+            if out.is_empty() {
+                out.push_str("    <no branch stack>\n");
+            }
+            Ok(out)
+        }
+        _ => Err("invalid runtime helper".into()),
+    };
+    let text = match result {
+        Ok(text) => text,
+        Err(error) => {
+            state.fail(error);
+            String::new()
+        }
+    };
     let text = CString::new(text.replace('\0', "\\0")).unwrap();
     let pointer = text.as_ptr() as u64;
     state.stack_strings.push(text);

@@ -14,6 +14,7 @@ pub struct Program {
     pub ir: String,
     handlers: Vec<Handler>,
     ustack: bool,
+    branches: bool,
     _engine: Engine,
 }
 impl Program {
@@ -42,6 +43,7 @@ impl Program {
             ir,
             handlers,
             ustack: generator.ustack,
+            branches: generator.branches,
             _engine: engine,
         })
     }
@@ -59,11 +61,19 @@ impl Program {
         }
     }
     pub fn has_perf(&self) -> bool {
+        self.clauses
+            .iter()
+            .any(|c| c.probes.iter().any(|(_, p)| p.is_perf()))
+    }
+    pub fn has_syscalls(&self) -> bool {
         self.clauses.iter().any(|c| {
             c.probes
                 .iter()
-                .any(|(_, p)| matches!(p, Probe::Perf { .. }))
+                .any(|(_, p)| matches!(p, Probe::Syscall { .. }))
         })
+    }
+    pub fn needs_branches(&self) -> bool {
+        self.branches
     }
     pub fn needs_ustack(&self) -> bool {
         self.ustack
@@ -79,7 +89,7 @@ impl Program {
 }
 
 const PRELUDE: &str = "
-%Event = type { i64, i64, i64, i64, i64, i64, ptr, ptr, ptr, i64 }
+%Event = type { i64, i64, i64, i64, i64, i64, ptr, ptr, ptr, i64, i64, i64, i64, i64, i64, i64, [6 x i64], ptr, ptr, i64 }
 declare void @pt_map_update(ptr, i64, ptr, i64, i64, i64)
 declare i64 @pt_map_get(ptr, i64, ptr, i64)
 declare void @pt_printf(ptr, i64, ptr)
@@ -88,6 +98,7 @@ declare void @pt_exit(ptr)
 declare i64 @pt_stopped(ptr)
 declare i64 @pt_streq(ptr, ptr)
 declare i64 @pt_ustack(ptr, ptr, i64)
+declare i64 @pt_helper(ptr, ptr, i64, i64, i64)
 ";
 
 #[derive(Default)]
@@ -103,6 +114,7 @@ struct Generator {
     current: String,
     locals: BTreeMap<String, String>,
     ustack: bool,
+    branches: bool,
 }
 struct Value {
     reg: String,
@@ -139,8 +151,9 @@ impl Generator {
     fn infer(e: &Expr) -> Type {
         match e {
             Expr::String(_) => Type::String,
-            Expr::Builtin(n) if n == "comm" || n == "probe" => Type::String,
-            Expr::Builtin(n) | Expr::Call(n, _) if n == "ustack" => Type::Stack,
+            Expr::Builtin(n) if n == "comm" || n == "probe" || n == "syscall" => Type::String,
+            Expr::Builtin(n) | Expr::Call(n, _) if n == "ustack" || n == "branches" => Type::Stack,
+            Expr::Call(n, _) if matches!(n.as_str(), "usym" | "str" | "buf") => Type::String,
             _ => Type::Number,
         }
     }
@@ -153,9 +166,18 @@ impl Generator {
                 "max" => Aggregate::Max,
                 "avg" => Aggregate::Avg,
                 "hist" => Aggregate::Hist,
-                _ => return Err(format!("unknown aggregate '{name}'")),
+                "lhist" => Aggregate::Lhist,
+                _ => return Ok((Aggregate::Set, Some(rhs))),
             };
-            if args.len() != if agg == Aggregate::Count { 0 } else { 1 } {
+            if args.len()
+                != if agg == Aggregate::Count {
+                    0
+                } else if agg == Aggregate::Lhist {
+                    4
+                } else {
+                    1
+                }
+            {
                 return Err(format!("wrong number of arguments to {name}()"));
             }
             Ok((agg, args.first()))
@@ -163,12 +185,17 @@ impl Generator {
             Ok((Aggregate::Set, Some(rhs)))
         }
     }
-    fn declare_map(&mut self, lhs: &Expr, agg: Aggregate) -> Result<()> {
+    fn declare_map(
+        &mut self,
+        lhs: &Expr,
+        agg: Aggregate,
+        linear: Option<(i64, i64, i64)>,
+    ) -> Result<()> {
         if let Expr::Map(name, keys) = lhs {
             let types: Vec<_> = keys.iter().map(Self::infer).collect();
             if let Some(id) = self.ids.get(name) {
                 let old = &self.specs[*id];
-                if old.keys != types || old.aggregate != agg {
+                if old.keys != types || old.aggregate != agg || old.linear != linear {
                     return Err(format!("inconsistent key types or aggregation for @{name}"));
                 }
             } else {
@@ -177,6 +204,7 @@ impl Generator {
                     name: name.clone(),
                     keys: types,
                     aggregate: agg,
+                    linear,
                 });
             }
         }
@@ -191,9 +219,44 @@ impl Generator {
                     } else {
                         Aggregate::Set
                     };
-                    self.declare_map(lhs, agg)?;
+                    let linear = if agg == Aggregate::Lhist {
+                        let Expr::Call(_, args) = rhs else {
+                            unreachable!()
+                        };
+                        let constants: Vec<_> = args[1..]
+                            .iter()
+                            .map(|e| match e {
+                                Expr::Number(n) => Some(*n),
+                                Expr::Unary(op, e) if op == "-" => {
+                                    if let Expr::Number(n) = &**e {
+                                        Some(n.wrapping_neg())
+                                    } else {
+                                        None
+                                    }
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                        let [Some(min), Some(max), Some(step)] = constants.as_slice() else {
+                            return Err("lhist bounds must be integer constants".into());
+                        };
+                        if min >= max
+                            || *step <= 0
+                            || (*max as i128 - *min as i128 + *step as i128 - 1) / *step as i128
+                                > 1024
+                        {
+                            return Err(
+                                "lhist requires min < max, step > 0, and at most 1024 buckets"
+                                    .into(),
+                            );
+                        }
+                        Some((*min, *max, *step))
+                    } else {
+                        None
+                    };
+                    self.declare_map(lhs, agg, linear)?;
                 }
-                Stmt::Increment(lhs, _) => self.declare_map(lhs, Aggregate::Set)?,
+                Stmt::Increment(lhs, _) => self.declare_map(lhs, Aggregate::Set, None)?,
                 Stmt::If(_, yes, no) => {
                     self.declare_maps(yes)?;
                     self.declare_maps(no)?;
@@ -302,6 +365,23 @@ impl Generator {
                 if name == "ustack" {
                     return self.stack(127);
                 }
+                if name == "branches" {
+                    self.branches = true;
+                    return self.helper(10, "0".into(), 0, Type::Stack);
+                }
+                if let Some(index) = name
+                    .strip_prefix("arg")
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .filter(|i| *i < 6)
+                {
+                    let pointer = self
+                        .value(
+                            format!("getelementptr %Event, ptr %event, i32 0, i32 16, i32 {index}"),
+                            Type::Number,
+                        )
+                        .reg;
+                    return Ok(self.value(format!("load i64, ptr {pointer}"), Type::Number));
+                }
                 if name == "true" || name == "false" {
                     return Ok(Value {
                         reg: if name == "true" { "1" } else { "0" }.into(),
@@ -317,6 +397,13 @@ impl Generator {
                     "period" => 5,
                     "comm" => 6,
                     "probe" => 7,
+                    "addr" => 10,
+                    "offcpu_ns" => 11,
+                    "preempt" => 12,
+                    "sysno" => 13,
+                    "retval" => 14,
+                    "latency" => 15,
+                    "syscall" => 17,
                     _ => return Err(format!("unknown builtin '{name}'")),
                 };
                 let ptr = self
@@ -325,7 +412,7 @@ impl Generator {
                         Type::Number,
                     )
                     .reg;
-                if index < 6 {
+                if index < 6 || (10..=15).contains(&index) {
                     Ok(self.value(format!("load i64, ptr {ptr}"), Type::Number))
                 } else {
                     let p = self.value(format!("load ptr, ptr {ptr}"), Type::String).reg;
@@ -342,7 +429,7 @@ impl Generator {
             }
             Expr::Map(name, keys) => {
                 let (id, array) = self.keys(name, keys)?;
-                if self.specs[id].aggregate == Aggregate::Hist {
+                if matches!(self.specs[id].aggregate, Aggregate::Hist | Aggregate::Lhist) {
                     return Err("hist() maps can only be used with print/clear".into());
                 }
                 Ok(self.value(
@@ -352,6 +439,39 @@ impl Generator {
                     ),
                     Type::Number,
                 ))
+            }
+            Expr::Call(name, args)
+                if matches!(
+                    name.as_str(),
+                    "usym" | "str" | "buf" | "read_u8" | "read_u16" | "read_u32" | "read_u64"
+                ) =>
+            {
+                let op = match name.as_str() {
+                    "usym" => 0,
+                    "str" => 1,
+                    "buf" => 2,
+                    "read_u8" => 3,
+                    "read_u16" => 4,
+                    "read_u32" => 5,
+                    _ => 6,
+                };
+                let length = match args.as_slice() {
+                    [_] if op == 1 => 256,
+                    [_] if op != 2 => 0,
+                    [_, Expr::Number(n)] if (op == 1 || op == 2) && (1..=4096).contains(n) => *n,
+                    _ => {
+                        return Err(format!(
+                            "{name} requires an address and, for str/buf, a constant length from 1 to 4096"
+                        ));
+                    }
+                };
+                let address = self.numeric(&args[0])?;
+                self.helper(
+                    op,
+                    address,
+                    length,
+                    if op >= 3 { Type::Number } else { Type::String },
+                )
             }
             Expr::Call(name, args) if name == "ustack" => {
                 let depth = match args.as_slice() {
@@ -623,6 +743,14 @@ impl Generator {
             self.label(&next);
         }
         Ok(())
+    }
+    fn helper(&mut self, op: u64, address: String, length: i64, ty: Type) -> Result<Value> {
+        Ok(self.value(
+            format!(
+                "call i64 @pt_helper(ptr %state, ptr %event, i64 {op}, i64 {address}, i64 {length})"
+            ),
+            ty,
+        ))
     }
     fn stack(&mut self, depth: i64) -> Result<Value> {
         self.ustack = true;

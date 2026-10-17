@@ -1,0 +1,2 @@
+// Event availability depends on the CPU/PMU.
+cache:l1d:read:miss:10000 { @[ustack] = count(); }

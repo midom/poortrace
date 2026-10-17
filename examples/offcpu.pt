@@ -1,0 +1,2 @@
+// Complete switch-out/switch-in pairs; time includes blocking and run-queue delay.
+offcpu { @wait_ns[tid] = sum(offcpu_ns); @latency = lhist(offcpu_ns, 0, 100000000, 10000000); }

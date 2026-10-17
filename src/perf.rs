@@ -22,8 +22,36 @@ struct Attr {
     wakeup_events: u32,
     bp_type: u32,
     config1: u64,
+    config2: u64,
+    branch_type: u64,
+    regs_user: u64,
+    stack_user: u32,
+    clockid: i32,
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Branch {
+    pub from: u64,
+    pub to: u64,
+}
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UserRegs {
+    pub ip: u64,
+    pub sp: u64,
+    pub fp: u64,
+    pub lr: u64,
+}
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Capture {
+    pub callchain: bool,
+    pub dwarf_stack: u32,
+    pub branches: bool,
+    pub addr: bool,
+    pub offcpu: bool,
+    pub uprobe: bool,
+    pub retprobe: bool,
+}
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Sample {
     pub pid: u32,
     pub tid: u32,
@@ -32,12 +60,32 @@ pub struct Sample {
     pub ip: u64,
     pub period: u64,
     pub callchain: Vec<u64>,
+    pub addr: u64,
+    pub regs: Option<UserRegs>,
+    pub stack: Vec<u8>,
+    pub branches: Vec<Branch>,
+    pub offcpu_ns: u64,
+    pub preempt: bool,
+    pub args: [u64; 6],
+    pub retval: i64,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Record {
     Sample(Sample),
-    Comm { pid: u32, tid: u32, name: String },
+    Comm {
+        pid: u32,
+        tid: u32,
+        name: String,
+    },
     Lost(u64),
+    Switch {
+        out: bool,
+        preempt: bool,
+        pid: u32,
+        tid: u32,
+        cpu: u32,
+        time: u64,
+    },
     Other,
 }
 
@@ -48,26 +96,35 @@ pub struct PerfEvent {
     offset: usize,
     size: usize,
     tail: u64,
-    callchain: bool,
+    capture: Capture,
 }
 impl PerfEvent {
     pub fn open(tid: i32, probe: &Probe, pages: usize) -> Result<Self> {
-        Self::open_inner(tid, probe, pages, false, false)
+        Self::open_config(tid, probe, pages, false, Capture::default())
     }
     /// Leave the event disabled until the target calls exec, excluding the
     /// launcher's setup work between fork and exec from command measurements.
     pub fn open_on_exec(tid: i32, probe: &Probe, pages: usize) -> Result<Self> {
-        Self::open_inner(tid, probe, pages, true, false)
+        Self::open_config(tid, probe, pages, true, Capture::default())
     }
     pub fn open_with_ustack(tid: i32, probe: &Probe, pages: usize, on_exec: bool) -> Result<Self> {
-        Self::open_inner(tid, probe, pages, on_exec, true)
+        Self::open_config(
+            tid,
+            probe,
+            pages,
+            on_exec,
+            Capture {
+                callchain: true,
+                ..Capture::default()
+            },
+        )
     }
-    fn open_inner(
+    pub fn open_config(
         tid: i32,
         probe: &Probe,
         pages: usize,
         on_exec: bool,
-        callchain: bool,
+        mut capture: Capture,
     ) -> Result<Self> {
         if tid <= 0 {
             return Err("perf target TID must be positive".into());
@@ -75,31 +132,116 @@ impl PerfEvent {
         if !pages.is_power_of_two() || pages > 1024 {
             return Err("mmap pages must be a power of two from 1 to 1024".into());
         }
-        let Probe::Perf {
-            kind,
-            config,
-            period,
-            frequency,
+        let uprobe = if let Probe::Uprobe {
+            path,
+            function,
+            ret,
         } = probe
-        else {
-            return Err("not a perf probe".into());
+        {
+            Some(crate::uprobe::resolve(tid, path, function, *ret)?)
+        } else {
+            None
+        };
+        let (kind, config, period, frequency, bp_type, config1, config2) = match probe {
+            Probe::Uprobe { ret, .. } => {
+                capture.uprobe = true;
+                capture.retprobe = *ret;
+                let resolved = uprobe.as_ref().unwrap();
+                (
+                    resolved.kind,
+                    resolved.config,
+                    1,
+                    false,
+                    0,
+                    resolved.path.as_ptr() as u64,
+                    resolved.offset,
+                )
+            }
+            Probe::Perf {
+                kind,
+                config,
+                period,
+                frequency,
+            } => (*kind, *config, *period, *frequency, 0, 0, 0),
+            Probe::Watchpoint {
+                address,
+                length,
+                access,
+            } => {
+                capture.addr = true;
+                (5, 0, 1, false, *access, *address, *length)
+            }
+            Probe::OffCpu => {
+                capture.offcpu = true;
+                (1, 9, 0, false, 0, 0, 0)
+            }
+            _ => return Err("not a perf probe".into()),
+        };
+        if capture.dwarf_stack > 32768 || capture.dwarf_stack % 8 != 0 {
+            return Err("DWARF stack size must be a multiple of 8 up to 32768".into());
+        }
+        if capture.offcpu {
+            capture.callchain = false;
+            capture.dwarf_stack = 0;
+            capture.branches = false;
+            capture.addr = false;
+            capture.uprobe = false;
+            capture.retprobe = false;
+        }
+        if capture.dwarf_stack != 0 {
+            capture.callchain = false;
+        }
+        let sample_type = if capture.offcpu {
+            2 | 4 | 128
+        } else {
+            SAMPLE_TYPE
+                | if capture.callchain { 1 << 5 } else { 0 }
+                | if capture.addr { 1 << 3 } else { 0 }
+                | if capture.branches { 1 << 11 } else { 0 }
+                | if capture.dwarf_stack != 0 || capture.uprobe {
+                    1 << 12
+                } else {
+                    0
+                }
+                | if capture.dwarf_stack != 0 { 1 << 13 } else { 0 }
         };
         let attr = Attr {
-            kind: *kind,
-            size: size_of::<Attr>() as u32,
-            config: *config,
-            sample_period: *period,
-            sample_type: SAMPLE_TYPE | if callchain { 1 << 5 } else { 0 },
-            // Per-thread, user-mode only, initially disabled. Inherit is deliberately
-            // off: inherited events with cpu=-1 cannot use an mmap sample buffer.
+            kind,
+            size: if capture.dwarf_stack != 0 || capture.uprobe {
+                96
+            } else if capture.branches {
+                80
+            } else if bp_type != 0 {
+                72
+            } else {
+                64
+            },
+            config,
+            sample_period: period,
+            sample_type,
             flags: 1
-                | (1 << 5)
-                | (1 << 6)
-                | (1 << 9)
-                | if *frequency { 1 << 10 } else { 0 }
-                | if callchain { 1 << 21 } else { 0 }
-                | if on_exec { 1 << 12 } else { 0 },
+                | 1 << 5
+                | 1 << 6
+                | 1 << 9
+                | if frequency { 1 << 10 } else { 0 }
+                | if capture.callchain { 1 << 21 } else { 0 }
+                | if on_exec { 1 << 12 } else { 0 }
+                | if capture.offcpu {
+                    (1 << 18) | (1 << 26)
+                } else {
+                    0
+                },
             wakeup_events: 1,
+            bp_type,
+            config1,
+            config2,
+            branch_type: if capture.branches { 1 | 8 } else { 0 },
+            regs_user: if capture.dwarf_stack != 0 || capture.uprobe {
+                register_mask(capture.uprobe)
+            } else {
+                0
+            },
+            stack_user: capture.dwarf_stack,
             ..Attr::default()
         };
         let fd = unsafe {
@@ -113,7 +255,14 @@ impl PerfEvent {
             )
         };
         if fd < 0 {
-            return Err(open_error(tid, io::Error::last_os_error()));
+            let error = io::Error::last_os_error();
+            if capture.uprobe && matches!(error.raw_os_error(), Some(libc::EACCES | libc::EPERM)) {
+                return Err(format!(
+                    "dynamic perf uprobes require privileged kernel access (commonly CAP_SYS_ADMIN); use --uprobe-backend ptrace for unprivileged function probes: {}",
+                    open_error(tid, error)
+                ));
+            }
+            return Err(open_error(tid, error));
         }
         let fd = unsafe { OwnedFd::from_raw_fd(fd as i32) };
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
@@ -141,7 +290,7 @@ impl PerfEvent {
             offset: page_size,
             size: pages * page_size,
             tail: 0,
-            callchain,
+            capture,
         };
         // UAPI offsets in perf_event_mmap_page are architecture independent.
         let offset = unsafe { event.base().add(1040).cast::<u64>().read_volatile() } as usize;
@@ -198,7 +347,7 @@ impl PerfEvent {
             }
             let mut bytes = vec![0; size];
             self.copy(self.tail, &mut bytes);
-            records.push(decode(&bytes, self.callchain)?);
+            records.push(decode_capture(&bytes, self.capture)?);
             self.tail = self.tail.wrapping_add(size as u64);
         }
         // The kernel must not reuse these bytes until all our reads complete.
@@ -251,70 +400,226 @@ fn open_error(tid: i32, error: io::Error) -> String {
     )
 }
 
+#[cfg(target_arch = "x86_64")]
+fn register_mask(arguments: bool) -> u64 {
+    (1 << 6)
+        | (1 << 7)
+        | (1 << 8)
+        | if arguments {
+            (1 << 0) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 11) | (1 << 12)
+        } else {
+            0
+        }
+}
+#[cfg(target_arch = "aarch64")]
+fn register_mask(arguments: bool) -> u64 {
+    (1 << 29) | (1 << 30) | (1 << 31) | (1 << 32) | if arguments { 63 } else { 0 }
+}
+#[cfg(test)]
 fn decode(bytes: &[u8], callchain: bool) -> Result<Record> {
+    decode_capture(
+        bytes,
+        Capture {
+            callchain,
+            ..Capture::default()
+        },
+    )
+}
+struct Cursor<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+impl<'a> Cursor<'a> {
+    fn take(&mut self, size: usize) -> Result<&'a [u8]> {
+        let end = self
+            .at
+            .checked_add(size)
+            .ok_or("perf record length overflow")?;
+        let value = self
+            .bytes
+            .get(self.at..end)
+            .ok_or("truncated perf record")?;
+        self.at = end;
+        Ok(value)
+    }
+    fn word(&mut self) -> Result<u64> {
+        Ok(u64::from_ne_bytes(self.take(8)?.try_into().unwrap()))
+    }
+    fn pair(&mut self) -> Result<(u32, u32)> {
+        let b = self.take(8)?;
+        Ok((
+            u32::from_ne_bytes(b[..4].try_into().unwrap()),
+            u32::from_ne_bytes(b[4..].try_into().unwrap()),
+        ))
+    }
+}
+fn decode_capture(bytes: &[u8], capture: Capture) -> Result<Record> {
     if bytes.len() < 8 {
         return Err("short perf header".into());
     }
-    let declared = u16::from_ne_bytes(bytes[6..8].try_into().unwrap()) as usize;
-    if declared != bytes.len() {
+    let size = u16::from_ne_bytes(bytes[6..8].try_into().unwrap()) as usize;
+    if size != bytes.len() {
         return Err("perf record size mismatch".into());
     }
     let kind = u32::from_ne_bytes(bytes[..4].try_into().unwrap());
-    let u64_at = |i| u64::from_ne_bytes(bytes[i..i + 8].try_into().unwrap());
-    let u32_at = |i| u32::from_ne_bytes(bytes[i..i + 4].try_into().unwrap());
-    match kind {
-        9 if bytes.len() >= 48 => {
-            let mut frames = Vec::new();
-            if callchain {
-                if bytes.len() < 56 {
-                    return Err("truncated perf callchain".into());
-                }
-                let count = u64_at(48);
-                if count > ((bytes.len() - 56) / 8) as u64 || bytes.len() - 56 != count as usize * 8
-                {
+    let misc = u16::from_ne_bytes(bytes[4..6].try_into().unwrap());
+    let mut c = Cursor { bytes, at: 8 };
+    let record = match kind {
+        9 => {
+            let ip = c.word()?;
+            let (pid, tid) = c.pair()?;
+            let time = c.word()?;
+            let addr = if capture.addr { c.word()? } else { 0 };
+            let (cpu, _) = c.pair()?;
+            let period = c.word()?;
+            let mut sample = Sample {
+                pid,
+                tid,
+                time,
+                ip,
+                cpu,
+                period,
+                addr,
+                ..Sample::default()
+            };
+            if capture.callchain {
+                let count = c.word()?;
+                if count > (bytes.len().saturating_sub(c.at) / 8) as u64 {
                     return Err("invalid perf callchain length".into());
                 }
                 let mut user = true;
-                for frame in bytes[56..].chunks_exact(8) {
-                    let ip = u64::from_ne_bytes(frame.try_into().unwrap());
+                for _ in 0..count {
+                    let ip = c.word()?;
                     if ip >= (-4095i64) as u64 {
-                        user = ip == (-512i64) as u64; // PERF_CONTEXT_USER
-                    } else if user && ip != 0 && frames.len() < 127 {
-                        frames.push(ip);
+                        user = ip == (-512i64) as u64;
+                    } else if user && ip != 0 && sample.callchain.len() < 127 {
+                        sample.callchain.push(ip);
                     }
                 }
-                if frames.is_empty() && u64_at(8) != 0 {
-                    frames.push(u64_at(8));
+                if sample.callchain.is_empty() && ip != 0 {
+                    sample.callchain.push(ip);
                 }
-            } else if bytes.len() != 48 {
-                return Err("invalid perf sample length".into());
             }
-            Ok(Record::Sample(Sample {
-                ip: u64_at(8),
-                pid: u32_at(16),
-                tid: u32_at(20),
-                time: u64_at(24),
-                cpu: u32_at(32),
-                period: u64_at(40),
-                callchain: frames,
-            }))
+            if capture.branches {
+                let count = c.word()?;
+                if count > (bytes.len().saturating_sub(c.at) / 24) as u64 {
+                    return Err("invalid branch stack length".into());
+                }
+                for index in 0..count {
+                    let from = c.word()?;
+                    let to = c.word()?;
+                    let _flags = c.word()?;
+                    if index < 128 {
+                        sample.branches.push(Branch { from, to });
+                    }
+                }
+            }
+            if capture.dwarf_stack != 0 || capture.uprobe {
+                let abi = c.word()?;
+                if abi != 0 {
+                    if abi != 2 {
+                        return Err("only 64-bit sampled user registers are supported".into());
+                    }
+                    let mut values = [0u64; 33];
+                    for (index, value) in values.iter_mut().enumerate() {
+                        if register_mask(capture.uprobe) & (1u64 << index) != 0 {
+                            *value = c.word()?;
+                        }
+                    }
+                    #[cfg(target_arch = "x86_64")]
+                    let (regs, args, retval) = (
+                        UserRegs {
+                            fp: values[6],
+                            sp: values[7],
+                            ip: values[8],
+                            lr: 0,
+                        },
+                        [
+                            values[5], values[4], values[3], values[2], values[11], values[12],
+                        ],
+                        values[0] as i64,
+                    );
+                    #[cfg(target_arch = "aarch64")]
+                    let (regs, args, retval) = (
+                        UserRegs {
+                            fp: values[29],
+                            lr: values[30],
+                            sp: values[31],
+                            ip: values[32],
+                        },
+                        values[..6].try_into().unwrap(),
+                        values[0] as i64,
+                    );
+                    sample.regs = Some(regs);
+                    if capture.uprobe && !capture.retprobe {
+                        sample.args = args;
+                    }
+                    if capture.retprobe {
+                        sample.retval = retval;
+                    }
+                }
+            }
+            if capture.dwarf_stack != 0 {
+                let size = c.word()?;
+                if size > capture.dwarf_stack as u64 || size > 32768 {
+                    return Err("invalid sampled user stack size".into());
+                }
+                if size != 0 {
+                    let stack = c.take(size as usize)?;
+                    let dynamic = c.word()?;
+                    if dynamic > size {
+                        return Err("invalid dynamic user stack size".into());
+                    }
+                    sample.stack = stack[..dynamic as usize].to_vec();
+                }
+            }
+            Record::Sample(sample)
         }
-        2 if bytes.len() >= 24 => Ok(Record::Lost(u64_at(16))),
-        13 if bytes.len() >= 16 => Ok(Record::Lost(u64_at(8))),
-        3 if bytes.len() >= 17 => {
-            let end = bytes[16..]
+        2 => {
+            let _id = c.word()?;
+            Record::Lost(c.word()?)
+        }
+        13 => Record::Lost(c.word()?),
+        3 => {
+            let (pid, tid) = c.pair()?;
+            let end = bytes
+                .len()
+                .checked_sub(if capture.offcpu { 24 } else { 0 })
+                .filter(|end| *end >= c.at)
+                .ok_or("truncated perf comm sample ID")?;
+            let rest = &bytes[c.at..end];
+            let end = rest
                 .iter()
                 .position(|b| *b == 0)
                 .ok_or("unterminated perf comm record")?;
-            Ok(Record::Comm {
-                pid: u32_at(8),
-                tid: u32_at(12),
-                name: String::from_utf8_lossy(&bytes[16..16 + end]).into_owned(),
-            })
+            return Ok(Record::Comm {
+                pid,
+                tid,
+                name: String::from_utf8_lossy(&rest[..end]).into_owned(),
+            });
         }
-        9 | 2 | 13 | 3 => Err("truncated perf sample/lost/comm record".into()),
-        _ => Ok(Record::Other),
+        14 if capture.offcpu => {
+            let (pid, tid) = c.pair()?;
+            let time = c.word()?;
+            let (cpu, _) = c.pair()?;
+            Record::Switch {
+                out: misc & (1 << 13) != 0,
+                preempt: misc & (1 << 14) != 0,
+                pid,
+                tid,
+                cpu,
+                time,
+            }
+        }
+        _ => return Ok(Record::Other),
+    };
+    if capture.offcpu && matches!(kind, 2 | 13) {
+        c.take(24)?;
     }
+    if c.at != bytes.len() {
+        return Err("unexpected trailing perf record data".into());
+    }
+    Ok(record)
 }
 
 #[cfg(test)]
@@ -348,6 +653,7 @@ mod tests {
                 cpu: 3,
                 period: 100,
                 callchain: vec![],
+                ..Sample::default()
             })
         );
         assert_eq!(
@@ -403,7 +709,7 @@ mod tests {
             offset: 4096,
             size: 4096,
             tail: 4092,
-            callchain: false,
+            capture: Capture::default(),
         };
         let bytes = record(13, &42u64.to_ne_bytes());
         for (i, b) in bytes.iter().enumerate() {
@@ -420,7 +726,8 @@ mod tests {
     }
     #[test]
     fn attr_matches_version_zero_abi() {
-        assert_eq!(size_of::<Attr>(), 64);
+        assert_eq!(size_of::<Attr>(), 96);
+        assert_eq!(std::mem::offset_of!(Attr, regs_user), 80);
         assert_eq!(std::mem::offset_of!(Attr, flags), 40);
     }
 
@@ -465,5 +772,108 @@ mod tests {
         assert_eq!(sample.callchain.len(), 127);
         payload.pop();
         assert!(decode(&record(9, &payload), true).is_err());
+    }
+}
+
+#[cfg(test)]
+mod extended_tests {
+    use super::*;
+    fn record(kind: u32, payload: &[u8], misc: u16) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend(kind.to_ne_bytes());
+        bytes.extend(misc.to_ne_bytes());
+        bytes.extend(((payload.len() + 8) as u16).to_ne_bytes());
+        bytes.extend(payload);
+        bytes
+    }
+    #[test]
+    fn branches_registers_stack_and_truncation_are_validated() {
+        let capture = Capture {
+            addr: true,
+            branches: true,
+            dwarf_stack: 16,
+            uprobe: true,
+            ..Default::default()
+        };
+        let mut bytes = Vec::new();
+        for word in [
+            0x1234u64,
+            (43u64 << 32) | 42,
+            100,
+            0xabcd,
+            3,
+            99,
+            1,
+            0x1111,
+            0x2222,
+            0,
+            2,
+        ] {
+            bytes.extend(word.to_ne_bytes());
+        }
+        for index in 0..33 {
+            if register_mask(true) & (1 << index) != 0 {
+                bytes.extend((index as u64 + 1000).to_ne_bytes());
+            }
+        }
+        bytes.extend(16u64.to_ne_bytes());
+        bytes.extend([7u8; 16]);
+        bytes.extend(8u64.to_ne_bytes());
+        let Record::Sample(sample) = decode_capture(&record(9, &bytes, 0), capture).unwrap() else {
+            panic!()
+        };
+        assert_eq!(sample.addr, 0xabcd);
+        assert_eq!(
+            sample.branches,
+            [Branch {
+                from: 0x1111,
+                to: 0x2222
+            }]
+        );
+        assert_eq!(sample.stack, [7u8; 8]);
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(sample.args, [1000, 1001, 1002, 1003, 1004, 1005]);
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(sample.args, [1005, 1004, 1003, 1002, 1011, 1012]);
+        for length in 0..bytes.len() {
+            assert!(
+                decode_capture(&record(9, &bytes[..length], 0), capture).is_err(),
+                "length {length}"
+            );
+        }
+        let last = bytes.len() - 8;
+        bytes[last..].copy_from_slice(&17u64.to_ne_bytes());
+        assert!(decode_capture(&record(9, &bytes, 0), capture).is_err());
+    }
+    #[test]
+    fn switch_sideband_and_loss_trailers() {
+        let capture = Capture {
+            offcpu: true,
+            ..Default::default()
+        };
+        let mut bytes = Vec::new();
+        for word in [(43u64 << 32) | 42, 12345, 3] {
+            bytes.extend(word.to_ne_bytes());
+        }
+        assert_eq!(
+            decode_capture(&record(14, &bytes, (1 << 13) | (1 << 14)), capture).unwrap(),
+            Record::Switch {
+                out: true,
+                preempt: true,
+                pid: 42,
+                tid: 43,
+                cpu: 3,
+                time: 12345
+            }
+        );
+        let mut lost = vec![];
+        lost.extend(0u64.to_ne_bytes());
+        lost.extend(7u64.to_ne_bytes());
+        lost.extend(&bytes);
+        assert_eq!(
+            decode_capture(&record(2, &lost, 0), capture).unwrap(),
+            Record::Lost(7)
+        );
+        assert!(decode_capture(&record(14, &bytes[..16], 0), capture).is_err());
     }
 }

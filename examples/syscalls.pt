@@ -1,0 +1,2 @@
+// Uses ptrace; syscall latency includes tracing overhead.
+syscall:exit:* { @calls[syscall] = count(); @latency[syscall] = hist(latency); }

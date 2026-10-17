@@ -251,6 +251,100 @@ fn user_stacks_are_typed_keys_and_strings_live_through_the_handler() {
 
 #[test]
 fn event_layout_matches_the_jit_stack_abi() {
-    assert_eq!(std::mem::size_of::<Event<'_>>(), 80);
+    assert_eq!(std::mem::size_of::<Event<'_>>(), 200);
     assert_eq!(std::mem::offset_of!(Event<'_>, period), 40);
+}
+
+#[test]
+fn memory_helpers_symbol_keys_and_extended_event_fields() {
+    let text = std::ffi::CString::new("hello target").unwrap();
+    let number = 0x12345678u32;
+    let source = format!(
+        r#"BEGIN {{
+        printf("%s|%s|%x|%d|%d|%d|%d|%d\n", str({}, 64), buf({}, 4), read_u32({}), arg0, arg5, retval, latency, offcpu_ns);
+        @symbols[usym(0x1234)]++;
+    }}"#,
+        text.as_ptr() as u64,
+        &number as *const _ as u64,
+        &number as *const _ as u64
+    );
+    let program = Program::compile(&source).unwrap();
+    let mut output = Vec::new();
+    {
+        let mut state = program.state(&mut output);
+        let mut event = Event::new(c"test", c"BEGIN");
+        event.pid = std::process::id() as u64;
+        event.args = [11, 0, 0, 0, 0, 55];
+        event.retval = -2;
+        event.latency = 123;
+        event.offcpu_ns = 456;
+        program.invoke(0, &mut state, &event);
+        state.print_all();
+        state.flush().unwrap();
+    }
+    let output = String::from_utf8(output).unwrap();
+    assert!(
+        output.contains("hello target|78 56 34 12|12345678|11|55|-2|123|456"),
+        "{output}"
+    );
+    assert!(output.contains("@symbols[\"0x1234\"]: 1"), "{output}");
+    let program = Program::compile("BEGIN { @x = read_u64(0); }").unwrap();
+    let mut state = program.state(std::io::sink());
+    let mut event = Event::new(c"test", c"BEGIN");
+    event.pid = std::process::id() as u64;
+    program.invoke(0, &mut state, &event);
+    assert!(state.flush().unwrap_err().contains("read memory"));
+    for source in [
+        "BEGIN { @x = read_u64(); }",
+        "BEGIN { @x[str(1, 4097)]++; }",
+        "BEGIN { @x[buf(1)]++; }",
+        "BEGIN { @x[usym(1,2)]++; }",
+    ] {
+        assert!(Program::compile(source).is_err(), "{source}");
+    }
+}
+
+#[test]
+fn linear_histograms_and_report_controls() {
+    let program =
+        Program::compile("BEGIN { @linear = lhist(period, -10, 10, 5); @count[period]++; }")
+            .unwrap();
+    let mut output = Vec::new();
+    {
+        let mut state = program.state(&mut output);
+        let mut event = Event::new(c"test", c"BEGIN");
+        for value in [-11i64, -10, -6, 0, 9, 10] {
+            event.period = value as u64;
+            program.invoke(0, &mut state, &event);
+        }
+        state.print_all();
+        state.flush().unwrap();
+        state.report = poortrace::report::Options {
+            format: "json".into(),
+            top: Some(1),
+            ..Default::default()
+        };
+        let rows: serde_json::Value =
+            serde_json::from_str(&state.render_report().unwrap()).unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 2);
+    }
+    let text = String::from_utf8(output).unwrap();
+    for line in [
+        "(-inf, -10): 1",
+        "[-10, -5): 2",
+        "[0, 5): 1",
+        "[5, 10): 1",
+        "[10, +inf): 1",
+    ] {
+        assert!(text.contains(line), "{text}");
+    }
+    for source in [
+        "BEGIN { @x = lhist(1,0,0,1); }",
+        "BEGIN { @x = lhist(1,0,10,0); }",
+        "BEGIN { @x = lhist(1,0,10000,1); }",
+        "BEGIN { @x = lhist(1,0,10,pid); }",
+        "BEGIN { @x = lhist(1,0,10,1); @x = lhist(1,0,20,1); }",
+    ] {
+        assert!(Program::compile(source).is_err(), "{source}");
+    }
 }

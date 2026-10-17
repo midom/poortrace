@@ -3,7 +3,7 @@ use poortrace::{
     Result,
     codegen::Program,
     language::{HARDWARE, Probe, SOFTWARE},
-    perf::{PerfEvent, Record},
+    perf::{Capture, PerfEvent, Record},
     runtime::{Event, State},
 };
 use std::{
@@ -19,8 +19,8 @@ use std::{
 #[derive(Parser)]
 #[command(
     version,
-    about = "LLVM JIT tracing scripts over unprivileged, user-mode Linux perf events",
-    after_help = "Examples:\n  poortrace -e 'interval:ms:100 { @ticks = count(); }' --duration 1\n  poortrace -e 'profile:hz:99 { @[comm, ip] = count(); }' -- ./workload\n  poortrace -p 1234 -e 'profile:hz:99 { @[ustack] = count(); }'\n  poortrace -p 1234 -e 'software:page-faults:1 { @[tid] = count(); }'\n\nPerf policy and PMU support are enforced by the host. No BPF programs are loaded."
+    about = "LLVM JIT scripts over user-mode perf and ptrace tracing",
+    after_help = "Examples:\n  poortrace -e 'interval:ms:100 { @ticks = count(); }' --duration 1\n  poortrace -e 'profile:hz:99 { @[comm, ip] = count(); }' -- ./workload\n  poortrace -p 1234 -e 'profile:hz:99 { @[ustack] = count(); }'\n  poortrace -p 1234 -e 'software:page-faults:1 { @[tid] = count(); }'\n\nPerf/ptrace policy and PMU support are enforced by the host. No BPF programs are loaded."
 )]
 struct Args {
     /// Inline script (otherwise supply a script file)
@@ -46,6 +46,50 @@ struct Args {
     /// List supported probes/events
     #[arg(short = 'l', long)]
     list: bool,
+    /// Function probe backend: ptrace works without privileged perf uprobes
+    #[arg(long,default_value="ptrace",value_parser=["ptrace","perf"])]
+    uprobe_backend: String,
+    /// Read grouped counters instead of sampling (no script)
+    #[arg(long, conflicts_with_all=["expression","script","check","emit_llvm"])]
+    stat: bool,
+    /// Counter probes for --stat, comma separated
+    #[arg(
+        long,
+        value_delimiter = ',',
+        default_value = "hardware:cycles,hardware:instructions",
+        requires = "stat"
+    )]
+    stat_events: Vec<String>,
+    /// Report encoding; script printf output is separate when --output is used
+    #[arg(long, default_value="text",value_parser=["text","json","folded","speedscope","flamegraph"])]
+    output_format: String,
+    /// Write the final report to a file
+    #[arg(short = 'o', long)]
+    output: Option<PathBuf>,
+    /// Show the largest N entries in each map
+    #[arg(long,value_parser=clap::value_parser!(u32).range(1..))]
+    top: Option<u32>,
+    /// Add percentages to text map reports
+    #[arg(long)]
+    percent: bool,
+    /// Add per-second rates to text map reports
+    #[arg(long)]
+    rate: bool,
+    /// Print and clear text maps on this wall-clock interval
+    #[arg(long,value_parser=duration)]
+    window: Option<Duration>,
+    /// Compare map values with a previous --output-format json report
+    #[arg(long)]
+    compare: Option<PathBuf>,
+    /// Stack unwinder: frame pointers or sampled-stack DWARF CFI
+    #[arg(long,default_value="fp",value_parser=["fp","dwarf"])]
+    stack_mode: String,
+    /// Bytes of target stack captured per DWARF sample; multiple of 8
+    #[arg(long,default_value_t=16384,value_parser=clap::value_parser!(u32).range(8..=32768))]
+    stack_bytes: u32,
+    /// Capture user branch history where the PMU supports it
+    #[arg(long)]
+    branch_stack: bool,
     /// Data pages per thread/event; power of two, 1..1024
     #[arg(long, default_value_t = 8)]
     mmap_pages: usize,
@@ -105,6 +149,9 @@ fn main() {
 fn run(args: Args) -> Result<i32> {
     if args.list {
         println!("BEGIN\nEND\ninterval:{{ns,us,ms,s,hz}}:N\nprofile:{{ns,us,ms,s,hz}}:N");
+        println!(
+            "offcpu\nwatchpoint:ADDRESS:LENGTH:{{r,w,rw,x}}\nraw:CONFIG[:PERIOD]\npmu:NAME:CONFIG[:PERIOD]\ncache:CACHE:OP:RESULT[:PERIOD]\nsyscall:{{enter,exit}}:{{NAME,NUMBER,*}}"
+        );
         for (name, _) in SOFTWARE {
             println!("software:{name}[:period]");
         }
@@ -115,6 +162,21 @@ fn run(args: Args) -> Result<i32> {
     }
     if !args.mmap_pages.is_power_of_two() || args.mmap_pages > 1024 {
         return Err("--mmap-pages must be a power of two from 1 to 1024".into());
+    }
+    if args.stack_bytes % 8 != 0 {
+        return Err("--stack-bytes must be a multiple of 8".into());
+    }
+    if args.window.is_some() && (args.output_format != "text" || args.output.is_some()) {
+        return Err("--window supports text reports on stdout; omit --output".into());
+    }
+    if args.compare.is_some() && !matches!(args.output_format.as_str(), "text" | "json") {
+        return Err("--compare supports signed text or JSON reports".into());
+    }
+    if (args.percent || args.rate) && args.output_format != "text" {
+        return Err("--percent and --rate apply to text reports".into());
+    }
+    if args.stat {
+        return run_stat(&args);
     }
     let source = if let Some(s) = &args.expression {
         s.clone()
@@ -146,13 +208,49 @@ fn run(args: Args) -> Result<i32> {
         );
         return Ok(0);
     }
-    if program.has_perf()
+    if (program.has_perf() || program.has_syscalls())
         && args.pid.is_none()
         && args.command.is_empty()
         && args.shell_command.is_none()
     {
         return Err("perf probes require -p PID, -c COMMAND, or -- EXECUTABLE [ARGS...]".into());
     }
+    if program.clauses.iter().any(|clause| {
+        clause
+            .probes
+            .iter()
+            .any(|(_, probe)| matches!(probe, Probe::Uprobe { .. }))
+    }) && args.uprobe_backend == "ptrace"
+    {
+        if program.has_syscalls()
+            || program.clauses.iter().any(|clause| {
+                clause
+                    .probes
+                    .iter()
+                    .any(|(_, probe)| probe.is_perf() && !matches!(probe, Probe::Uprobe { .. }))
+            })
+        {
+            return Err("ptrace function probes cannot mix with syscall or perf probes; BEGIN/END/interval handlers are supported".into());
+        }
+        return run_functions(&args, &program);
+    }
+    if program.has_syscalls() {
+        if program.has_perf() {
+            return Err("syscall probes use ptrace and cannot be mixed with perf probes; interval/BEGIN/END handlers are supported".into());
+        }
+        return run_syscalls(&args, &program);
+    }
+    let capture = Capture {
+        addr: true,
+        callchain: program.needs_ustack(),
+        dwarf_stack: if args.stack_mode == "dwarf" && program.needs_ustack() {
+            args.stack_bytes
+        } else {
+            0
+        },
+        branches: args.branch_stack || program.needs_branches(),
+        ..Capture::default()
+    };
     install_signals()?;
     let command = args
         .shell_command
@@ -177,6 +275,7 @@ fn run(args: Args) -> Result<i32> {
             &mut streams,
             false,
             child.is_some(),
+            capture,
         )?;
     }
     if !args.quiet {
@@ -193,6 +292,7 @@ fn run(args: Args) -> Result<i32> {
     }
     let stdout = io::stdout();
     let mut state = program.state(io::BufWriter::new(stdout.lock()));
+    configure_report(&mut state, &args)?;
     state.max_entries = args.max_map_entries as usize;
     invoke_kind(&program, &mut state, target, true);
     state.flush()?;
@@ -222,6 +322,7 @@ fn run(args: Args) -> Result<i32> {
         })
         .collect();
     let mut lost = 0u64;
+    let mut window_start = Instant::now();
     let result = (|| -> Result<()> {
         let mut refresh = Instant::now();
         loop {
@@ -242,7 +343,15 @@ fn run(args: Args) -> Result<i32> {
             }
             if refresh.elapsed() >= Duration::from_millis(100) {
                 if let Some(pid) = target {
-                    attach(&program, pid, args.mmap_pages, &mut streams, true, false)?;
+                    attach(
+                        &program,
+                        pid,
+                        args.mmap_pages,
+                        &mut streams,
+                        true,
+                        false,
+                        capture,
+                    )?;
                 }
                 refresh = Instant::now();
             }
@@ -256,6 +365,15 @@ fn run(args: Args) -> Result<i32> {
                         break;
                     }
                 }
+            }
+            if args
+                .window
+                .is_some_and(|period| window_start.elapsed() >= period)
+            {
+                state.report.elapsed = window_start.elapsed().as_secs_f64();
+                state.print_all();
+                state.clear_all();
+                window_start = Instant::now();
             }
             state.flush()?;
             if state.stopped {
@@ -303,9 +421,7 @@ fn run(args: Args) -> Result<i32> {
     // END handlers still run after exit(), target exit, or an interrupt.
     state.stopped = false;
     invoke_kind(&program, &mut state, target, false);
-    if !args.no_print_maps {
-        state.print_all();
-    }
+    finish_report(&mut state, &args, window_start.elapsed())?;
     state.flush()?;
     if lost != 0 {
         eprintln!(
@@ -324,6 +440,7 @@ struct Stream {
     hup: bool,
     comm: CString,
     on_exec: bool,
+    switched_out: Option<(u64, bool)>,
 }
 fn threads(pid: i32) -> Result<BTreeSet<i32>> {
     std::fs::read_dir(format!("/proc/{pid}/task"))
@@ -345,6 +462,7 @@ fn attach(
     streams: &mut Vec<Stream>,
     enabled: bool,
     on_exec: bool,
+    capture: Capture,
 ) -> Result<()> {
     if !program.has_perf() {
         if !alive(pid) {
@@ -357,10 +475,9 @@ fn attach(
         Err(_) if !alive(pid) => return Ok(()),
         Err(e) => return Err(e),
     };
-    streams.retain(|s| !s.hup && tids.contains(&s.tid));
     for (clause, c) in program.clauses.iter().enumerate() {
         for (name, probe) in &c.probes {
-            if !matches!(probe, Probe::Perf { .. }) {
+            if !probe.is_perf() {
                 continue;
             }
             for tid in &tids {
@@ -370,13 +487,7 @@ fn attach(
                 {
                     continue;
                 }
-                let event = if program.needs_ustack() {
-                    PerfEvent::open_with_ustack(*tid, probe, pages, on_exec)
-                } else if on_exec {
-                    PerfEvent::open_on_exec(*tid, probe, pages)
-                } else {
-                    PerfEvent::open(*tid, probe, pages)
-                };
+                let event = PerfEvent::open_config(*tid, probe, pages, on_exec, capture);
                 match event {
                     Ok(event) => {
                         if enabled {
@@ -390,6 +501,7 @@ fn attach(
                             hup: false,
                             comm: task_comm(pid, *tid),
                             on_exec,
+                            switched_out: None,
                         });
                     }
                     Err(_)
@@ -422,7 +534,44 @@ fn drain(
                 Record::Comm { tid, name, .. } if tid as i32 == stream.tid => {
                     stream.comm = CString::new(name).unwrap()
                 }
-                Record::Lost(n) => *lost = lost.saturating_add(n),
+                Record::Switch {
+                    out,
+                    preempt,
+                    pid,
+                    tid,
+                    cpu,
+                    time,
+                } => {
+                    if out {
+                        stream.switched_out = Some((time, preempt));
+                    } else if let Some((start, preempt)) = stream.switched_out.take() {
+                        if time >= start && !state.stopped {
+                            let sample = poortrace::perf::Sample {
+                                pid,
+                                tid,
+                                cpu,
+                                time,
+                                period: time - start,
+                                offcpu_ns: time - start,
+                                preempt,
+                                ..Default::default()
+                            };
+                            invoke(
+                                program,
+                                stream.clause,
+                                state,
+                                Some(pid as i32),
+                                &stream.name,
+                                Some(&sample),
+                                Some(&stream.comm),
+                            );
+                        }
+                    }
+                }
+                Record::Lost(n) => {
+                    *lost = lost.saturating_add(n);
+                    stream.switched_out = None;
+                }
                 _ => {}
             }
         }
@@ -470,8 +619,19 @@ fn invoke(
         }
     };
     let name = CString::new(name).unwrap();
-    let mut event =
-        Event::new(comm, &name).with_ustack(sample.map(|s| s.callchain.as_slice()).unwrap_or(&[]));
+    let frames = sample
+        .map(|sample| state.unwind_sample(sample))
+        .unwrap_or_default();
+    let mut event = Event::new(comm, &name).with_ustack(&frames).with_branches(
+        sample
+            .map(|sample| sample.branches.as_slice())
+            .unwrap_or(&[]),
+    );
+    event.args = sample.map(|s| s.args).unwrap_or([0; 6]);
+    event.retval = sample.map(|s| s.retval).unwrap_or(0);
+    event.addr = sample.map(|s| s.addr).unwrap_or(0);
+    event.offcpu_ns = sample.map(|s| s.offcpu_ns).unwrap_or(0);
+    event.preempt = sample.map(|s| u64::from(s.preempt)).unwrap_or(0);
     event.pid = pid as u64;
     event.tid = tid as u64;
     event.cpu = sample.map(|s| s.cpu as u64).unwrap_or(0);
@@ -611,4 +771,482 @@ impl Drop for Child {
             }
         }
     }
+}
+
+fn command_for(args: &Args) -> Vec<String> {
+    args.shell_command
+        .as_ref()
+        .map(|s| vec!["/bin/sh".into(), "-c".into(), s.clone()])
+        .unwrap_or_else(|| args.command.clone())
+}
+fn configure_report(state: &mut State<'_>, args: &Args) -> Result<()> {
+    state.report = poortrace::report::Options {
+        format: args.output_format.clone(),
+        top: args.top.map(|n| n as usize),
+        percent: args.percent,
+        rate: args.rate,
+        baseline: args
+            .compare
+            .as_ref()
+            .map(|path| poortrace::report::baseline(path))
+            .transpose()?
+            .unwrap_or_default(),
+        ..Default::default()
+    };
+    Ok(())
+}
+fn finish_report(state: &mut State<'_>, args: &Args, elapsed: Duration) -> Result<()> {
+    state.report.elapsed = elapsed.as_secs_f64();
+    if let Some(path) = &args.output {
+        let report = state.render_report()?;
+        std::fs::write(path, report).map_err(|e| format!("{}: {e}", path.display()))?;
+    } else if !args.no_print_maps {
+        state.print_all();
+    }
+    Ok(())
+}
+fn run_stat(args: &Args) -> Result<i32> {
+    if !matches!(args.output_format.as_str(), "text" | "json")
+        || args.compare.is_some()
+        || args.window.is_some()
+    {
+        return Err("--stat supports final text or JSON counter reports".into());
+    }
+    install_signals()?;
+    let command = command_for(args);
+    let mut child = if command.is_empty() {
+        None
+    } else {
+        Some(Child::spawn(&command)?)
+    };
+    let pid = child
+        .as_ref()
+        .map(|c| c.pid)
+        .or(args.pid)
+        .ok_or("--stat requires -p PID or a command")?;
+    let mut groups = std::collections::BTreeMap::new();
+    for tid in threads(pid)? {
+        groups.insert(
+            tid,
+            poortrace::counters::Group::open(tid, &args.stat_events, child.is_some())?,
+        );
+    }
+    for group in groups.values() {
+        if child.is_none() {
+            group.enable()?;
+        }
+    }
+    if let Some(child) = &mut child {
+        child.start()?;
+    }
+    let start = Instant::now();
+    let mut refresh = Instant::now();
+    let mut readings = Vec::new();
+    loop {
+        let done = if let Some(child) = &mut child {
+            child.check()?.is_some()
+        } else {
+            !alive(pid)
+        };
+        if done
+            || INTERRUPTED.load(Ordering::Relaxed)
+            || args.duration.is_some_and(|d| start.elapsed() >= d)
+        {
+            break;
+        }
+        if refresh.elapsed() >= Duration::from_millis(100) {
+            let tids = threads(pid).unwrap_or_default();
+            let dead: Vec<_> = groups
+                .keys()
+                .filter(|tid| !tids.contains(tid))
+                .copied()
+                .collect();
+            for tid in dead {
+                let group = groups.remove(&tid).unwrap();
+                group.disable()?;
+                readings.extend(group.read()?);
+            }
+            for tid in tids {
+                if let std::collections::btree_map::Entry::Vacant(entry) = groups.entry(tid) {
+                    match poortrace::counters::Group::open(tid, &args.stat_events, false) {
+                        Ok(group) => {
+                            group.enable()?;
+                            entry.insert(group);
+                        }
+                        Err(_)
+                            if !std::path::Path::new(&format!("/proc/{pid}/task/{tid}"))
+                                .exists() => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+            refresh = Instant::now();
+        }
+        unsafe {
+            libc::poll(std::ptr::null_mut(), 0, 20);
+        }
+    }
+    for group in groups.values() {
+        group.disable()?;
+        readings.extend(group.read()?);
+    }
+    let mut totals = std::collections::BTreeMap::<String, (u128, u128, u128, Option<f64>)>::new();
+    for reading in readings {
+        let total = totals.entry(reading.event).or_insert((0, 0, 0, Some(0.0)));
+        total.0 += reading.raw as u128;
+        total.1 += reading.enabled_ns as u128;
+        total.2 += reading.running_ns as u128;
+        total.3 = total.3.zip(reading.scaled).map(|(a, b)| a + b);
+    }
+    let rows:Vec<_>=totals.iter().map(|(event,(raw,enabled,running,scaled))|serde_json::json!({"event":event,"raw":raw,"enabled_ns":enabled,"running_ns":running,"scaled":scaled})).collect();
+    let text = if args.output_format == "json" {
+        serde_json::to_string_pretty(&rows).map_err(|e| e.to_string())? + "\n"
+    } else {
+        let mut out = String::new();
+        for (event, (raw, enabled, running, scaled)) in &totals {
+            out.push_str(&format!(
+                "{event}: raw={raw} scaled={} running={running}/{enabled} ns\n",
+                scaled
+                    .map(|v| format!("{v:.3}"))
+                    .unwrap_or_else(|| "unavailable".into())
+            ));
+        }
+        if let (Some(cycles), Some(instructions)) = (
+            totals
+                .get("hardware:cycles")
+                .or_else(|| totals.get("hardware:cpu-cycles")),
+            totals.get("hardware:instructions"),
+        ) {
+            if let (Some(cycles), Some(instructions)) = (cycles.3, instructions.3) {
+                if cycles > 0.0 {
+                    out.push_str(&format!("IPC: {:.4}\n", instructions / cycles));
+                }
+            }
+        }
+        out
+    };
+    if let Some(path) = &args.output {
+        std::fs::write(path, text).map_err(|e| e.to_string())?;
+    } else {
+        use std::io::Write;
+        io::stdout()
+            .write_all(text.as_bytes())
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(child.as_ref().and_then(|child| child.status).unwrap_or(0))
+}
+fn run_syscalls(args: &Args, program: &Program) -> Result<i32> {
+    if args.branch_stack {
+        return Err("branch history is available with perf probes, not syscall probes".into());
+    }
+    install_signals()?;
+    let command = command_for(args);
+    let mut child = if command.is_empty() {
+        None
+    } else {
+        Some(Child::spawn(&command)?)
+    };
+    let pid = child
+        .as_ref()
+        .map(|child| child.pid)
+        .or(args.pid)
+        .ok_or("syscall probes require a target")?;
+    let mut tracer = poortrace::syscall::Tracer::seize(pid, threads(pid)?, child.is_some())?;
+    let stdout = io::stdout();
+    let mut state = program.state(io::BufWriter::new(stdout.lock()));
+    configure_report(&mut state, args)?;
+    state.max_entries = args.max_map_entries as usize;
+    invoke_kind(program, &mut state, Some(pid), true);
+    state.flush()?;
+    if !state.stopped {
+        if let Some(child) = &mut child {
+            child.start()?;
+        }
+    }
+    let start = Instant::now();
+    let mut window_start = start;
+    let mut timers: Vec<_> = program
+        .clauses
+        .iter()
+        .enumerate()
+        .flat_map(|(id, clause)| {
+            clause.probes.iter().filter_map(move |(name, probe)| {
+                if let Probe::Interval(period) = probe {
+                    Some((id, name.clone(), *period, Instant::now() + *period))
+                } else {
+                    None
+                }
+            })
+        })
+        .collect();
+    let result = (|| -> Result<()> {
+        while !state.stopped
+            && !INTERRUPTED.load(Ordering::Relaxed)
+            && !args
+                .duration
+                .is_some_and(|duration| start.elapsed() >= duration)
+        {
+            let events = tracer.poll()?;
+            let idle = events.is_empty();
+            for event in events {
+                let name = poortrace::syscall::name(event.number);
+                let syscall_name = CString::new(name).unwrap();
+                let comm = task_comm(pid, event.tid);
+                for (id, clause) in program.clauses.iter().enumerate() {
+                    for (probe_name, probe) in &clause.probes {
+                        if let Probe::Syscall { enter, number } = probe {
+                            if *enter != event.enter
+                                || number.is_some_and(|number| number != event.number)
+                            {
+                                continue;
+                            }
+                            let probe_name = CString::new(probe_name.as_str()).unwrap();
+                            let mut sample =
+                                Event::new(&comm, &probe_name).with_syscall(&syscall_name);
+                            sample.pid = pid as u64;
+                            sample.tid = event.tid as u64;
+                            sample.nsecs = monotonic_ns();
+                            sample.ip = event.ip;
+                            sample.sysno = event.number as u64;
+                            sample.retval = event.retval;
+                            sample.latency = event.latency;
+                            sample.args = event.args;
+                            program.invoke(id, &mut state, &sample);
+                            if state.stopped {
+                                break;
+                            }
+                        }
+                    }
+                    if state.stopped {
+                        break;
+                    }
+                }
+                if !state.stopped {
+                    tracer.resume(event.tid)?;
+                }
+            }
+            if let Some(child) = &mut child {
+                if let Some(code) = tracer.exits.remove(&child.pid) {
+                    child.status = Some(code);
+                    unsafe {
+                        libc::kill(-child.pid, libc::SIGKILL);
+                    }
+                    break;
+                }
+            }
+            if tracer.is_empty() || (!alive(pid) && idle) {
+                break;
+            }
+            for (id, name, period, deadline) in &mut timers {
+                if Instant::now() >= *deadline {
+                    invoke(program, *id, &mut state, Some(pid), name, None, None);
+                    *deadline = Instant::now() + *period;
+                }
+            }
+            if args
+                .window
+                .is_some_and(|duration| window_start.elapsed() >= duration)
+            {
+                state.report.elapsed = window_start.elapsed().as_secs_f64();
+                state.print_all();
+                state.clear_all();
+                window_start = Instant::now();
+            }
+            state.flush()?;
+            if idle {
+                unsafe {
+                    libc::poll(std::ptr::null_mut(), 0, 1);
+                }
+            }
+        }
+        Ok(())
+    })();
+    // Detach before dropping an owned child or returning to an attached target.
+    tracer.detach();
+    if let Some(child) = &mut child {
+        if child.status.is_none() {
+            if let Some(code) = tracer.exits.remove(&child.pid) {
+                child.status = Some(code);
+                unsafe {
+                    libc::kill(-child.pid, libc::SIGKILL);
+                }
+            }
+        }
+    }
+    drop(tracer);
+    state.stopped = false;
+    invoke_kind(program, &mut state, Some(pid), false);
+    finish_report(&mut state, args, window_start.elapsed())?;
+    state.flush()?;
+    result?;
+    Ok(child.as_ref().and_then(|child| child.status).unwrap_or(0))
+}
+
+fn run_functions(args: &Args, program: &Program) -> Result<i32> {
+    if args.branch_stack || program.needs_branches() {
+        return Err("ptrace function probes do not capture PMU branch history".into());
+    }
+    install_signals()?;
+    let command = command_for(args);
+    let mut child = if command.is_empty() {
+        None
+    } else {
+        Some(Child::spawn(&command)?)
+    };
+    let pid = child
+        .as_ref()
+        .map(|child| child.pid)
+        .or(args.pid)
+        .ok_or("function probes require a target")?;
+    let mut bindings = Vec::new();
+    let mut specs = Vec::new();
+    for (id, clause) in program.clauses.iter().enumerate() {
+        for (name, probe) in &clause.probes {
+            if let Probe::Uprobe {
+                path,
+                function,
+                ret,
+            } = probe
+            {
+                bindings.push((id, name.clone()));
+                specs.push(poortrace::functions::Spec {
+                    path: path.clone(),
+                    function: function.clone(),
+                    ret: *ret,
+                });
+            }
+        }
+    }
+    let mut tracer =
+        poortrace::functions::Tracer::seize(pid, threads(pid)?, &specs, child.is_some())?;
+    let stdout = io::stdout();
+    let mut state = program.state(io::BufWriter::new(stdout.lock()));
+    configure_report(&mut state, args)?;
+    state.max_entries = args.max_map_entries as usize;
+    invoke_kind(program, &mut state, Some(pid), true);
+    state.flush()?;
+    if !state.stopped {
+        if let Some(child) = &mut child {
+            child.start()?;
+        }
+    }
+    let start = Instant::now();
+    let mut window_start = start;
+    let mut timers: Vec<_> = program
+        .clauses
+        .iter()
+        .enumerate()
+        .flat_map(|(id, clause)| {
+            clause.probes.iter().filter_map(move |(name, probe)| {
+                if let Probe::Interval(period) = probe {
+                    Some((id, name.clone(), *period, Instant::now() + *period))
+                } else {
+                    None
+                }
+            })
+        })
+        .collect();
+    let result = (|| -> Result<()> {
+        while !state.stopped
+            && !INTERRUPTED.load(Ordering::Relaxed)
+            && !args
+                .duration
+                .is_some_and(|duration| start.elapsed() >= duration)
+        {
+            let events = tracer.poll()?;
+            let idle = events.is_empty();
+            for event in events {
+                let (id, name) = &bindings[event.binding];
+                let name = CString::new(name.as_str()).unwrap();
+                let comm = task_comm(pid, event.tid);
+                let frames = if program.needs_ustack() {
+                    let stack = poortrace::memory::read(
+                        event.tid as u32,
+                        event.regs.sp,
+                        args.stack_bytes as usize,
+                        true,
+                    )
+                    .unwrap_or_default();
+                    state.unwind_sample(&poortrace::perf::Sample {
+                        pid: pid as u32,
+                        tid: event.tid as u32,
+                        ip: event.regs.ip,
+                        regs: Some(event.regs),
+                        stack,
+                        callchain: vec![event.regs.ip],
+                        ..Default::default()
+                    })
+                } else {
+                    Vec::new()
+                };
+                let mut sample = Event::new(&comm, &name).with_ustack(&frames);
+                sample.pid = pid as u64;
+                sample.tid = event.tid as u64;
+                sample.nsecs = monotonic_ns();
+                sample.ip = event.regs.ip;
+                sample.args = event.args;
+                sample.retval = event.retval;
+                sample.latency = event.latency;
+                program.invoke(*id, &mut state, &sample);
+                if state.stopped {
+                    break;
+                }
+            }
+            if !state.stopped {
+                tracer.resume_hit()?;
+            }
+            if let Some(child) = &mut child {
+                if let Some(code) = tracer.exits.remove(&child.pid) {
+                    child.status = Some(code);
+                    unsafe {
+                        libc::kill(-child.pid, libc::SIGKILL);
+                    }
+                    break;
+                }
+            }
+            if tracer.is_empty() || (!alive(pid) && idle) {
+                break;
+            }
+            for (id, name, period, deadline) in &mut timers {
+                if Instant::now() >= *deadline {
+                    invoke(program, *id, &mut state, Some(pid), name, None, None);
+                    *deadline = Instant::now() + *period;
+                }
+            }
+            if args
+                .window
+                .is_some_and(|duration| window_start.elapsed() >= duration)
+            {
+                state.report.elapsed = window_start.elapsed().as_secs_f64();
+                state.print_all();
+                state.clear_all();
+                window_start = Instant::now();
+            }
+            state.flush()?;
+            if idle {
+                unsafe {
+                    libc::poll(std::ptr::null_mut(), 0, 1);
+                }
+            }
+        }
+        Ok(())
+    })();
+    tracer.detach();
+    if let Some(child) = &mut child {
+        if child.status.is_none() {
+            if let Some(code) = tracer.exits.remove(&child.pid) {
+                child.status = Some(code);
+                unsafe {
+                    libc::kill(-child.pid, libc::SIGKILL);
+                }
+            }
+        }
+    }
+    drop(tracer);
+    state.stopped = false;
+    invoke_kind(program, &mut state, Some(pid), false);
+    finish_report(&mut state, args, window_start.elapsed())?;
+    state.flush()?;
+    result?;
+    Ok(child.as_ref().and_then(|child| child.status).unwrap_or(0))
 }

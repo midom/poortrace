@@ -6,6 +6,21 @@ pub enum Probe {
     Begin,
     End,
     Interval(Duration),
+    OffCpu,
+    Uprobe {
+        path: String,
+        function: String,
+        ret: bool,
+    },
+    Watchpoint {
+        address: u64,
+        length: u64,
+        access: u32,
+    },
+    Syscall {
+        enter: bool,
+        number: Option<i64>,
+    },
     Perf {
         kind: u32,
         config: u64,
@@ -44,10 +59,163 @@ pub const HARDWARE: &[(&str, u64)] = &[
 
 impl Probe {
     pub fn parse(text: &str) -> Result<Self> {
+        if let Some((rest, ret)) = text
+            .strip_prefix("uprobe:")
+            .map(|rest| (rest, false))
+            .or_else(|| text.strip_prefix("uretprobe:").map(|rest| (rest, true)))
+        {
+            let mut quoted = false;
+            let mut escaped = false;
+            let mut split = None;
+            for (index, c) in rest.char_indices() {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                if c == '\\' && quoted {
+                    escaped = true;
+                    continue;
+                }
+                if c == '"' {
+                    quoted = !quoted;
+                } else if c == ':' && !quoted {
+                    split = Some(index);
+                    break;
+                }
+            }
+            let split = split.ok_or("uprobe requires PATH:SYMBOL or PATH:0xFILE_OFFSET")?;
+            let component = |raw: &str| -> Result<String> {
+                if raw.starts_with('"') {
+                    let tokens = lex(raw)?;
+                    if tokens.len() == 2 {
+                        if let TokenKind::String(value) = &tokens[0].kind {
+                            return Ok(value.clone());
+                        }
+                    }
+                    return Err("invalid quoted uprobe component".into());
+                }
+                Ok(raw.to_string())
+            };
+            let path = component(&rest[..split])?;
+            let function = component(&rest[split + 1..])?;
+            if path.is_empty() || function.is_empty() {
+                return Err("uprobe needs a nonempty path and function".into());
+            }
+            return Ok(Self::Uprobe {
+                path,
+                function,
+                ret,
+            });
+        }
         let parts: Vec<_> = text.split(':').collect();
         match parts.as_slice() {
             ["BEGIN"] => Ok(Self::Begin),
             ["END"] => Ok(Self::End),
+            ["offcpu"] => Ok(Self::OffCpu),
+            ["syscall", direction, name] if *direction == "enter" || *direction == "exit" => {
+                let number = if *name == "*" {
+                    None
+                } else {
+                    Some(crate::syscall::number(name).ok_or_else(|| {
+                        format!("unknown syscall '{name}'; use a native syscall number or '*'")
+                    })?)
+                };
+                Ok(Self::Syscall {
+                    enter: *direction == "enter",
+                    number,
+                })
+            }
+            ["watchpoint", address, length, mode] => {
+                let address = unsigned(address)?;
+                let length = unsigned(length)?;
+                let access = match *mode {
+                    "r" => 1,
+                    "w" => 2,
+                    "rw" => 3,
+                    "x" => 4,
+                    _ => return Err("watchpoint access must be r, w, rw, or x".into()),
+                };
+                if ![1, 2, 4, 8].contains(&length) || address == 0 || address % length != 0 {
+                    return Err("watchpoint needs a nonzero, naturally aligned address and length 1, 2, 4, or 8".into());
+                }
+                Ok(Self::Watchpoint {
+                    address,
+                    length,
+                    access,
+                })
+            }
+            ["raw", config] | ["raw", config, _] => Ok(Self::Perf {
+                kind: 4,
+                config: unsigned(config)?,
+                period: if parts.len() == 3 {
+                    positive(parts[2])?
+                } else {
+                    1_000_000
+                },
+                frequency: false,
+            }),
+            ["pmu", name, config] | ["pmu", name, config, _] => {
+                if name.is_empty()
+                    || !name
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+                {
+                    return Err("invalid PMU name".into());
+                }
+                let kind =
+                    std::fs::read_to_string(format!("/sys/bus/event_source/devices/{name}/type"))
+                        .map_err(|e| format!("PMU {name}: {e}"))?
+                        .trim()
+                        .parse::<u32>()
+                        .map_err(|e| e.to_string())?;
+                Ok(Self::Perf {
+                    kind,
+                    config: unsigned(config)?,
+                    period: if parts.len() == 4 {
+                        positive(parts[3])?
+                    } else {
+                        1_000_000
+                    },
+                    frequency: false,
+                })
+            }
+            ["cache", cache, operation, result] | ["cache", cache, operation, result, _] => {
+                let cache = match *cache {
+                    "l1d" => 0,
+                    "l1i" => 1,
+                    "ll" => 2,
+                    "dtlb" => 3,
+                    "itlb" => 4,
+                    "branch" => 5,
+                    "node" => 6,
+                    _ => {
+                        return Err(
+                            "unknown cache; use l1d, l1i, ll, dtlb, itlb, branch, or node".into(),
+                        );
+                    }
+                };
+                let op = match *operation {
+                    "read" => 0,
+                    "write" => 1,
+                    "prefetch" => 2,
+                    _ => return Err("cache operation must be read, write, or prefetch".into()),
+                };
+                let result = match *result {
+                    "access" => 0,
+                    "miss" => 1,
+                    _ => return Err("cache result must be access or miss".into()),
+                };
+                Ok(Self::Perf {
+                    kind: 3,
+                    config: cache | op << 8 | result << 16,
+                    period: if parts.len() == 5 {
+                        positive(parts[4])?
+                    } else {
+                        1_000_000
+                    },
+                    frequency: false,
+                })
+            }
             [provider @ ("interval" | "profile"), unit, amount] => {
                 let amount = positive(amount)?;
                 if *unit == "hz" {
@@ -115,6 +283,22 @@ impl Probe {
                 "unsupported probe '{text}'; see --list (kernel probes and BPF are not supported)"
             )),
         }
+    }
+}
+
+impl Probe {
+    pub fn is_perf(&self) -> bool {
+        matches!(
+            self,
+            Self::Perf { .. } | Self::Watchpoint { .. } | Self::OffCpu | Self::Uprobe { .. }
+        )
+    }
+}
+fn unsigned(text: &str) -> Result<u64> {
+    if let Some(hex) = text.strip_prefix("0x") {
+        u64::from_str_radix(hex, 16).map_err(|e| e.to_string())
+    } else {
+        text.parse::<u64>().map_err(|e| e.to_string())
     }
 }
 
@@ -267,7 +451,7 @@ fn lex(src: &str) -> Result<Vec<Token>> {
                 .contains(&s)
             }) {
                 i += 2;
-            } else if b"{}()[];,:/@$+-*%=!<>~&|^".contains(&bytes[i]) {
+            } else if b"{}()[];,:./@$+-*%=!<>~&|^".contains(&bytes[i]) {
                 i += 1;
             } else {
                 return Err(diagnostic(src, i, "unexpected character"));
@@ -312,11 +496,16 @@ pub fn parse(src: &str) -> Result<Vec<Clause>> {
         let mut probes = Vec::new();
         loop {
             let start = p.token().start;
+            let is_uprobe = matches!(&p.token().kind,TokenKind::Word(name) if name=="uprobe"||name=="uretprobe");
+            let mut colons = 0;
             while !p.is("{")
-                && !p.is("/")
+                && !(p.is("/") && (!is_uprobe || colons >= 2))
                 && !p.is(",")
                 && !matches!(p.token().kind, TokenKind::Eof)
             {
+                if p.is(":") {
+                    colons += 1;
+                }
                 p.at += 1;
             }
             let end = if p.at == 0 {
@@ -324,9 +513,25 @@ pub fn parse(src: &str) -> Result<Vec<Clause>> {
             } else {
                 p.tokens[p.at.saturating_sub(1)].end
             };
+            let mut quoted = false;
+            let mut escaped = false;
             let name: String = src[start..end.max(start)]
                 .chars()
-                .filter(|c| !c.is_whitespace())
+                .filter(|c| {
+                    if escaped {
+                        escaped = false;
+                        return true;
+                    }
+                    if *c == '\\' && quoted {
+                        escaped = true;
+                        return true;
+                    }
+                    if *c == '"' {
+                        quoted = !quoted;
+                        return true;
+                    }
+                    quoted || !c.is_whitespace()
+                })
                 .collect();
             probes.push((
                 name.clone(),
@@ -543,5 +748,24 @@ impl Parser<'_> {
             }
             self.expect(",")?;
         }
+    }
+}
+
+#[cfg(test)]
+mod new_probe_tests {
+    use super::*;
+    #[test]
+    fn function_paths_names_and_predicates() {
+        let clauses=parse(r#"uprobe:"/a path/libfoo.so":"ns::work(int)" / arg0 > 0 / { @x++; } uretprobe:/tmp/a.so:work { @x++; }"#).unwrap();
+        assert_eq!(clauses.len(), 2);
+        assert!(clauses[0].predicate.is_some());
+        assert!(
+            matches!(&clauses[0].probes[0].1,Probe::Uprobe {path,function,ret:false} if path=="/a path/libfoo.so"&&function=="ns::work(int)")
+        );
+        assert!(
+            matches!(&clauses[1].probes[0].1,Probe::Uprobe {path,function,ret:true} if path=="/tmp/a.so"&&function=="work")
+        );
+        assert!(Probe::parse("uprobe:/path").is_err());
+        assert!(Probe::parse("uprobe::foo").is_err());
     }
 }

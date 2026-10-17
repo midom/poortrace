@@ -1,0 +1,3 @@
+// Replace /path/to/app and my_function. Default backend is unprivileged ptrace.
+uprobe:/path/to/app:my_function { @calls = count(); @argument = hist(arg0); }
+uretprobe:/path/to/app:my_function { @result = hist(retval); @duration_ns = hist(latency); }

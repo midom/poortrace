@@ -1,0 +1,2 @@
+// Paths read while the calling thread is stopped; sibling threads may still modify them.
+syscall:enter:openat { @files[str(arg1, 256)] = count(); }

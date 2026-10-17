@@ -1,0 +1,2 @@
+// --output-format flamegraph -o cpu.svg (also: folded, json, speedscope)
+profile:hz:99 { @[ustack] = count(); }

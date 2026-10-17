@@ -97,13 +97,25 @@ supports every event.
 | `profile:ns:N`, `:us:N`, `:ms:N`, `:s:N` | Per-thread CPU-clock sampling every N units of CPU time |
 | `software:EVENT[:PERIOD]` | Samples every PERIOD software-counter occurrences |
 | `hardware:EVENT[:PERIOD]` | Samples every PERIOD hardware-counter occurrences |
+| `raw:CONFIG[:PERIOD]` | CPU-specific raw PMU event, decimal or hexadecimal config |
+| `pmu:NAME:CONFIG[:PERIOD]` | Event from a named `/sys/bus/event_source/devices` PMU |
+| `cache:CACHE:OP:RESULT[:PERIOD]` | Cache/TLB event (`l1d`, `l1i`, `ll`, `dtlb`, `itlb`, `branch`, `node`) |
+| `watchpoint:ADDRESS:LENGTH:MODE` | User hardware breakpoint: lengths 1/2/4/8, modes `r`, `w`, `rw`, `x` |
+| `uprobe:PATH:FUNCTION`, `uretprobe:PATH:FUNCTION` | Native user function entry/return stops |
+| `offcpu` | Completed switch-out/switch-in intervals for target threads |
+| `syscall:enter:NAME`, `syscall:exit:NAME` | Native syscall stops using ptrace; names, numbers, or `*` |
 
 Periods and rates must be positive decimal integers. Use `--list` for names,
 including `cpu-clock`, `task-clock`, `page-faults`, `minor-faults`, `major-faults`,
 `context-switches`, `cpu-migrations`, `cycles`, `instructions`, `cache-misses`,
 and `branch-misses`. The default period is 1,000,000 for hardware events and
 software clock events (nanoseconds for the latter), and 1 for other software
-events. Availability and user-mode filtering semantics depend on the kernel/PMU.
+events. Cache operations are `read`, `write`, or `prefetch`; results are `access`
+or `miss`. Cache/raw/PMU probes default to period 1,000,000. Config encodings,
+read-only watchpoints, breakpoint lengths/alignment, and event availability
+are CPU/kernel specific. Watchpoint addresses are runtime virtual addresses;
+account for ASLR. These probes apply to the target's threads and open no BPF
+programs. Host perf policy continues to apply.
 
 Separate probe specs with commas to share one handler. Put an optional predicate
 between slashes:
@@ -123,7 +135,10 @@ END { printf("finished\n"); }
   `true`, `false`, parentheses, `//` and `/* */` comments.
 * Integer builtins: `pid`, `tid`, `cpu`, `nsecs`, `ip`, `period`. `nsecs` uses
   `CLOCK_MONOTONIC`; `period` is the sample's perf counter period. String
-  builtins: `comm` and `probe`.
+  builtins: `comm`, `probe`, and `syscall` (empty outside syscall handlers).
+  Additional integers: `addr` (sampled data address when provided), `offcpu_ns`,
+  `preempt`, `sysno`, `retval`, `latency`, and `arg0` through `arg5`. Values that
+  do not apply to a handler are zero; `latency` and `offcpu_ns` are nanoseconds.
 * User stacks: `ustack` or `ustack()` captures up to 127 user frames;
   `ustack(N)` limits output to a constant depth from 1 to 127. Stacks can be map
   keys or arguments to `printf("%s", ...)`. They have a distinct key type and
@@ -136,13 +151,31 @@ END { printf("finished\n"); }
   and integers. A map's key types and aggregation must be consistent throughout
   the script. Missing scalar entries read as zero.
 * Map assignment, `+=`, `-=`, `++`, `--`, and direct aggregation assignments:
-  `count()`, `sum(expr)`, `min(expr)`, `max(expr)`, `avg(expr)`, `hist(expr)`.
+  `count()`, `sum(expr)`, `min(expr)`, `max(expr)`, `avg(expr)`, `hist(expr)`,
+  `lhist(expr, min, max, step)`. Linear bounds must be integer constants with
+  min < max, positive step, and at most 1024 buckets. Underflow and overflow
+  get separate buckets; the final ordinary bucket ends at max.
   Average rounds toward zero. Histograms use power-of-two buckets, a zero bucket,
   and one negative bucket; use `print` to inspect a histogram.
 * `printf("literal format", ...)`: `%d`, `%i`, `%u`, `%x`, `%X`, `%o`, `%s`,
   `%c`, `%p`, `%%`, optional `l`/`ll`, width up to 200, `-` and zero padding.
   Argument counts and types are checked before execution. Escapes: `\n`, `\r`,
   `\t`, `\\`, `\"`. C varargs are not used.
+* `usym(address)` resolves an individual user address using the current PID.
+  `str(address[, length])` reads a string up to NUL or the bounded length
+  (default 256). `buf(address, length)` renders bytes as hexadecimal.
+  Lengths must be constants from 1 to 4096. `read_u8`, `read_u16`, `read_u32`,
+  and `read_u64` return native-endian unsigned bit patterns as integers. String
+  helpers work as map keys or `%s` arguments; numeric reads work in expressions.
+  Memory access uses `process_vm_readv` with the kernel's ptrace permission
+  checks. Errors end the trace through State; partial strings may be truncated,
+  while buffers and numeric reads require a complete read. Async perf handlers
+  read current memory, not memory frozen at sample time. Even at ptrace stops,
+  sibling threads can modify shared memory.
+* `branches` is an indented list of sampled user branch source/destination
+  symbols. Using it, or `--branch-stack`, requests branch history. The PMU must
+  support it; `examples/branches.pt` uses a hardware branch event. The most
+  recent 128 branch entries are retained. This is history, not a call stack.
 * `print(@map)`, `clear(@map)`, `exit()`. Maps are also printed automatically
   at shutdown unless `--no-print-maps` is given. Clear a map after an explicit
   final print if duplicate output is undesirable.
@@ -175,29 +208,193 @@ targets with `-fno-omit-frame-pointer`, or Rust targets with
 also use `-mno-omit-leaf-frame-pointer` with C/C++ compilers that otherwise omit
 leaf frames. The kernel's
 `perf_event_max_stack` also limits captured depth. Omitted frame pointers,
-inlining, tail calls, or interrupted prologues can truncate stacks. This mode
-does not perform DWARF unwinding or recover interpreter/JIT language frames.
+inlining, tail calls, or interrupted prologues can truncate stacks.
+
+Use `--stack-mode dwarf --stack-bytes 16384 --mmap-pages 128` to unwind sampled
+user registers and stack bytes through ELF `.eh_frame`/`.debug_frame` CFI,
+including ordinary native code compiled without frame pointers. `--stack-bytes`
+is a multiple of 8 from 8 to 32768. Only the captured stack bytes are read by
+the unwinder; insufficient bytes, missing/unsupported CFI, and stack switches
+can truncate results. Frame-pointer fallback is available. Large stack samples
+need larger rings or lower sample rates. Neither mode reconstructs interpreter
+or JIT language frames without corresponding native unwind metadata.
 
 Frames resolve against the target's `/proc/PID/maps` and ELF regular/dynamic
 symbol tables, accounting for PIE/ASLR and shared-library segment offsets.
 Rust and C++ names are demangled. Available symbols print as
 `function+0xOFFSET (/path/to/module)`; unavailable symbols retain their raw
 address and module/file offset when possible. Stripped binaries may expose
-only exported symbols. Separate debug files, source lines, and inline frames
-are not resolved. Symbol lookup uses pure Rust libraries and needs no external
+only exported symbols. GNU debuglink files (CRC checked), conventional build-ID
+files under `/usr/lib/debug/.build-id`, and DWARF in the executable supply source
+locations and inline chains where available. Offsets are included when known
+from the ELF symbol table; inline chains are displayed within a physical frame. Symbol lookup uses pure Rust libraries and needs no external
 symbolizer executable or additional shared libraries in a static build.
 
 Resolution is best effort: mappings refresh at most every 100 ms while handling
 stacks, so unloading/replacing modules before samples are processed can prevent
 or invalidate resolution. Access restrictions, deleted/unreadable files, and
 anonymous mappings fall back to addresses. ELF reads are limited to 128 MiB per
-file and 250,000 text symbols; symbol caches are bounded. Stack keys own their
+file and 250,000 text symbols; symbol caches are bounded. DWARF unwinding uses at most 128 executable mappings
+per process. Stack keys own their
 rendered frames so maps remain printable after the target exits. Lifecycle and
 interval events have no sampled stack and print `<no user stack>`.
 
+## Reports and profile exports
+
+```sh
+# SVG flamegraph with hover labels; also supports folded and speedscope formats.
+./target/release/poortrace -p 1234 -d 10 examples/flamegraph.pt \
+  --output-format flamegraph -o cpu.svg
+./target/release/poortrace -p 1234 -d 10 examples/flamegraph.pt \
+  --output-format speedscope -o cpu.speedscope.json
+# Store numeric map values and typed keys, then compare another observation.
+./target/release/poortrace -p 1234 -d 10 examples/stacks.pt \
+  --output-format json -o baseline.json
+./target/release/poortrace -p 1234 -d 10 examples/stacks.pt \
+  --compare baseline.json --top 20 --percent --rate
+# Independent text snapshots: print and clear maps each second.
+./target/release/poortrace -p 1234 -d 10 examples/stacks.pt --window 1 --top 10
+```
+
+`--output-format` accepts `text` (default), `json`, `folded`, `speedscope`, or
+`flamegraph` (standalone SVG). `-o/--output` writes the final report to a file;
+script `printf`/`print` and launched-command output still go to stdout, so use
+an output file for machine-readable reports when they might print. Exported
+stack profiles use nonnegative numeric map values as weights, root first, with
+map names and other keys as labels. Speedscope exports are **aggregated weights**,
+not a time-ordered recording. Exports allow at most 256 frames per row including
+labels. Empty captures produce empty profiles.
+
+`--top N` ranks final entries by absolute value within each map; `--percent`
+uses the absolute-value total before top-N filtering; `--rate` divides numeric
+values by elapsed wall time. These two annotations apply to text map reports.
+`--window SECONDS` emits text snapshots on stdout and clears all maps, including
+maps used by the script; it cannot be combined with `--output` or other report
+formats. Script `print(@map)` retains its normal immediate rendering.
+
+`--compare FILE` subtracts numeric map values from a previous poortrace JSON
+report, matching map names and typed rendered keys; missing current keys appear
+as negative values. It supports text and JSON, and does not subtract histogram
+buckets. Stack comparisons depend on consistent resolved labels; unavailable
+symbols or changed modules can change those labels. Reports show delivered
+sample/aggregation weights, not exact CPU utilization or uncertainty bounds.
+
+## Counter reads
+
+```sh
+./target/release/poortrace --stat --stat-events hardware:cycles,hardware:instructions -- ./my-program
+./target/release/poortrace --stat --stat-events software:cpu-clock,software:page-faults -p 1234 -d 5
+```
+
+`--stat` needs no script. It reads groups of 1..16 hardware, software, raw,
+cache, or named-PMU counters per thread. The default is cycles and instructions;
+choose software events on hosts without a suitable hardware PMU. Reports include
+raw values and summed enabled/running times. Scaling is computed per thread
+before summing; a group that never ran has an unavailable scaled value.
+Multiplexed totals are estimates. Text reports include IPC when cycles and
+instructions are present in the group. `--output-format json` and `--output`
+are supported. Existing/new threads use the same 100 ms discovery limitation
+as sampling; counters are read before descriptors are dropped.
+
+## User function probes
+
+```sh
+# Default backend: unprivileged ptrace software breakpoints.
+./target/release/poortrace -p 1234 \
+  -e 'uprobe:/path/to/program:my_function { @calls = count(); @args = hist(arg0); }'
+./target/release/poortrace \
+  -e 'uretprobe:/path/to/program:my_function { @returns = sum(retval); @time = hist(latency); }' \
+  -- /path/to/program
+# Quote paths with spaces or complete demangled C++ names inside the script.
+./target/release/poortrace -p 1234 \
+  -e 'uprobe:"/path/with spaces/libfoo.so":"ns::work(int)" { @[ustack] = count(); }'
+```
+
+Function probes accept exact regular/dynamic ELF symbols, exact demangled names,
+`SYMBOL+OFFSET`, or `0xFILE_OFFSET`. Offsets are **file offsets**, not runtime
+addresses; symbol addresses are translated through executable ELF segments.
+Ambiguous overloads must use a precise signature, mangled name, or file offset.
+Offsets must be instruction boundaries (4-byte aligned on AArch64); return probes
+must select function entries. Inlined functions without a distinct symbol/entry
+cannot be probed this way. Targets must be native 64-bit ELF files up to 128 MiB.
+Absolute paths are resolved in the target's filesystem root; relative paths use
+the tracer's working directory. Stripped functions need a known file offset.
+
+`--uprobe-backend ptrace` is the default. It requires ordinary ptrace access,
+not a privileged perf uprobe PMU. The tracer stops the target's threads while
+patching, handling hits, and single-stepping original instructions; code bytes
+are restored on normal/error/interrupt cleanup before detach. Executable mappings
+must be private. This backend is intrusive and can substantially change timing;
+it is for native function tracing, not transparent high-rate profiling. Abruptly
+killing the tracer with SIGKILL prevents its cleanup. Do not probe an instruction
+that already contains a software breakpoint. Existing debuggers and ptracers
+cannot share the target. Pre-existing processes sharing its address space outside
+the target thread group are not supported.
+
+Entry probes expose the first six integer/pointer arguments in `arg0..arg5` under
+the native calling convention. Floating-point/vector, stack-passed, language ABI,
+and aggregate arguments are not decoded. Return probes preserve entry argument
+register values and provide raw signed `retval` plus `latency` including debugger
+overhead; only normal matched returns generate events. Recursion and threads are
+tracked separately. Nonlocal unwinding, tail-call transformations, and unusual
+stack switching can prevent matching returns; at most 4096 pending returns,
+1024 active breakpoints, and 256 probe bindings are allowed. `ustack` uses a
+bounded snapshot of the stopped thread's stack and native CFI, limited by
+`--stack-bytes`.
+
+Loaded instances are located through target mappings, accounting for PIE/ASLR
+and shared libraries. The loader is traced until initial bindings appear;
+subsequent mappings are rescanned every 100 ms, so brief load/unload activity can
+be missed. Thread clones are followed. Child processes do not produce script
+events; fork/vfork children are briefly controlled as needed to restore inherited
+breakpoints safely. BEGIN/END/interval handlers are supported, but ptrace function
+probes cannot mix with syscall or perf probes in one run.
+
+`--uprobe-backend perf` selects kernel uprobes instead and allows mixing with
+other perf probes. It registers dynamic uprobe/uretprobe perf descriptors directly,
+without BPF or tracefs writes. Linux kernels including 6.17 require CAP_SYS_ADMIN
+for this interface, independently of `perf_event_paranoid`; it is **not** the
+unprivileged default. This path uses asynchronous samples, can lose hits, and
+exposes argument registers on entry and the return-value register on return;
+it does not retain entry arguments or function latency for return probes.
+
+## Off-CPU and syscall tracing
+
+```sh
+./target/release/poortrace -p 1234 -d 5 examples/offcpu.pt
+./target/release/poortrace examples/syscalls.pt -- ./my-program
+./target/release/poortrace examples/files.pt -- ./my-program
+./target/release/poortrace -e 'syscall:exit:read / retval < 0 / { @[retval] = count(); }' -- ./my-program
+```
+
+`offcpu` consumes per-thread perf switch records. `offcpu_ns` (also `period`)
+is the duration of a complete switch-out/switch-in pair; `preempt` reports the
+switch-out preemption flag when the kernel supplies it. This includes both
+blocking and time awaiting a CPU. It does not establish a blocking reason or
+provide a user stack at the switch. Incomplete boundary intervals are omitted;
+a loss record discards pending pairs rather than joining across a gap.
+
+Syscall probes select an explicit **ptrace** backend, using seize/interrupt
+without sending SIGSTOP. They require Linux 5.3+ and access to the target under
+ptrace/Yama/credential/container rules. Native 64-bit syscall names/numbers and
+`*` are accepted. Entry handlers get six raw arguments; exit handlers get the
+saved arguments, signed raw `retval` (negative errno on failure), and elapsed
+`latency`. Timing includes ptrace overhead and scheduling while stopped. Syscall
+stops do not carry sampled `ustack` or branch history.
+
+Syscall probes may share scripts with BEGIN/END/interval handlers, but cannot
+mix with perf probes. Launch gating and BEGIN still precede command execution;
+launcher syscalls before exec are omitted. Existing threads are seized and
+subsequent thread clones are followed; initial attachment races remain possible.
+Child processes are not followed. Signals and group stops are preserved; cleanup
+detaches attached targets and cleans up owned command groups. No privilege or
+host-policy changes are performed. See [ptrace](https://man7.org/linux/man-pages/man2/ptrace.2.html)
+and [process_vm_readv](https://man7.org/linux/man-pages/man2/process_vm_readv.2.html)
+for their separate access checks.
+
 ## Target lifecycle and limits
 
-Perf probes require `-p PID`, `-c 'shell command'`, or `-- executable args...`.
+Perf and syscall probes require `-p PID`, `-c 'shell command'`, or `-- executable args...`.
 Launched commands wait behind a pipe gate until streams are attached and
 `BEGIN` has completed. Their initial perf streams enable at exec so launcher
 setup work is excluded. The launched command's exit status becomes the tracer's
@@ -220,9 +417,9 @@ thread/probe rather than one per CPU. There is no system-wide mode.
 Samples are buffered and handled asynchronously in userspace; this is not a
 synchronous debugger or kernel probe engine. Per-stream order is preserved,
 but streams are not globally timestamp-sorted. `ip` remains a raw user address;
-user callchains and ELF symbols are available through `ustack`. Arbitrary
-process-memory access, kprobes,
-uprobes, tracepoints, USDT, BTF, loops, structs, and the rest of bpftrace's
+user callchains and ELF/DWARF symbols are available through `ustack`. Bounded
+read-only memory helpers are available, but kprobes, tracepoints, USDT,
+BTF, loops, typed structs, and the rest of bpftrace's
 language are outside this implementation. Counter samples are not exact
 counter totals: `count()` counts delivered samples, while `sum(period)` sums
 their recorded periods; neither includes lost samples or PMU multiplexing

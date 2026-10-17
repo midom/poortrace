@@ -4,13 +4,13 @@
 
 poortrace is a bpftrace-inspired userspace tracer written in Rust. It parses a
 small tracing language, compiles handlers to native code with LLVM MCJIT, and
-invokes those handlers for Linux `perf_event_open` samples. It does not load BPF
+invokes those handlers for Linux `perf_event_open` samples or ptrace stops. It does not load BPF
 programs. See `README.md` for supported syntax, probes, examples, and limitations.
 
 Supported targets are 64-bit Linux on x86-64 and AArch64. The crate uses Rust
 edition 2024 with a minimum Rust version of 1.85. Runtime dependencies are `libc`
-and `clap`, plus `object`, `cpp_demangle`, and `rustc-demangle` for ELF user-stack
-symbolization; LLVM is accessed through direct C API bindings.
+and `clap`, ELF/DWARF readers (`object`, `addr2line`, `framehop`), demanglers, and
+Serde for profile/report formats; LLVM is accessed through direct C API bindings.
 
 ## Source map
 
@@ -22,6 +22,12 @@ symbolization; LLVM is accessed through direct C API bindings.
 - `src/runtime.rs`: event ABI, typed map keys, aggregations, formatting, output,
   and callbacks called by generated code.
 - `src/symbols.rs`: target mappings, ELF symbol lookup, and user-stack rendering.
+- `src/report.rs`: text/JSON reports, comparisons, folded stacks, Speedscope, and SVG flamegraphs.
+- `src/memory.rs`: bounded read-only process_vm_readv helpers.
+- `src/counters.rs`: grouped per-thread counter reads and scheduling-time scaling.
+- `src/functions.rs`: all-stop ptrace function breakpoints, return matching, fork handling, and text restoration.
+- `src/uprobe.rs`: ELF symbol/file-offset resolution and optional dynamic perf uprobe registration data.
+- `src/syscall.rs`: explicit ptrace syscall stops, native syscall tables, and detach cleanup.
 - `src/perf.rs`: perf attributes, event descriptors, mmap ring consumption,
   record decoding, and perf access diagnostics.
 - `src/main.rs`: CLI, signal handling, process launch gate, thread discovery,
@@ -34,7 +40,7 @@ symbolization; LLVM is accessed through direct C API bindings.
   and allocation work on the main thread and dynamically created worker threads.
 
 The data path is script → AST → typed LLVM IR → MCJIT handler → runtime callbacks.
-The CLI consumes perf records and invokes handlers serially with an `Event` and
+The CLI consumes perf records or ptrace syscall stops and invokes handlers serially with an `Event` and
 the compiled program's `State`.
 
 ## Build and validation
@@ -91,7 +97,18 @@ Do not change host perf policy to make tests pass.
   Initial events enable on exec to exclude launcher setup work.
 - Shutdown runs `END` and prints maps unless disabled. Early termination cleans
   up a launched process group; attached processes must never be signaled.
-- Samples are asynchronous, ordered within each stream, and not globally sorted.
+- Perf samples are asynchronous, ordered within each stream, and not globally sorted.
+- Syscall probes use a separate ptrace backend; do not mix them with perf probes.
+  Use seize/interrupt and preserve signals/group stops; detach attached targets.
+- Function probes default to ptrace. Restore patched text and rewind pending INT3
+  stops before detach, coordinate all threads while stepping, and restore inherited
+  breakpoints in fork children. Never silently fall back between intrusive backends.
+  Kernel perf uprobes are an explicit privileged alternative; no BPF is loaded.
+- Off-CPU intervals require complete switch pairs; clear pending pairs on loss.
+  Switch records do not carry a blocking stack or establish why a task waited.
+- Counter reads distinguish raw counts, scheduling times, and scaled estimates.
+  Preserve unscheduled (unavailable) results and read groups before dropping them.
+- Memory helpers are read-only, limited to 4096 bytes, and subject to ptrace checks.
   `count()` counts delivered samples; `sum(period)` is not an exact counter total.
 
 ## Implementation invariants

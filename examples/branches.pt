@@ -1,0 +1,2 @@
+// Requires a PMU supporting user branch history; capture is selected automatically.
+hardware:branches:100000 { @[branches] = count(); }

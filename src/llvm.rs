@@ -52,7 +52,6 @@ unsafe extern "C" {
 }
 
 #[repr(C)]
-#[derive(Default)]
 struct Options {
     opt_level: c_uint,
     code_model: c_uint,
@@ -113,7 +112,13 @@ impl Engine {
             }
             error = ptr::null_mut();
             let mut engine = ptr::null_mut();
-            let mut options = Options::default();
+            let mut options = Options {
+                opt_level: 0,
+                code_model: 0,
+                no_frame_pointer_elim: 0,
+                enable_fast_isel: 0,
+                memory_manager: ptr::null_mut(),
+            };
             LLVMInitializeMCJITCompilerOptions(&mut options, size_of::<Options>());
             options.opt_level = 2;
             if LLVMCreateMCJITCompilerForModule(
@@ -132,6 +137,7 @@ impl Engine {
             let owner = Self { engine, context };
             let mappings: &[(&CStr, Ref)] = &[
                 (c"pt_ustack", runtime::ustack as *const () as Ref),
+                (c"pt_helper", runtime::helper as *const () as Ref),
                 (c"pt_map_update", runtime::map_update as *const () as Ref),
                 (c"pt_map_get", runtime::map_get as *const () as Ref),
                 (c"pt_printf", runtime::print as *const () as Ref),
