@@ -92,35 +92,89 @@ fn launched_command_exit_status_and_gate() {
 
 #[test]
 fn interrupt_runs_end_and_releases_launched_process_group() {
+    use std::io::BufRead;
+
     let mut child = Command::new(env!("CARGO_BIN_EXE_poortrace"))
         .args([
             "-q",
             "-e",
             r#"END { printf("interrupted\n"); }"#,
             "--",
-            "/bin/sleep",
-            "30",
+            "/bin/sh",
+            "-c",
+            r#"printf 'ready:%s\n' "$$"; exec /bin/sleep 30"#,
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    std::thread::sleep(Duration::from_millis(150));
-    unsafe {
-        libc::kill(child.id() as i32, libc::SIGINT);
-    }
-    // Bound the test, including regressions in shutdown.
+    let stdout = child.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout).lines() {
+            if sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    // The workload can print only after startup, signal-handler installation,
+    // JIT compilation, and release of the launch gate. A fixed sleep races with
+    // shared LLVM loading on busy CI runners.
+    let ready = match receiver.recv_timeout(Duration::from_secs(20)) {
+        Ok(Ok(line)) => line,
+        result => {
+            let _ = child.kill();
+            let out = child.wait_with_output().unwrap();
+            panic!(
+                "workload did not become ready: {result:?}; status={}; {}",
+                out.status,
+                errors(&out)
+            );
+        }
+    };
+    let workload: i32 = ready.strip_prefix("ready:").unwrap().parse().unwrap();
+    assert!(workload > 0);
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+    // Bound shutdown independently of the startup deadline.
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     while child.try_wait().unwrap().is_none() {
         if std::time::Instant::now() > deadline {
-            child.kill().unwrap();
+            unsafe {
+                libc::kill(-workload, libc::SIGKILL);
+            }
+            let _ = child.kill();
+            let _ = child.wait();
             panic!("tracer did not stop on SIGINT");
         }
         std::thread::sleep(Duration::from_millis(10));
     }
     let out = child.wait_with_output().unwrap();
-    assert!(out.status.success(), "{}", errors(&out));
-    assert_eq!(output(&out), "interrupted\n");
+    assert!(
+        out.status.success(),
+        "status={}; {}",
+        out.status,
+        errors(&out)
+    );
+    assert_eq!(
+        receiver
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap(),
+        "interrupted"
+    );
+    // EOF also proves that the workload no longer holds the output pipe open.
+    let eof = receiver.recv_timeout(Duration::from_secs(3));
+    if !matches!(eof, Err(std::sync::mpsc::RecvTimeoutError::Disconnected)) {
+        unsafe {
+            libc::kill(-workload, libc::SIGKILL);
+        }
+        panic!("workload output pipe remained open or had unexpected output: {eof:?}");
+    }
+    assert_eq!(unsafe { libc::kill(workload, 0) }, -1);
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH)
+    );
 }
 
 #[test]
