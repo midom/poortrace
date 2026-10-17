@@ -4,8 +4,10 @@
 
 poortrace is a bpftrace-inspired userspace tracer written in Rust. It parses a
 small tracing language, compiles handlers to native code with LLVM MCJIT, and
-invokes those handlers for Linux `perf_event_open` samples or ptrace stops. It does not load BPF
-programs. See `README.md` for supported syntax, probes, examples, and limitations.
+invokes those handlers for Linux `perf_event_open` samples, ptrace stops, timers,
+and polling observations. Recorded invocations can also be replayed offline.
+It does not load BPF programs. See `README.md` for supported syntax, probes,
+examples, and limitations.
 
 Supported targets are 64-bit Linux on x86-64 and AArch64. The crate uses Rust
 edition 2024 with a minimum Rust version of 1.85. Runtime dependencies are `libc`
@@ -21,7 +23,8 @@ Serde for profile/report formats; LLVM is accessed through direct C API bindings
   registration, and engine/context ownership.
 - `src/runtime.rs`: event ABI, typed map keys, aggregations, formatting, output,
   and callbacks called by generated code.
-- `src/symbols.rs`: target mappings, ELF symbol lookup, and user-stack rendering.
+- `src/symbols.rs`: target mappings, ELF/DWARF symbol lookup, sampled-stack CFI
+  unwinding, perf-map JIT names, and user-stack rendering.
 - `src/recording.rs`: bounded, versioned invocation/helper journals and offline replay.
 - `src/python.rs`: read-only, version-checked CPython frame walking.
 - `src/javascript.rs`: V8 metadata discovery and read-only JavaScript frames.
@@ -33,7 +36,8 @@ Serde for profile/report formats; LLVM is accessed through direct C API bindings
 - `src/counters.rs`: grouped per-thread counter reads and scheduling-time scaling.
 - `src/functions.rs`: all-stop ptrace function breakpoints, return matching, fork handling, and text restoration.
 - `src/uprobe.rs`: ELF symbol/file-offset resolution and optional dynamic perf uprobe registration data.
-- `src/syscall.rs`: explicit ptrace syscall stops, native syscall tables, and detach cleanup.
+- `src/syscall.rs`: ptrace syscall/lifecycle tracking and detach cleanup; native
+  syscall-name tables live in `src/syscalls/{x86_64,aarch64}.txt`.
 - `src/perf.rs`: perf attributes, event descriptors, mmap ring consumption,
   record decoding, and perf access diagnostics.
 - `src/main.rs`: CLI, signal handling, process launch gate, thread discovery,
@@ -46,13 +50,15 @@ Serde for profile/report formats; LLVM is accessed through direct C API bindings
   and allocation work on the main thread and dynamically created worker threads.
 
 The data path is script → AST → typed LLVM IR → MCJIT handler → runtime callbacks.
-The CLI consumes perf records or ptrace syscall stops and invokes handlers serially with an `Event` and
-the compiled program's `State`.
+The CLI dispatches perf records, ptrace syscall/function stops, timers, wait
+snapshots, or recorded invocations serially with an `Event` and the compiled
+program's `State`.
 
 ## Build and validation
 
 Install a C linker and LLVM 15 or newer with development files and its shared
-library. `LLVM_CONFIG` defaults to `llvm-config`; CI uses LLVM 18:
+library (or static archives for static builds). `LLVM_CONFIG` defaults to
+`llvm-config`; CI uses LLVM 18:
 
 ```sh
 LLVM_CONFIG=llvm-config-18 cargo build --locked
@@ -71,7 +77,10 @@ alongside their implementations. Language and runtime changes should also be
 covered by synthetic-event JIT tests. CLI and lifecycle changes belong in
 `tests/cli.rs`.
 
-Live perf tests are ignored by default because host policy can deny sampling:
+Live tests are ignored by default because perf/ptrace access, native C/C++
+compilers, and runtime installations vary by host. The complete suite needs
+CPython 3.12 and Node 22 (V8 12.4), as well as permitted software perf sampling
+and hardware watchpoint support:
 
 ```sh
 LLVM_CONFIG=llvm-config-18 cargo test --locked --test cli -- --ignored --nocapture
@@ -93,17 +102,23 @@ Do not change host perf policy to make tests pass.
 - Perf probes require an attached PID or a launched command. Each thread/probe
   has its own descriptor and mmap ring, with `cpu=-1`, kernel/hypervisor execution
   excluded, and inheritance disabled.
-- Existing threads are attached individually; new threads are currently found
-  by scanning `/proc/PID/task` every 100 ms. Early events and threads that finish
-  between scans can be missed. Opt-in --track-threads attaches perf streams at
-  ptrace clone stops; --follow-forks also follows descendants across exec. Initial
-  attachment races remain. Do not describe default scanning as complete coverage.
+- In perf-only and counter runs without ptrace tracking, existing threads are
+  attached individually and new threads are found by scanning `/proc/PID/task`
+  every 100 ms. Early events and threads that finish between scans can be missed.
+  Syscall/ptrace function backends already follow thread clones. Opt-in
+  `--track-threads` attaches perf streams/counters at clone stops; `--follow-forks`
+  also follows children created after attachment across exec and waits for the
+  followed tree after root exit. Pre-existing descendants are not automatically
+  attached; initial attachment races remain.
 - Perf inheritance with `cpu=-1` has mmap sampling restrictions. Account for
   those restrictions when changing thread attachment.
 - Launched commands wait behind a pipe gate until attachment and `BEGIN` finish.
   Initial events enable on exec to exclude launcher setup work.
 - Shutdown runs `END` and prints maps unless disabled. Early termination cleans
-  up a launched process group; attached processes must never be signaled.
+  up the launched process group and, with `--follow-forks`, tracked owned
+  descendants using pidfds and a tracer-local subreaper (Linux 5.3+). Cleanup must
+  never send termination signals to attached processes; preserve signal delivery
+  and detach behavior for ptrace targets.
 - Perf samples are asynchronous, ordered within each stream, and not globally sorted.
 - Syscall/function stops can share a run with perf samples. One ptracer owns
   each target; preserve signals/group stops, launch gating, and detach cleanup.
@@ -119,6 +134,10 @@ Do not change host perf policy to make tests pass.
 - Counter reads distinguish raw counts, scheduling times, and scaled estimates.
   Preserve unscheduled (unavailable) results and read groups before dropping them.
 - Memory helpers are read-only, limited to 4096 bytes, and subject to ptrace checks.
+  Current ptrace/polling native-stack reads share this limit: use
+  `--stack-bytes 4096` or less; the 16384-byte default leaves those snapshots empty.
+  Perf-sampled stack capture supports 8..32768 bytes. Ptrace `jsstack` reads frame
+  slots directly; polling snapshots lack FP and cannot provide JS frames.
   `count()` counts delivered samples; `sum(period)` is not an exact counter total.
 
 ## Implementation invariants
@@ -139,12 +158,13 @@ Do not change host perf policy to make tests pass.
 - Retain parser/resource limits and type checks when extending the language.
   Update `README.md`, examples, CLI help, and tests when user-visible behavior
   changes.
-
 - Script repeats share a 4096-iteration invocation budget; local arrays and
   inlined expression functions must retain parser, expansion, and type limits.
 - Replay must validate helper result types before exposing pointers to JIT code.
   Never read current target memory to reconstruct a recorded helper result.
-- CPython and V8 ScopeInfo layouts are explicitly version gated; unavailable/racy
-  frames are observable labels. V8 heap reads are bounded and read-only; sampled
+- `pystack` currently supports CPython 3.12 release layouts; `jsstack` requires
+  exported V8 metadata and 8-byte tagged pointers, with ScopeInfo names gated to
+  V8 12.4 (Node 22). Keep these layout gates explicit; unavailable/racy frames are
+  observable labels. V8 heap reads are bounded and read-only; sampled
   stack slots must come from the captured stack rather than a later live stack.
 - Polling wait/wakeup observations do not identify wakers or exact sleep times.

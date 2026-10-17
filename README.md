@@ -2,8 +2,9 @@
 
 A bpftrace-inspired tracing tool written in Rust. It compiles script predicates,
 arithmetic, and control flow to native machine code with LLVM MCJIT, then runs
-those handlers over Linux `perf_event_open` samples in userspace. It does not load
-eBPF programs and needs no BPF privileges.
+those handlers over Linux `perf_event_open` samples, ptrace syscall/function
+stops, timers, and polling observations in userspace. It also supports offline
+replay. It does not load eBPF programs; host perf and ptrace access checks apply.
 
 ```sh
 cargo build --release
@@ -13,16 +14,15 @@ cargo build --release
 ```
 
 This implements the subset described below, rather than full bpftrace language
-or probe compatibility. `~/bpftrace` was used as a local reference for probe and
-language conventions; poortrace has no build or runtime dependency on it.
+or probe compatibility. poortrace has no build or runtime dependency on bpftrace.
 
 ## Build
 
 Requires 64-bit Linux on **x86-64 or AArch64**, Rust 1.85 or newer, a C linker,
 and LLVM 15 or newer with development files and its shared library (or static
-archives for static builds). LLVM 18 is
-tested on AArch64. LLVM's stable C API is bound directly; no C++ bindings or
-particular `llvm-sys` crate version are required.
+archives for static builds). CI uses LLVM 18 on x86-64; live tracing and static
+builds have also been tested on AArch64. LLVM's stable C API is bound directly;
+no C++ bindings or particular `llvm-sys` crate version are required.
 
 On Ubuntu with LLVM 18 available:
 
@@ -32,10 +32,10 @@ LLVM_CONFIG=llvm-config-18 cargo build --release --locked
 ./target/release/poortrace --help
 ```
 
-`LLVM_CONFIG` defaults to `llvm-config`. The selected library directory is
-embedded in the executable's runtime library search path. Deployment still
-requires the corresponding LLVM shared library. `cargo install --path . --locked`
-installs the binary in Cargo's bin directory.
+`LLVM_CONFIG` defaults to `llvm-config`. In the default shared-LLVM build, the
+selected library directory is embedded in the executable's runtime library
+search path. Deployment requires the corresponding LLVM shared library.
+`cargo install --path . --locked` installs the binary in Cargo's bin directory.
 
 To embed LLVM's static component libraries instead of depending on `libLLVM.so`:
 
@@ -83,9 +83,13 @@ PMU; virtualization can make them unavailable. See the
 [kernel perf access documentation](https://www.kernel.org/doc/html/latest/admin-guide/perf-security.html)
 and [perf_event_open manual](https://man7.org/linux/man-pages/man2/perf_event_open.2.html).
 
-`BEGIN`, `END`, interval-only scripts, `--check`, and `--emit-llvm` do not open
-perf events. `--list` shows recognized event names, not a guarantee that the host
-supports every event.
+`BEGIN`, `END`, interval-only scripts, ptrace-only syscall/function/USDT scripts,
+and polling wait/wakeup scripts do not open perf events. Ptrace and target-memory
+access checks still apply where needed. `--check`, `--emit-llvm`, `--list`,
+`--list-functions`, and `--list-usdt` do not attach to a target. Compilation checks
+validate language syntax and types; function globs, ELF/USDT sites, DWARF layouts,
+and host event availability are resolved later. `--list` shows recognized event
+names, not a guarantee that the host supports every event.
 
 ## Probes
 
@@ -103,7 +107,7 @@ supports every event.
 | `watchpoint:ADDRESS:LENGTH:MODE` | User hardware breakpoint: lengths 1/2/4/8, modes `r`, `w`, `rw`, `x` |
 | `uprobe:PATH:FUNCTION`, `uretprobe:PATH:FUNCTION` | Native user function entry/return stops |
 | `usdt:PATH:PROVIDER:NAME` | SystemTap SDT markers using ptrace, with scalar arguments and semaphores |
-| `wait:ms:N`, `wakeup:ms:N` | Sleeping-thread snapshots and observed sleeping-to-runnable transitions |
+| `wait:UNIT:N`, `wakeup:UNIT:N` | Sleeping-thread snapshots and observed sleeping-to-runnable transitions; units `ns`, `us`, `ms`, `s`, `hz`, minimum interval 1 ms |
 | `offcpu` | Completed switch-out/switch-in intervals for target threads |
 | `syscall:enter:NAME`, `syscall:exit:NAME` | Native syscall stops using ptrace; names, numbers, or `*` |
 
@@ -137,7 +141,8 @@ END { printf("finished\n"); }
   `true`, `false`, parentheses, `//` and `/* */` comments.
 * Integer builtins: `pid`, `tid`, `cpu`, `nsecs`, `ip`, `period`. `nsecs` uses
   `CLOCK_MONOTONIC`; `period` is the sample's perf counter period. String
-  builtins: `comm`, `probe`, and `syscall` (empty outside syscall handlers).
+  builtins: `comm`, `probe`, `syscall` (a syscall name in syscall/wait/wakeup
+  handlers, otherwise empty), and `wait_reason` (empty without a wait snapshot).
   Additional integers: `addr` (sampled data address when provided), `offcpu_ns`,
   `preempt`, `sysno`, `retval`, `latency`, and `arg0` through `arg5`. Values that
   do not apply to a handler are zero; `latency` and `offcpu_ns` are nanoseconds.
@@ -145,10 +150,13 @@ END { printf("finished\n"); }
   `ustack(N)` limits output to a constant depth from 1 to 127. Stacks can be map
   keys or arguments to `printf("%s", ...)`. They have a distinct key type and
   print as indented frames, leaf first. They cannot be used as integers.
+  `pystack` and `jsstack` provide supported managed-runtime frames; see
+  [Managed frames and JIT symbols](#managed-frames-and-jit-symbols).
 * Arithmetic `+ - * / %`, bitwise `& | ^ ~ << >>`, comparisons, unary `!`,
   and short-circuit `&& ||`. Strings support `==` and `!=` by content.
 * `$local = expression`, `+=`, `-=`, `++`, `--`, and `if (...) { ... } else { ... }`.
-  Locals hold consistently typed integers, strings, or stack values, start at zero/empty, and reset on each handler invocation.
+  Locals hold consistently typed integers, strings, or stack values, start at
+  zero/empty, and reset on each handler invocation.
 * Persistent maps: `@`, `@name`, and `@name[key, ...]`. Keys may mix strings
   and integers. A map's key types and aggregation must be consistent throughout
   the script. Missing scalar entries read as zero.
@@ -184,8 +192,8 @@ END { printf("finished\n"); }
 
 Arithmetic wraps; division/remainder by zero returns zero; `INT64_MIN / -1`
 wraps to `INT64_MIN`; shift amounts are masked to 0..63. Script strings cannot
-be used as raw pointers. Map output is sorted by key. Each map is limited to
-65,536 entries by default; `--max-map-entries` changes that limit. Exceeding it
+be used as raw pointers. Default map output is sorted by key; `--top` ranks
+entries by absolute value. Each map is limited to 65,536 entries by default; `--max-map-entries` changes that limit. Exceeding it
 ends the trace with an error. Scripts are limited to 256 KiB, nesting to 128
 levels, each expression to 128 operators per precedence level, and calls/keys
 to 16 arguments.
@@ -218,7 +226,17 @@ including ordinary native code compiled without frame pointers. `--stack-bytes`
 is a multiple of 8 from 8 to 32768. Only the captured stack bytes are read by
 the unwinder; insufficient bytes, missing/unsupported CFI, and stack switches
 can truncate results. Frame-pointer fallback is available. Large stack samples
-need larger rings or lower sample rates. Native unwinding needs native unwind metadata. `pystack` separately reads supported CPython frames; perf-map files can name native JIT frames (see below).
+need larger rings or lower sample rates. Native CFI unwinding needs unwind
+metadata. `pystack` and `jsstack` separately decode supported managed-runtime
+frames; perf-map files can name native JIT frames (see below).
+
+At ptrace syscall/function stops and polling wait/wakeup observations, stack
+snapshots currently use the 4096-byte memory-read limit. Use `--stack-bytes 4096`
+(or a smaller multiple of 8) with `ustack` for these probes. Larger values,
+including the 16384-byte default, leave these snapshots empty and native
+`ustack` falls back to the event IP. Perf stack capture supports the full
+8..32768-byte range. Ptrace `jsstack` reads frame slots directly and does not
+use this snapshot path.
 
 Frames resolve against the target's `/proc/PID/maps` and ELF regular/dynamic
 symbol tables, accounting for PIE/ASLR and shared-library segment offsets.
@@ -275,7 +293,9 @@ formats. Script `print(@map)` retains its normal immediate rendering.
 
 `--compare FILE` subtracts numeric map values from a previous poortrace JSON
 report, matching map names and typed rendered keys; missing current keys appear
-as negative values. It supports text, JSON, and differential flamegraphs, and also subtracts histogram buckets by label in text/JSON. Stack comparisons depend on consistent resolved labels; unavailable
+as negative values. It supports text, JSON, and differential flamegraphs, and
+also subtracts histogram buckets by label in text/JSON. Stack comparisons depend
+on consistent resolved labels; unavailable
 symbols or changed modules can change those labels. Reports show delivered
 sample/aggregation weights, not exact CPU utilization or uncertainty bounds.
 
@@ -293,8 +313,11 @@ raw values and summed enabled/running times. Scaling is computed per thread
 before summing; a group that never ran has an unavailable scaled value.
 Multiplexed totals are estimates. Text reports include IPC when cycles and
 instructions are present in the group. `--output-format json` and `--output`
-are supported. Existing/new threads use the same 100 ms discovery limitation
-as sampling; counters are read before descriptors are dropped.
+are supported. By default, new threads have the same 100 ms discovery limitation
+as sampling. `--track-threads` uses ptrace clone stops to attach counters before
+new threads resume; `--follow-forks` also follows newly created child processes
+and exec transitions. Initial attachment races remain. Counters are read before
+descriptors are dropped.
 
 ## User function probes
 
@@ -332,26 +355,32 @@ cannot share the target. Pre-existing processes sharing its address space outsid
 the target thread group are not supported.
 
 Entry probes expose the first six integer/pointer arguments in `arg0..arg5` under
-the native calling convention. Floating-point/vector, stack-passed, language ABI,
-and aggregate arguments are not decoded. Return probes preserve entry argument
+the native calling convention. At ptrace stops, `farg` reads scalar FP registers
+and `sarg` reads raw stack slots (see below). Vector, language-specific, and
+aggregate calling conventions are not inferred. Return probes preserve entry argument
 register values and provide raw signed `retval` plus `latency` including debugger
 overhead; only normal matched returns generate events. Recursion and threads are
 tracked separately. Nonlocal unwinding, tail-call transformations, and unusual
 stack switching can prevent matching returns; at most 4096 pending returns,
 1024 active breakpoints, and 256 probe bindings are allowed. `ustack` uses a
-bounded snapshot of the stopped thread's stack and native CFI, limited by
-`--stack-bytes`.
+bounded snapshot of the stopped thread's stack and native CFI; use
+`--stack-bytes 4096` as described under [User stacks](#user-stacks).
 
 Loaded instances are located through target mappings, accounting for PIE/ASLR
 and shared libraries. The loader is traced until initial bindings appear;
 subsequent mappings are rescanned every 100 ms, so brief load/unload activity can
-be missed. Thread clones are followed. By default, child processes do not produce script events; fork/vfork children are briefly controlled as needed to restore inherited breakpoints safely. `--follow-forks` includes descendant events and exec transitions. BEGIN/END/interval, syscall, and perf probes can share the same ptrace-backed run. Perf events still require host permission; ptrace timing changes also affect mixed samples.
+be missed. Thread clones are followed. By default, child processes do not produce
+script events; fork/vfork children are briefly controlled as needed to restore
+inherited breakpoints safely. `--follow-forks` includes descendant events and exec
+transitions. BEGIN/END/interval, syscall, and perf probes can share the same
+ptrace-backed run. Perf events still require host permission; ptrace timing
+changes also affect mixed samples.
 
 `--uprobe-backend perf` selects kernel uprobes instead and allows mixing with
 other perf probes. It registers dynamic uprobe/uretprobe perf descriptors directly,
-without BPF or tracefs writes. Linux kernels including 6.17 require CAP_SYS_ADMIN
-for this interface, independently of `perf_event_paranoid`; it is **not** the
-unprivileged default. This path uses asynchronous samples, can lose hits, and
+without BPF or tracefs writes. This interface commonly requires CAP_SYS_ADMIN
+independently of `perf_event_paranoid`; it is **not** the unprivileged default.
+This path uses asynchronous samples, can lose hits, and
 exposes argument registers on entry and the return-value register on return;
 it does not retain entry arguments or function latency for return probes.
 
@@ -376,47 +405,66 @@ without sending SIGSTOP. They require Linux 5.3+ and access to the target under
 ptrace/Yama/credential/container rules. Native 64-bit syscall names/numbers and
 `*` are accepted. Entry handlers get six raw arguments; exit handlers get the
 saved arguments, signed raw `retval` (negative errno on failure), and elapsed
-`latency`. Timing includes ptrace overhead and scheduling while stopped. Syscall stops can capture `ustack` from the stopped thread with bounded native CFI unwinding. PMU branch history belongs to perf samples.
+`latency`. Timing includes ptrace overhead and scheduling while stopped. Syscall
+stops can capture `ustack` using native CFI unwinding; use `--stack-bytes 4096`
+for the current snapshot path. PMU branch history belongs to perf samples.
 
-Syscall probes can share scripts with BEGIN/END/interval, function, and perf probes. Launch gating and BEGIN still precede command execution;
+Syscall probes can share scripts with BEGIN/END/interval, function, and perf
+probes. Launch gating and BEGIN still precede command execution;
 launcher syscalls before exec are omitted. Existing threads are seized and
 subsequent thread clones are followed; initial attachment races remain possible.
-`--follow-forks` follows child processes across exec; otherwise only threads are followed. Signals and group stops are preserved; cleanup
-detaches attached targets and cleans up owned command groups. No privilege or
+`--follow-forks` follows child processes across exec; otherwise only threads are
+followed. Signals and group stops are preserved; cleanup detaches attached
+targets and cleans up owned command groups. No privilege or
 host-policy changes are performed. See [ptrace](https://man7.org/linux/man-pages/man2/ptrace.2.html)
 and [process_vm_readv](https://man7.org/linux/man-pages/man2/process_vm_readv.2.html)
 for their separate access checks.
 
 ## Target lifecycle and limits
 
-Perf and syscall probes require `-p PID`, `-c 'shell command'`, or `-- executable args...`.
+Perf, syscall/function/USDT, and wait/wakeup probes require `-p PID`,
+`-c 'shell command'`, or `-- executable args...`.
 Launched commands wait behind a pipe gate until streams are attached and
 `BEGIN` has completed. Their initial perf streams enable at exec so launcher
 setup work is excluded. The launched command's exit status becomes the tracer's
 exit status. `-c` uses `/bin/sh -c`; use `-c 'exec my-program ...'` to replace
 the shell when the workload would otherwise be a separate child process.
 
-The tracer stops on target exit, `exit()`, Ctrl-C/SIGTERM, or `--duration SECONDS`.
-`END` runs at shutdown and remaining maps are printed. Early termination cleans
-up the launched process group; an attached PID is never signaled. An exit from
-`BEGIN` prevents command execution. Command stdout shares the tracer's stdout.
+The tracer stops on target exit (or completion of the followed process tree),
+`exit()`, Ctrl-C/SIGTERM, or `--duration SECONDS`. `END` runs at shutdown and
+remaining maps are printed. Early termination cleans up the launched process
+group and, with `--follow-forks`, tracked owned descendants. Cleanup never sends
+termination signals to attached targets. An exit from `BEGIN` prevents command
+execution. Command stdout shares the tracer's stdout.
 Launched commands run in a separate process group and are intended for
 non-interactive workloads.
 
 Existing target threads are attached individually. New threads are discovered
 every 100 ms, so their early events, and threads shorter than the scan interval,
-can be missed. `--track-threads` uses ptrace lifecycle stops to attach new perf streams before new threads resume; `--follow-forks` also includes children created after attachment and waits for them after the original process exits. Pre-existing descendant processes are not automatically attached. These options require ptrace access and introduce stops. Launched process trees use pidfds and a tracer-local subreaper for descendant cleanup, requiring Linux 5.3+; attached process trees are detached without termination signals. Initial attachment races remain, and this is not an atomic attach to an existing process tree. The default avoids perf's
+can be missed in perf-only runs without lifecycle tracking. Syscall and ptrace
+function probes already follow thread clones. `--track-threads` uses ptrace
+lifecycle stops to attach new perf streams before new threads resume;
+`--follow-forks` also includes children created after attachment and waits for
+them after the original process exits. Pre-existing descendant processes are
+not automatically attached. These options require ptrace access and introduce
+stops. Launched process trees use pidfds and a tracer-local subreaper for
+descendant cleanup, requiring Linux 5.3+; attached process trees are detached
+without termination signals. Initial attachment races remain, and this is not
+an atomic attach to an existing process tree. The default avoids perf's
 `inherit`/`cpu=-1` mmap restriction and limits the number of streams to one per
 thread/probe rather than one per CPU. There is no system-wide mode.
 
-Samples are buffered and handled asynchronously in userspace; this is not a
-synchronous debugger or kernel probe engine. Per-stream order is preserved,
-but streams are not globally timestamp-sorted. `ip` remains a raw user address;
-user callchains and ELF/DWARF symbols are available through `ustack`. Bounded
+Perf samples are buffered and handled asynchronously in userspace; ptrace
+syscall/function handlers run while their event thread is stopped. Per-stream
+perf order is preserved, but live streams are not globally timestamp-sorted.
+Offline replay can optionally sort recorded invocations by timestamp. `ip`
+remains a raw user address; user callchains and ELF/DWARF symbols are available
+through `ustack`. Bounded
 read-only memory helpers are available, but kprobes, tracepoints,
-BTF and complete bpftrace language compatibility remain outside this implementation. Bounded loops and selected DWARF structure reads are available as described below. Counter samples are not exact
-counter totals: `count()` counts delivered samples, while `sum(period)` sums
-their recorded periods; neither includes lost samples or PMU multiplexing
+BTF and complete bpftrace language compatibility remain outside this
+implementation. Bounded loops and selected DWARF structure reads are available
+as described below. Counter samples are not exact counter totals: `count()`
+counts delivered samples, while `sum(period)` sums their recorded periods; neither includes lost samples or PMU multiplexing
 corrections.
 
 The mmap consumer handles wraparound, validates record sizes, uses the kernel's
@@ -434,7 +482,7 @@ poortrace --list-functions /path/app --function-filter 'work*'
 poortrace --list-usdt /path/app
 poortrace -e 'uprobe:/path/app:work* { @[probe] = count(); }' -- /path/app
 poortrace -e 'usdt:/path/app:provider:request* { @[probe, arg0] = count(); }' -- /path/app
-poortrace -f -e 'syscall:enter:write { @[pid, ustack] = count(); }' -- /path/app
+poortrace -f --stack-bytes 4096 -e 'syscall:enter:write { @[pid, ustack] = count(); }' -- /path/app
 ```
 
 Function globs match raw or demangled names, deduplicate aliases by file offset,
@@ -448,10 +496,10 @@ cleanup; fork copies and separate address spaces are handled. These probes use
 the ptrace backend. See the [SystemTap semaphore documentation](https://www.sourceware.org/systemtap/man/dtrace.1.html).
 
 At a ptrace function stop, `farg(N, "f32")` / `farg(N, "f64")` render the first
-eight FP/SIMD argument registers as strings; FP register zero also holds ordinary
-scalar FP returns. `sarg(N)` reads one of the first sixteen raw 8-byte stack
-argument slots: immediately above the return address on x86-64, at entry SP on
-AArch64. These are ABI-level reads; signatures, varargs, vector arguments, and
+eight FP/SIMD argument registers (N=0..7) as strings; FP register zero also holds
+ordinary scalar FP returns. `sarg(N)` reads one of the first sixteen raw 8-byte stack
+argument slots (N=0..15): immediately above the return address on x86-64, at
+entry SP on AArch64. These are ABI-level reads; signatures, varargs, vector arguments, and
 aggregate calling conventions are not inferred. Return-time stack slots do not
 necessarily contain the original entry arguments.
 
@@ -560,7 +608,7 @@ and fall back to raw addresses when unavailable.
 ## Sleeping-thread observations
 
 ```sh
-poortrace -p PID -e 'wait:ms:10 { @[wait_reason, ustack] = count(); }'
+poortrace -p PID --stack-bytes 4096 -e 'wait:ms:10 { @[wait_reason, ustack] = count(); }'
 poortrace -p PID -e 'wakeup:ms:5 { @wait[wait_reason] = hist(latency); }'
 ```
 
@@ -568,7 +616,8 @@ poortrace -p PID -e 'wakeup:ms:5 { @wait[wait_reason] = hist(latency); }'
 `/proc/TID/syscall` and `wchan`. `wait_reason` labels the observed state, kernel wait
 channel (when permitted), and syscall. `ustack` uses bounded stack bytes captured
 with the observed syscall SP/IP; other registers are unavailable, so unwinding may
-truncate. `wakeup` emits when a previously observed sleeping thread is observed
+truncate. Use `--stack-bytes 4096` for the current polling snapshot limit.
+`wakeup` emits when a previously observed sleeping thread is observed
 runnable; `latency` is elapsed time between those observations. Its native stack
 bytes come from the initial sleeping snapshot.
 
@@ -594,18 +643,21 @@ poortrace --quantiles 0.5,0.9,0.99 -e 'BEGIN { @h=hist(42); }'
 Recordings are versioned newline-delimited JSON containing the original script,
 per-handler timestamps and fields, and captured helper results (including rendered
 stacks and memory reads). Replay executes the same script offline and never reads
-live target memory for those helpers. Target stdout is not recorded. File/event
-limits are 256 MiB/1 MiB. This is a handler-invocation log, not a raw perf record
+live target memory for those helpers. Target stdout/stderr and command exit
+status are not recorded. Replay uses the same native JIT; shared-LLVM binaries
+still need their LLVM shared library, while static builds retain standalone
+deployment. File/event limits are 256 MiB/1 MiB. This is a handler-invocation log, not a raw perf record
 archive; scripts cannot be replaced during replay. Replay checks helper order and
 types. `--sort-events` gives a stable global timestamp order; this can change the
 results of order-sensitive aggregations. Per-thread events otherwise retain
 recorded dispatch order.
 
 `--live SECONDS` redraws cumulative text maps in a terminal (or emits successive
-snapshots when redirected); it does not clear script maps. `--window` continues to
-print and clear them. `--quantiles` reports the containing histogram bucket rather
-than an invented exact percentile. Histogram comparisons subtract matching bucket
-labels, including removed entries. Differential flamegraphs use absolute numeric
+snapshots when redirected); it does not clear script maps and cannot be combined
+with `--window` or `--output`. `--window` continues to print and clear maps.
+`--quantiles` applies to text reports and reports the containing histogram bucket
+rather than an exact percentile; rows with negative bucket counts omit quantiles.
+Histogram comparisons subtract matching bucket labels, including removed entries. Differential flamegraphs use absolute numeric
 changes for widths, red for increases and blue for decreases; they are not CPU
 utilization measurements. Text/JSON preserve signed differences.
 
@@ -613,12 +665,13 @@ utilization measurements. Text/JSON preserve signed differences.
 
 ```sh
 cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test --locked
-# Optional live perf tests; requires a host allowing unprivileged sampling:
-cargo test --test cli -- --ignored --nocapture
+LLVM_CONFIG=llvm-config-18 cargo clippy --locked --all-targets -- -D warnings
+LLVM_CONFIG=llvm-config-18 cargo test --locked
+LLVM_CONFIG=llvm-config-18 cargo test --locked --features static-llvm
+# Opt-in live tests: perf/ptrace access, C/C++ compilers, CPython 3.12, Node 22.
+LLVM_CONFIG=llvm-config-18 cargo test --locked --test cli -- --ignored --nocapture
 
-cargo build --release --examples
+LLVM_CONFIG=llvm-config-18 cargo build --release --locked --bins --examples
 ./target/release/poortrace examples/profile.pt -- ./target/release/examples/workload 2
 ./target/release/poortrace examples/faults.pt -- ./target/release/examples/workload 2
 ./target/release/poortrace --check examples/counters.pt
@@ -628,11 +681,13 @@ cargo build --release --examples
 The tests execute actual native JIT handlers with synthetic events, including
 typed formatting, predicates, aggregation, arithmetic edge cases, output
 failures, and capacity limits. They also exercise real process startup,
-shutdown, timers, CLI errors, ring wraparound, and malformed perf records. Live
-tests cover command launching and attachment to an existing PID.
+shutdown, timers, CLI errors, ring wraparound, and malformed perf records. Opt-in
+live tests cover perf capture, native stacks, syscall/function probes, fork/exec
+lifecycle and cleanup, USDT semaphores, typed reads, CPython frames, and Node
+interpreted/optimized/worker frames and replay. CI runs shared/static LLVM tests,
+selected ptrace/runtime tests, fully static builds, and Rust 1.85 checks.
 
-Source layout: `language.rs` (lexer/parser and probe specs), `codegen.rs` (typed
-AST to LLVM IR), `llvm.rs` (C API and MCJIT lifetime), `perf.rs` (syscall and mmap
-ring), `runtime.rs` (map/output callbacks), `main.rs` (CLI and event loop).
+See [AGENTS.md](AGENTS.md#source-map) for the complete source map, build checks,
+and implementation invariants.
 
 MIT licensed. Inspired by [bpftrace](https://github.com/bpftrace/bpftrace).
