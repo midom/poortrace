@@ -19,7 +19,8 @@ language conventions; poortrace has no build or runtime dependency on it.
 ## Build
 
 Requires 64-bit Linux on **x86-64 or AArch64**, Rust 1.85 or newer, a C linker,
-and LLVM 15 or newer with development files and its shared library. LLVM 18 is
+and LLVM 15 or newer with development files and its shared library (or static
+archives for static builds). LLVM 18 is
 tested on AArch64. LLVM's stable C API is bound directly; no C++ bindings or
 particular `llvm-sys` crate version are required.
 
@@ -35,6 +36,36 @@ LLVM_CONFIG=llvm-config-18 cargo build --release --locked
 embedded in the executable's runtime library search path. Deployment still
 requires the corresponding LLVM shared library. `cargo install --path . --locked`
 installs the binary in Cargo's bin directory.
+
+To embed LLVM's static component libraries instead of depending on `libLLVM.so`:
+
+```sh
+LLVM_CONFIG=llvm-config-18 cargo build --release --locked --features static-llvm
+```
+
+This requires LLVM's static archives and a C++ standard library development
+package. LLVM's system dependencies and the C/C++ runtimes remain dynamically
+linked in this mode. The LLVM runtime search path is omitted.
+
+For a fully static executable on a native GNU/Linux toolchain, enable Rust's
+`crt-static` target feature; this selects static LLVM automatically:
+
+```sh
+sudo apt install build-essential llvm-18-dev zlib1g-dev libzstd-dev libtinfo-dev libxml2-dev
+LLVM_CONFIG=llvm-config-18 RUSTFLAGS='-C target-feature=+crt-static' \
+  cargo build --release --locked --target x86_64-unknown-linux-gnu
+./target/x86_64-unknown-linux-gnu/release/poortrace --check examples/counters.pt
+```
+
+Use `aarch64-unknown-linux-gnu` on AArch64. The explicit `--target` keeps
+`crt-static` out of host-side procedural macros. All libraries reported by
+`llvm-config --link-static --system-libs`, plus the C/C++ runtimes, must be
+available as static archives; required packages depend on the LLVM installation.
+Cross-compilation additionally requires a matching target LLVM and linker;
+switching to a musl target requires LLVM and its dependencies built for musl.
+GNU libc may emit linker warnings about dynamic loading and name-service
+functions in static executables; static linking does not make those glibc
+facilities portable across systems.
 
 ## Perf access
 

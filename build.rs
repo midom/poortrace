@@ -7,7 +7,11 @@ fn llvm(config: &str, args: &[&str]) -> String {
         .unwrap_or_else(|e| {
             panic!("cannot run {config}: {e}; install LLVM development packages or set LLVM_CONFIG")
         });
-    assert!(output.status.success(), "{config} {args:?} failed");
+    assert!(
+        output.status.success(),
+        "{config} {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     String::from_utf8(output.stdout)
         .expect("llvm-config output is UTF-8")
         .trim()
@@ -25,10 +29,21 @@ fn main() {
     );
     let libdir = llvm(&config, &["--libdir"]);
     println!("cargo:rustc-link-search=native={libdir}");
+    let static_crt = std::env::var("CARGO_CFG_TARGET_FEATURE")
+        .unwrap_or_default()
+        .split(',')
+        .any(|feature| feature == "crt-static");
+    let static_llvm = static_crt || std::env::var_os("CARGO_FEATURE_STATIC_LLVM").is_some();
+    let mode = if static_llvm {
+        "--link-static"
+    } else {
+        "--link-shared"
+    };
+    let kind = if static_llvm { "static" } else { "dylib" };
     for flag in llvm(
         &config,
         &[
-            "--link-shared",
+            mode,
             "--libs",
             "core",
             "irreader",
@@ -40,9 +55,42 @@ fn main() {
     .split_whitespace()
     {
         if let Some(name) = flag.strip_prefix("-l") {
-            println!("cargo:rustc-link-lib=dylib={name}");
+            println!("cargo:rustc-link-lib={kind}={name}");
         }
     }
+    if static_llvm {
+        // LLVM's component archives do not include its system dependencies or
+        // the C++ standard library. Keep system libraries dynamic unless the
+        // executable itself is being linked statically.
+        // With crt-static, let the linker find archives in its default system
+        // search paths (which are not necessarily in rustc's archive search path).
+        let system_kind = if static_crt { "" } else { "dylib=" };
+        for flag in llvm(&config, &[mode, "--system-libs"]).split_whitespace() {
+            if let Some(name) = flag.strip_prefix("-l") {
+                println!("cargo:rustc-link-lib={system_kind}{name}");
+            } else if let Some(path) = flag.strip_prefix("-L") {
+                println!("cargo:rustc-link-search=native={path}");
+            } else if std::path::Path::new(flag).is_absolute() {
+                // Preserve dependencies in the library's metadata so integration
+                // tests and other consumers receive them too.
+                let path = std::path::Path::new(flag);
+                let archive = path.extension().is_some_and(|ext| ext == "a");
+                assert!(
+                    !static_crt || archive,
+                    "llvm-config reported a shared system library for a fully static build: {flag}; use an LLVM installation configured with static system dependencies"
+                );
+                let kind = if archive { "static" } else { "dylib" };
+                let directory = path.parent().unwrap().display();
+                let filename = path.file_name().unwrap().to_str().unwrap();
+                println!("cargo:rustc-link-search=native={directory}");
+                println!("cargo:rustc-link-lib={kind}:+verbatim={filename}");
+            } else {
+                panic!("unsupported llvm-config system library flag: {flag}");
+            }
+        }
+        println!("cargo:rustc-link-lib={system_kind}stdc++");
+    } else {
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{libdir}");
+    }
     println!("cargo:rustc-env=POORTRACE_LLVM_VERSION={version}");
-    println!("cargo:rustc-link-arg=-Wl,-rpath,{libdir}");
 }

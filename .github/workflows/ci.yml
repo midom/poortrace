@@ -3,6 +3,9 @@ on: [push, pull_request]
 jobs:
   test:
     runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        features: ["", "static-llvm"]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -10,9 +13,33 @@ jobs:
           components: rustfmt, clippy
       - run: sudo apt-get update && sudo apt-get install -y llvm-18-dev
       - run: cargo fmt --check
-      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo clippy --locked --all-targets --features '${{ matrix.features }}' -- -D warnings
         env:
           LLVM_CONFIG: llvm-config-18
+      - run: cargo test --locked --features '${{ matrix.features }}'
+        env:
+          LLVM_CONFIG: llvm-config-18
+  fully-static:
+    runs-on: ubuntu-24.04
+    env:
+      LLVM_CONFIG: llvm-config-18
+      RUSTFLAGS: -C target-feature=+crt-static
+      CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y llvm-18-dev zlib1g-dev libzstd-dev libtinfo-dev libxml2-dev
       - run: cargo test --locked
-        env:
-          LLVM_CONFIG: llvm-config-18
+      - run: cargo build --release --locked
+      - name: Verify static executable and JIT
+        run: |
+          binary=target/x86_64-unknown-linux-gnu/release/poortrace
+          if readelf -d "$binary" | grep -q '(NEEDED)'; then
+            echo "Executable depends on shared libraries"
+            exit 1
+          fi
+          if readelf -l "$binary" | grep -q INTERP; then
+            echo "Executable requires a dynamic loader"
+            exit 1
+          fi
+          "$binary" -q -e 'BEGIN { printf("%d\n", 6 * 7); exit(); }' | grep -qx 42

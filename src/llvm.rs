@@ -1,4 +1,4 @@
-//! Minimal, version-stable LLVM C API surface; llvm-config selects the shared library.
+//! Minimal, version-stable LLVM C API surface; llvm-config selects the libraries.
 use crate::{Result, runtime};
 use std::{
     ffi::{CStr, CString, c_char, c_int, c_uint, c_void},

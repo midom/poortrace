@@ -24,8 +24,8 @@ and `clap`; LLVM is accessed through direct C API bindings.
   record decoding, and perf access diagnostics.
 - `src/main.rs`: CLI, signal handling, process launch gate, thread discovery,
   stream attachment, polling, timers, and shutdown.
-- `build.rs`: discovers LLVM through `llvm-config`, links its shared library,
-  and embeds its library path and version.
+- `build.rs`: discovers LLVM through `llvm-config`, selects shared or static
+  linking, and embeds its version and (for shared builds) runtime library path.
 - `tests/jit.rs`: native JIT integration tests using synthetic events.
 - `tests/cli.rs`: CLI, timers, process lifecycle, and opt-in live perf tests.
 - `examples/*.pt`: sample tracing scripts. `examples/workload.rs` provides CPU
@@ -46,6 +46,11 @@ cargo fmt --check
 LLVM_CONFIG=llvm-config-18 cargo clippy --locked --all-targets -- -D warnings
 LLVM_CONFIG=llvm-config-18 cargo test --locked
 ```
+
+`--features static-llvm` links LLVM component archives; `RUSTFLAGS='-C
+target-feature=+crt-static'` with an explicit native `--target` selects a fully
+static build, including LLVM. See `README.md` for archive prerequisites. CI
+tests shared LLVM, static LLVM, and fully static builds.
 
 Run checks appropriate to the change. Parser and perf decoder unit tests live
 alongside their implementations. Language and runtime changes should also be
