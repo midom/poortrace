@@ -1172,7 +1172,7 @@ fn live_usdt_discovery_for_pid() {
         "poortrace:work",
     ]);
     assert!(out.status.success(), "{}", errors(&out));
-    let expected = format!("usdt:{}:poortrace:work\n", binary.display());
+    let expected = format!("usdt:{:?}:poortrace:work\n", binary.to_str().unwrap());
     assert_eq!(output(&out), expected);
     poortrace::language::parse(&format!("{} {{ @calls=count(); }}", expected.trim())).unwrap();
     assert!(fixture.0.try_wait().unwrap().is_none());
