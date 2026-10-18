@@ -352,8 +352,8 @@ impl Tracer {
         if tasks.len() > 4096 {
             return Err("initial thread limit (4096) exceeded".into());
         }
-        if specs.is_empty() || specs.len() > 256 {
-            return Err("function tracing supports 1..256 probe bindings".into());
+        if specs.len() > 256 {
+            return Err("function tracing supports at most 256 probe bindings".into());
         }
         let mut bindings = Vec::new();
         for spec in specs {
@@ -730,6 +730,50 @@ impl Tracer {
             }
         }
         Ok(())
+    }
+    /// Stop all tracked tasks and prove that no visible sibling was missed.
+    /// Kernel group stops and vfork-blocked parents are quiescent as well.
+    pub fn pause_for_snapshot(&mut self) -> Result<()> {
+        self.stop_world()?;
+        for pid in self.targets() {
+            let tasks = match std::fs::read_dir(format!("/proc/{pid}/task")) {
+                Ok(tasks) => tasks,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(format!("reliable thread coverage PID {pid}: {error}")),
+            };
+            for task in tasks {
+                let task = task.map_err(|e| e.to_string())?;
+                let tid: i32 = task
+                    .file_name()
+                    .to_string_lossy()
+                    .parse()
+                    .map_err(|_| "invalid task ID")?;
+                if !self.tids.contains(&tid) {
+                    return Err(format!(
+                        "reliable snapshot cannot proceed: untraced sibling TID {tid}"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+    /// Pending stop events must be processed by poll before their tasks resume.
+    pub fn release_snapshot(&mut self) -> Result<()> {
+        if self.pending.is_empty() && self.active_hit.is_none() {
+            self.resume_all()?;
+        }
+        Ok(())
+    }
+    /// Registers are read only from observed ptrace stops, never running tasks.
+    pub fn snapshot_registers(&self) -> Result<Vec<(i32, UserRegs)>> {
+        if !self.active {
+            return Ok(Vec::new()); // A launched child has not executed its target yet.
+        }
+        self.stopped
+            .iter()
+            .filter(|tid| self.follow || !self.foreign.contains(tid))
+            .map(|&tid| Registers::read(tid).map(|regs| (tid, regs.user())))
+            .collect()
     }
     fn current_maps(&self) -> Result<Vec<Mapping>> {
         match maps(self.pid) {

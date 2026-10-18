@@ -199,6 +199,7 @@ fn replay_script(events: &[Saved], original: &str, alternate: &str) -> String {
         serde_json::to_writer(
             &mut file,
             &recording::Header {
+                capture_mode: None,
                 version: 2,
                 architecture: None,
                 endianness: None,
@@ -426,6 +427,7 @@ fn scheduler_timelines_require_proven_complete_lossless_matching_switches() {
     };
     let mut recording = Recording {
         header: recording::Header {
+            capture_mode: None,
             version: 3,
             architecture: None,
             endianness: None,
@@ -633,6 +635,7 @@ fn raw_perf_observations_decode_archived_formats_and_preserve_handler_captures()
     old.comm = "known".into();
     let mut recording = Recording {
         header: recording::Header {
+            capture_mode: None,
             version: 3,
             source: "tracepoint:test:sample {}".into(),
             architecture: Some(std::env::consts::ARCH.into()),
@@ -722,6 +725,7 @@ fn raw_offcpu_pairs_are_cleared_by_throttle_and_recorded_discontinuities() {
     };
     let mut recording = Recording {
         header: recording::Header {
+            capture_mode: None,
             version: 3,
             source: "offcpu {}".into(),
             architecture: None,

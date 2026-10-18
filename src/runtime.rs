@@ -323,6 +323,8 @@ pub struct State<'a> {
     pub trace_fields: crate::kernel::Fields,
     pub(crate) replay_lookup: bool,
     pub js_snapshot: Option<(crate::perf::UserRegs, Vec<u8>)>,
+    /// Set only while handlers execute under a verified stopped-target pause.
+    pub target_paused: bool,
     types: crate::types::Reader,
     native_args: crate::native_args::Reader,
     pub report: crate::report::Options,
@@ -365,6 +367,7 @@ impl<'a> State<'a> {
             btf: crate::btf::Reader::default(),
             managed: crate::managed_bridge::Reader::default(),
             js_snapshot: None,
+            target_paused: false,
             trace_fields: Default::default(),
             replay_lookup: false,
             types: crate::types::Reader::default(),
@@ -1373,7 +1376,7 @@ unsafe fn helper_inner(
                 event.pid as u32,
                 event.tid as u32,
                 length as usize,
-                state.js_snapshot.as_ref(),
+                state.js_snapshot.as_ref().filter(|_| !state.target_paused),
             )
             .unwrap_or_else(|error| {
                 format!(

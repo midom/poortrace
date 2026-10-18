@@ -24,6 +24,8 @@ pub struct Header {
     pub architecture: Option<String>,
     #[serde(default)]
     pub endianness: Option<String>,
+    #[serde(default)]
+    pub capture_mode: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MemoryRegion {
@@ -214,6 +216,13 @@ pub struct Recorder {
 }
 impl Recorder {
     pub fn create(path: &std::path::Path, source: &str) -> Result<Self> {
+        Self::create_with_mode(path, source, None)
+    }
+    pub fn create_with_mode(
+        path: &std::path::Path,
+        source: &str,
+        capture_mode: Option<&str>,
+    ) -> Result<Self> {
         let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
         let mut out = Self {
             writer: std::io::BufWriter::new(file),
@@ -221,6 +230,7 @@ impl Recorder {
         };
         out.line(&Header {
             version: 3,
+            capture_mode: capture_mode.map(str::to_owned),
             source: source.into(),
             architecture: Some(std::env::consts::ARCH.into()),
             endianness: Some(

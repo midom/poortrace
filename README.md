@@ -197,7 +197,7 @@ END { printf("finished\n"); }
   checks. Errors end the trace through State; partial strings may be truncated,
   while buffers and numeric reads require a complete read. Async perf handlers
   read current memory, not memory frozen at sample time. Even at ptrace stops,
-  sibling threads can modify shared memory.
+  sibling threads can modify shared memory unless `--reliable` is selected.
 * `branches` is an indented list of sampled user branch source/destination
   symbols. Using it, or `--branch-stack`, requests branch history. The PMU must
   support it; `examples/branches.pt` uses a hardware branch event. The most
@@ -271,6 +271,48 @@ file and 250,000 text symbols; symbol caches are bounded. DWARF unwinding uses a
 per process. Stack keys own their
 rendered frames so maps remain printable after the target exits. Lifecycle and
 interval events have no sampled stack and print `<no user stack>`.
+
+## Stopped-target mode
+
+`--reliable` runs handlers while all tracked target threads are stopped through
+ptrace. It supports syscall, ptrace function/USDT, interval, and `profile:hz`
+probes, including mixtures of these probes. No perf access is required.
+
+```sh
+poortrace --reliable -p PID -e 'profile:hz:99 { @[pystack] = count(); }'
+poortrace --reliable -p PID -e 'profile:hz:99 { @[jsstack] = count(); }'
+poortrace --reliable -e 'syscall:enter:write { printf("%s",str(arg1)); }' -- app
+poortrace --reliable -p PID -e 'interval:ms:100 { @[ustack] = count(); }'
+```
+
+In this mode, `profile:hz` takes **wall-clock snapshots** of each stopped tracked
+thread, including sleeping threads. It is a different measurement from default
+perf CPU-time profiling. `period` is the requested snapshot interval in
+nanoseconds; `nsecs` is the snapshot observation time. Snapshot `cpu` is the
+thread's last reported processor, or 4294967295 when unavailable.
+Missed deadlines coalesce,
+and actual rates depend on stop and handler overhead. Launched-command snapshots
+start after exec. Interval handlers run once per tick on the stopped root thread
+when its registers are available. Native stack registers and stack bytes are read
+at that stop; Python/V8/Go helpers read the paused target's heap. BEGIN and END
+also run under a verified pause when a target remains.
+
+The tracer verifies visible sibling coverage and fails instead of invoking a
+handler if it cannot stop the tracked set or finds an untraced sibling. Existing
+tree attachment can therefore fail during a concurrent thread-creation race;
+retry after the process has stabilized. `--follow-forks`, `--attach-descendants`,
+and declared `--shared-mm-pids` extend the tracked set. Attached targets are
+detached without termination signals, including on handler errors or interrupts;
+launched commands retain the usual owned-process cleanup behavior.
+
+Stopping threads perturbs scheduling and timing. It prevents writes by those
+threads during the handler, but does not make an interrupted runtime operation a
+valid interpreter/GC safepoint. Unsupported frames can still be unavailable.
+Kernel activity, devices, and untracked processes writing shared mappings are
+outside this guarantee. Asynchronous perf/tracepoint/kernel/watchpoint/off-CPU
+probes, polling wait/wakeup probes, branch sampling, counters, and external
+cooperative snapshots are rejected in this mode. Recordings label the capture
+mode `stopped-target-wall-clock` and retain helper results for offline replay.
 
 ## Reports and profile exports
 
@@ -931,6 +973,7 @@ LLVM_CONFIG=llvm-config-18 cargo test --locked --features static-llvm
 # Opt-in native tests require host perf/ptrace access and the fixture compilers.
 LLVM_CONFIG=llvm-config-18 cargo test --locked --test cli -- --ignored --nocapture
 LLVM_CONFIG=llvm-config-18 cargo test --locked --test process_coverage -- --ignored
+LLVM_CONFIG=llvm-config-18 cargo test --locked --test reliable -- --ignored
 LLVM_CONFIG=llvm-config-18 cargo test --locked --test arguments -- --ignored
 # Select managed tests for the runtimes actually installed.
 LLVM_CONFIG=llvm-config-18 cargo test --locked --test managed node_ -- --ignored --skip cooperative_

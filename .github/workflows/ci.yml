@@ -45,6 +45,7 @@ jobs:
           cargo test --locked --features '${{ matrix.features }}' --test process_coverage -- --ignored
           cargo test --locked --features '${{ matrix.features }}' --test arguments -- --ignored
           cargo test --locked --features '${{ matrix.features }}' --test expansion -- --ignored
+          cargo test --locked --features '${{ matrix.features }}' --test reliable -- --ignored
         env:
           LLVM_CONFIG: llvm-config-18
   fully-static:

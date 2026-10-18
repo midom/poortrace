@@ -53,13 +53,15 @@ Serde for profile/report formats; LLVM is accessed through direct C API bindings
   syscall-name tables live in `src/syscalls/{x86_64,aarch64}.txt`.
 - `src/perf.rs`: perf attributes, event descriptors, mmap ring consumption,
   record decoding, and perf access diagnostics.
+- `src/reliable.rs`: stopped-target CLI backend, wall-clock profile snapshots,
+  and verified pauses around handlers; it never opens perf descriptors.
 - `src/main.rs`: CLI, signal handling, process launch gate, thread discovery,
   stream attachment, polling, timers, and shutdown.
 - `build.rs`: discovers LLVM through `llvm-config`, selects shared or static
   linking, and embeds its version and (for shared builds) runtime library path.
 - `tests/jit.rs`: native JIT integration tests using synthetic events.
 - `tests/cli.rs`: CLI, timers, process lifecycle, and opt-in live perf tests.
-- `tests/{managed,process_coverage,arguments,kernel_cli,recording_features,float_reports,expansion}.rs`:
+- `tests/{managed,process_coverage,arguments,kernel_cli,recording_features,float_reports,expansion,reliable}.rs`:
   focused runtime, lifecycle, ABI, kernel decoder/replay, and report regressions.
 - `examples/*.pt`: sample tracing scripts. `examples/workload.rs` provides CPU
   and allocation work on the main thread and dynamically created worker threads.
@@ -135,6 +137,12 @@ Do not change host perf policy to make tests pass.
   races remain. Function tracing can include declared `--shared-mm-pids` only
   after `kcmp(KCMP_VM)` proves shared ownership; stop every declared peer before
   patching. Permission failures or unproven ownership must fail safely.
+- `--reliable` routes supported probes through the all-stop ptrace backend.
+  Verify visible sibling coverage before handlers, retain pending stop events,
+  skip pre-exec launcher snapshots, and detach on every error path. Profile
+  probes in this mode are wall-clock thread snapshots, never CPU-time samples.
+  External shared-memory writers and runtime safepoints are not guaranteed.
+  Do not silently accept asynchronous or cooperative-snapshot probes in this mode.
 - Perf inheritance with `cpu=-1` has mmap sampling restrictions. Account for
   those restrictions when changing thread attachment.
 - Launched commands wait behind a pipe gate until attachment and `BEGIN` finish.

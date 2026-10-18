@@ -1,0 +1,3 @@
+// Run with --reliable -p PID for stopped-thread wall-clock snapshots.
+// Sleeping threads are included; these are not CPU-time weights.
+profile:hz:99 { @[tid, ustack] = count(); }
