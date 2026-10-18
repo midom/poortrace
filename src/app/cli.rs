@@ -125,6 +125,9 @@ pub(super) struct Args {
     /// Write the final report to a file
     #[arg(short = 'o', long)]
     pub(super) output: Option<PathBuf>,
+    /// Write measurement provenance to a JSON sidecar (also for text/folded reports)
+    #[arg(long)]
+    pub(super) report_metadata: Option<PathBuf>,
     /// Show the largest N entries in each map
     #[arg(long,value_parser=clap::value_parser!(u32).range(1..))]
     pub(super) top: Option<u32>,

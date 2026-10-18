@@ -1,0 +1,65 @@
+name: Benchmarks and fuzz smoke tests
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  workflow-lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.x'
+          cache: false
+      - run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 -color
+  benchmarks:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    env:
+      LLVM_CONFIG: llvm-config-18
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y llvm-18-dev
+      - run: cargo bench --locked --bench pipeline > pipeline.json
+      - run: cargo build --release --locked --bins --example benchmark_workload
+      - run: python3 scripts/benchmark.py --runs 3 > workload.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: benchmarks-${{ runner.arch }}
+          path: |
+            pipeline.json
+            workload.json
+  fuzz-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      LLVM_CONFIG: llvm-config-18
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: sudo apt-get update && sudo apt-get install -y llvm-18-dev
+      - run: cargo install cargo-fuzz --version 0.13.2 --locked
+      - run: |
+          mkdir -p fuzz/corpus/inputs
+          cp fuzz/seeds/inputs/* fuzz/corpus/inputs/
+          cargo fuzz run inputs -- -max_total_time=30 -max_len=65536 -print_funcs=0 -print_final_stats=1 -timeout=5 -rss_limit_mb=2048
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: fuzz-crashes
+          path: fuzz/artifacts/
+  llvm-compatibility:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        llvm: [15, 18]
+    env:
+      LLVM_CONFIG: llvm-config-${{ matrix.llvm }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y llvm-${{ matrix.llvm }}-dev
+      - run: cargo test --locked

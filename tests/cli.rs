@@ -304,8 +304,8 @@ fn new_probe_syntax_and_json_reporting() {
     ]);
     assert!(out.status.success(), "{}", errors(&out));
     let rows: serde_json::Value = serde_json::from_str(&output(&out)).unwrap();
-    assert_eq!(rows[0]["value"], 4);
-    assert_eq!(rows.as_array().unwrap().len(), 1);
+    assert_eq!(rows["rows"][0]["value"], 4);
+    assert_eq!(rows["rows"].as_array().unwrap().len(), 1);
     let out = trace(&[
         "-q",
         "--window",
@@ -335,8 +335,8 @@ fn live_stat_and_offcpu() {
     ]);
     assert!(out.status.success(), "{}", errors(&out));
     let rows: serde_json::Value = serde_json::from_str(&output(&out)).unwrap();
-    assert_eq!(rows.as_array().unwrap().len(), 2);
-    assert!(rows[0]["raw"].as_u64().unwrap() > 0);
+    assert_eq!(rows["rows"].as_array().unwrap().len(), 2);
+    assert!(rows["rows"][0]["raw"].as_u64().unwrap() > 0);
     let out = trace(&[
         "-q",
         "-e",

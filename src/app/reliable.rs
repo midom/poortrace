@@ -113,23 +113,16 @@ pub(super) fn run(args: &Args, program: &Program) -> Result<i32> {
     }
     let stdout = io::stdout();
     let mut state = program.state(io::BufWriter::new(stdout.lock()));
-    configure_report(&mut state, args)?;
+    configure_report(&mut state, args, program, "reliable")?;
     state.max_entries = args.max_map_entries as usize;
-    if let Some(path) = &args.record {
-        state.recorder = Some(poortrace::recording::Recorder::create_with_mode(
-            path,
-            &program.source,
-            Some("stopped-target-wall-clock"),
-        )?);
-    }
+    super::report::configure_record(&mut state, args, program)?;
     if !args.quiet {
         eprintln!(
             "poortrace: reliable mode stops all tracked threads; profile samples are wall-clock snapshots, not CPU-time samples"
         );
     }
     let start = Instant::now();
-    let mut window_start = start;
-    let mut live_start = start;
+    let mut reports = super::session::Reports::new();
     let mut timers: Vec<_> = program
         .clauses
         .iter()
@@ -262,17 +255,7 @@ pub(super) fn run(args: &Args, program: &Program) -> Result<i32> {
                 tracer.release_snapshot()?;
                 state.target_paused = false;
             }
-            if args.window.is_some_and(|d| window_start.elapsed() >= d) {
-                state.report.elapsed = window_start.elapsed().as_secs_f64();
-                state.print_all();
-                state.clear_all();
-                window_start = Instant::now();
-            }
-            if args.live.is_some_and(|d| live_start.elapsed() >= d) {
-                state.report.elapsed = start.elapsed().as_secs_f64();
-                state.live_snapshot();
-                live_start = Instant::now();
-            }
+            reports.refresh(&mut state, args);
             state.flush()?;
             unsafe {
                 libc::poll(std::ptr::null_mut(), 0, 1);
@@ -299,7 +282,7 @@ pub(super) fn run(args: &Args, program: &Program) -> Result<i32> {
     kill_owned_descendants(child.as_ref(), args.follow_forks, tracer.targets());
     drop(tracer);
     let child_result = finalize_recorded_child(&mut state, child.as_mut());
-    finish_report(&mut state, args, window_start.elapsed())?;
+    finish_report(&mut state, args, reports.window_elapsed())?;
     state.flush()?;
     result?;
     end_result?;

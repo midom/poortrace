@@ -61,6 +61,7 @@ Serde for profile/report formats; LLVM is accessed through direct C API bindings
 - `src/app/process.rs`: signal handling, process launch gate, owned-child output
   and cleanup, and thread discovery.
 - `src/app/events.rs`: shared event construction and handler dispatch.
+- `src/app/session.rs`: shared capture plans and periodic report refresh.
 - `src/app/{perf,syscalls,functions,stat}.rs`: CLI backend loops for sampling,
   syscall/lifecycle tracing, function tracing, and grouped counters respectively.
 - `src/app/replay.rs` and `src/app/report.rs`: offline CLI replay, runtime and
@@ -71,6 +72,13 @@ Serde for profile/report formats; LLVM is accessed through direct C API bindings
 - `tests/cli.rs`: CLI, timers, process lifecycle, and opt-in live perf tests.
 - `tests/{managed,process_coverage,arguments,kernel_cli,recording_features,float_reports,expansion,reliable}.rs`:
   focused runtime, lifecycle, ABI, kernel decoder/replay, and report regressions.
+- `benches/pipeline.rs` and `scripts/benchmark.py`: pipeline throughput, memory,
+  and fixed-work target slowdown measurements.
+- `fuzz/`: bounded parser/decoder fuzz harness and seeds; uses its own lockfile.
+- `tests/{invariants,provenance}.rs`: generated arithmetic/decoder checks and
+  report/recording provenance regressions.
+- `docs/{choosing-mode,validation}.md`: mode selection, measurements, live-perf
+  runner requirements, and release validation.
 - `examples/*.pt`: sample tracing scripts. `examples/workload.rs` provides CPU
   and allocation work on the main thread and dynamically created worker threads.
 

@@ -294,6 +294,14 @@ impl Cell {
     }
 }
 
+/// Native stack algorithm, independent of whether raw stack bytes are archived.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StackMode {
+    #[default]
+    FramePointer,
+    Dwarf,
+}
+
 pub struct State<'a> {
     pub(crate) origin: std::sync::Arc<()>,
     maps: Vec<BTreeMap<Vec<Key>, Cell>>,
@@ -310,6 +318,7 @@ pub struct State<'a> {
     pub(crate) iterations: Vec<Vec<(Vec<Key>, i64)>>,
     pub(crate) scratch: BTreeMap<u32, Vec<u64>>,
     symbols: crate::symbols::Symbolizer,
+    pub stack_mode: StackMode,
     python: crate::python::Reader,
     javascript: crate::javascript::Reader,
     golang: crate::golang::Reader,
@@ -356,6 +365,7 @@ impl<'a> State<'a> {
             scratch: BTreeMap::new(),
             iterations: Vec::new(),
             symbols: crate::symbols::Symbolizer::default(),
+            stack_mode: StackMode::default(),
             python: crate::python::Reader::default(),
             javascript: crate::javascript::Reader::default(),
             golang: crate::golang::Reader::default(),
@@ -418,7 +428,10 @@ impl<'a> State<'a> {
         if self.recorder.is_some() {
             self.js_snapshot = sample.regs.map(|regs| (regs, sample.stack.clone()));
         }
-        self.symbols.unwind(sample)
+        match self.stack_mode {
+            StackMode::FramePointer => crate::symbols::frame_pointer_stack(sample),
+            StackMode::Dwarf => self.symbols.unwind(sample),
+        }
     }
     pub fn replay_helpers(&mut self, helpers: Vec<crate::recording::Helper>) {
         self.replay = Some(helpers.into());

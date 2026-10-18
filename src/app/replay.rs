@@ -9,11 +9,51 @@ use std::{ffi::CString, io, time::Duration};
 
 pub(super) fn run_replay(args: &Args, path: &std::path::Path) -> Result<i32> {
     let mut recording = poortrace::recording::read_full(path)?;
+    let mut provenance =
+        recording
+            .header
+            .provenance
+            .clone()
+            .unwrap_or_else(|| poortrace::report::Provenance {
+                backend: "legacy-recording".into(),
+                capture_mode: recording
+                    .header
+                    .capture_mode
+                    .clone()
+                    .unwrap_or_else(|| "unknown".into()),
+                stack_mode: "unknown".into(),
+                ..Default::default()
+            });
+    provenance.replay = true;
+    provenance.lost_samples = (recording.header.version >= 3).then_some(0);
+    provenance.discontinuities = (recording.header.version >= 3).then_some(0);
+    for item in &recording.metadata {
+        match item {
+            poortrace::recording::Metadata::Lost { count, .. } => {
+                provenance.lost_samples = provenance.lost_samples.map(|n| n.saturating_add(*count))
+            }
+            poortrace::recording::Metadata::Discontinuity { .. } => {
+                provenance.discontinuities = provenance.discontinuities.map(|n| n.saturating_add(1))
+            }
+            _ => {}
+        }
+    }
+    if let (Some(first), Some(last)) = (
+        recording.events.iter().map(|e| e.nsecs).min(),
+        recording.events.iter().map(|e| e.nsecs).max(),
+    ) {
+        provenance.elapsed_seconds = last.saturating_sub(first) as f64 / 1e9;
+    }
     if args.output_format == "speedscope-scheduler" {
         if args.expression.is_some() || args.script.is_some() {
             return Err("scheduler export uses recorded switches; omit alternate script".into());
         }
-        let report = poortrace::recording::scheduler_speedscope(&recording)?;
+        let report = poortrace::report::annotate_profile(
+            poortrace::recording::scheduler_speedscope(&recording)?,
+            &args.output_format,
+            &provenance,
+        )?;
+        super::report::write_metadata(args, &provenance)?;
         if let Some(path) = &args.output {
             std::fs::write(path, report).map_err(|e| e.to_string())?;
         } else {
@@ -68,7 +108,12 @@ pub(super) fn run_replay(args: &Args, path: &std::path::Path) -> Result<i32> {
         if args.expression.is_some() || args.script.is_some() {
             return Err("timeline export uses captured stacks; omit an alternate script".into());
         }
-        let report = poortrace::recording::timeline_speedscope(&events)?;
+        let report = poortrace::report::annotate_profile(
+            poortrace::recording::timeline_speedscope(&events)?,
+            &args.output_format,
+            &provenance,
+        )?;
+        super::report::write_metadata(args, &provenance)?;
         if let Some(path) = &args.output {
             std::fs::write(path, report).map_err(|e| e.to_string())?;
         } else {
@@ -129,7 +174,8 @@ pub(super) fn run_replay(args: &Args, path: &std::path::Path) -> Result<i32> {
         events.sort_by_key(|event| event.nsecs);
     }
     let mut state = program.state(io::stdout());
-    configure_report(&mut state, args)?;
+    configure_report(&mut state, args, &program, "replay")?;
+    state.report.provenance = Some(provenance);
     state.max_entries = args.max_map_entries as usize;
     let mut first = u64::MAX;
     let mut last = 0;

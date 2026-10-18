@@ -1,0 +1,284 @@
+{
+  "captured_utc": "2026-10-18T17:10:18.730368+00:00",
+  "source": "Working tree implementing the measurement and validation changes after 88d172d",
+  "notes": "Single-host illustrative baseline. Startup and compilation are included in workload timings; these are not performance guarantees or CI thresholds.",
+  "pipeline": {
+    "architecture": "aarch64",
+    "archive_read": {
+      "elapsed_ns": 62892659
+    },
+    "compile": {
+      "median_ns": 2446767,
+      "p95_ns": 2754488,
+      "runs": 20
+    },
+    "handler": {
+      "elapsed_ns": 11689674,
+      "events": 100000,
+      "events_per_second": 8554558.493247973
+    },
+    "llvm": "18.1.3",
+    "map_memory": {
+      "entries": 16384,
+      "rss_after_kib": 62540,
+      "rss_before_kib": 58256
+    },
+    "peak_rss_kib": 63192,
+    "recording": {
+      "bytes": 3450156,
+      "bytes_per_second": 259196670.89325953,
+      "elapsed_ns": 13310958,
+      "events": 10000
+    },
+    "replay": {
+      "elapsed_ns": 1453764,
+      "events": 10000
+    },
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "schema_version": 1
+  },
+  "workload": {
+    "schema_version": 1,
+    "platform": "Linux-6.17.0-1019-oracle-aarch64-with-glibc2.39",
+    "architecture": "aarch64",
+    "runs": 5,
+    "rounds": 2000,
+    "perf_event_paranoid": "-1",
+    "baseline": {
+      "status": "ok",
+      "elapsed_ns": [
+        28264881,
+        28175721,
+        28252642,
+        28235721,
+        28222961
+      ],
+      "median_ns": 28235721
+    },
+    "modes": {
+      "interval": {
+        "status": "ok",
+        "elapsed_ns": [
+          53355673,
+          46272854,
+          46316813,
+          46407573,
+          46128333
+        ],
+        "median_ns": 46316813,
+        "slowdown": 1.6403623268554042,
+        "last_run_report": {
+          "metadata": {
+            "backend": "perf",
+            "capture_mode": "wall-clock-timer",
+            "discontinuities": 0,
+            "elapsed_seconds": 0.029565205,
+            "lost_samples": 0,
+            "observation_semantics": {
+              "interval:ms:10": "wall-clock-timer"
+            },
+            "probes": [
+              "interval:ms:10"
+            ],
+            "replay": false,
+            "stack_mode": "fp"
+          },
+          "rows": [
+            {
+              "buckets": [],
+              "keys": [],
+              "map": "samples",
+              "value": 2
+            }
+          ],
+          "schema_version": 1
+        }
+      },
+      "syscall": {
+        "status": "ok",
+        "elapsed_ns": [
+          265555884,
+          272412424,
+          265167203,
+          261895034,
+          263946160
+        ],
+        "median_ns": 265167203,
+        "slowdown": 9.391196456431908,
+        "last_run_report": {
+          "metadata": {
+            "backend": "syscalls",
+            "capture_mode": "ptrace-event-stop",
+            "discontinuities": 0,
+            "elapsed_seconds": 0.24673043,
+            "lost_samples": 0,
+            "observation_semantics": {
+              "syscall:enter:getpid": "ptrace-event-stop"
+            },
+            "probes": [
+              "syscall:enter:getpid"
+            ],
+            "replay": false,
+            "stack_mode": "fp"
+          },
+          "rows": [
+            {
+              "buckets": [],
+              "keys": [],
+              "map": "samples",
+              "value": 2000
+            }
+          ],
+          "schema_version": 1
+        }
+      },
+      "reliable": {
+        "status": "ok",
+        "elapsed_ns": [
+          64432626,
+          64044944,
+          67202154,
+          63807263,
+          64514306
+        ],
+        "median_ns": 64432626,
+        "slowdown": 2.2819543372028646,
+        "last_run_report": {
+          "metadata": {
+            "backend": "reliable",
+            "capture_mode": "stopped-target-wall-clock",
+            "discontinuities": 0,
+            "elapsed_seconds": 0.047469737,
+            "lost_samples": 0,
+            "observation_semantics": {
+              "profile:hz:99": "stopped-target-wall-clock"
+            },
+            "probes": [
+              "profile:hz:99"
+            ],
+            "replay": false,
+            "stack_mode": "fp"
+          },
+          "rows": [
+            {
+              "buckets": [],
+              "keys": [],
+              "map": "samples",
+              "value": 3
+            }
+          ],
+          "schema_version": 1
+        }
+      },
+      "perf": {
+        "status": "ok",
+        "elapsed_ns": [
+          71540686,
+          65531068,
+          65316868,
+          65126028,
+          64762706
+        ],
+        "median_ns": 65316868,
+        "slowdown": 2.3132707679042444,
+        "last_run_report": {
+          "metadata": {
+            "backend": "perf",
+            "capture_mode": "cpu-time-sample",
+            "discontinuities": 4,
+            "elapsed_seconds": 0.048358739,
+            "lost_samples": 0,
+            "observation_semantics": {
+              "profile:hz:99": "cpu-time-sample"
+            },
+            "probes": [
+              "profile:hz:99"
+            ],
+            "replay": false,
+            "stack_mode": "fp"
+          },
+          "rows": [
+            {
+              "buckets": [],
+              "keys": [],
+              "map": "samples",
+              "value": 2
+            }
+          ],
+          "schema_version": 1
+        }
+      },
+      "record": {
+        "status": "ok",
+        "elapsed_ns": [
+          444070958,
+          529098763,
+          546526853,
+          679089915,
+          598410403
+        ],
+        "median_ns": 546526853,
+        "slowdown": 19.35586674057305,
+        "last_run_report": {
+          "metadata": {
+            "backend": "syscalls",
+            "capture_mode": "ptrace-event-stop",
+            "discontinuities": 0,
+            "elapsed_seconds": 0.456380354,
+            "lost_samples": 0,
+            "observation_semantics": {
+              "syscall:enter:getpid": "ptrace-event-stop"
+            },
+            "probes": [
+              "syscall:enter:getpid"
+            ],
+            "replay": false,
+            "stack_mode": "fp"
+          },
+          "rows": [
+            {
+              "buckets": [],
+              "keys": [],
+              "map": "samples",
+              "value": 2000
+            }
+          ],
+          "schema_version": 1
+        }
+      }
+    },
+    "cpu_count": 4,
+    "cpu_model": {
+      "CPU implementer": "0x41",
+      "CPU architecture": "8",
+      "CPU part": "0xd0c"
+    }
+  },
+  "capabilities": {
+    "software_perf": {
+      "available": true,
+      "exit_status": 0,
+      "diagnostic": ""
+    },
+    "hardware_perf": {
+      "available": true,
+      "exit_status": 0,
+      "diagnostic": ""
+    },
+    "kernel_tracepoint": {
+      "available": false,
+      "exit_status": 1,
+      "diagnostic": "poortrace: tracepoint:syscalls:sys_enter_write: /sys/kernel/tracing/events/syscalls/sys_enter_write/format: Permission denied (os error 13); tracefs access is required\n"
+    },
+    "system_wide": {
+      "available": true,
+      "exit_status": 0,
+      "diagnostic": ""
+    },
+    "watchpoint": {
+      "available": true,
+      "exit_status": 0,
+      "diagnostic": ""
+    }
+  }
+}

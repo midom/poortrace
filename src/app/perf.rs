@@ -6,8 +6,8 @@ use super::{
     process::{Child, INTERRUPTED, alive, finalize_recorded_child, install_signals, threads},
     report::{configure_record, configure_report, finish_report},
 };
-use poortrace::perf::{PerfEvent, Record};
-use poortrace::{Result, codegen::Program, language::Probe, perf::Capture, runtime::State};
+use poortrace::perf::{Capture, PerfEvent, Record};
+use poortrace::{Result, codegen::Program, language::Probe, runtime::State};
 use std::{
     collections::BTreeSet,
     ffi::CString,
@@ -17,23 +17,7 @@ use std::{
 };
 
 pub(super) fn run(args: Args, program: Program) -> Result<i32> {
-    let capture = Capture {
-        addr: true,
-        kernel: args.include_kernel || program.needs_kstack(),
-        kernel_callchain: program.needs_kstack() || args.include_kernel && args.record.is_some(),
-        record_raw: args.record_raw,
-        callchain: program.needs_ustack() || args.record.is_some(),
-        dwarf_stack: if (args.stack_mode == "dwarf" && program.needs_ustack())
-            || program.needs_jsstack()
-            || args.record.is_some()
-        {
-            args.stack_bytes
-        } else {
-            0
-        },
-        branches: args.branch_stack || program.needs_branches(),
-        ..Capture::default()
-    };
+    let capture = super::session::capture(&args, &program, false);
     install_signals()?;
     let command = args
         .shell_command
@@ -83,7 +67,7 @@ pub(super) fn run(args: Args, program: Program) -> Result<i32> {
     }
     let stdout = io::stdout();
     let mut state = program.state(io::BufWriter::new(stdout.lock()));
-    configure_report(&mut state, &args)?;
+    configure_report(&mut state, &args, &program, "perf")?;
     configure_record(&mut state, &args, &program)?;
     state.max_entries = args.max_map_entries as usize;
     invoke_kind(&program, &mut state, target, true);
@@ -113,23 +97,9 @@ pub(super) fn run(args: Args, program: Program) -> Result<i32> {
     };
     let mut coverage_end = 0;
     let start = Instant::now();
-    let mut timers: Vec<_> = program
-        .clauses
-        .iter()
-        .enumerate()
-        .flat_map(|(clause, c)| {
-            c.probes.iter().filter_map(move |(name, p)| {
-                if let Probe::Interval(period) = p {
-                    Some((clause, name.clone(), *period, start + *period))
-                } else {
-                    None
-                }
-            })
-        })
-        .collect();
+    let mut timers = super::session::intervals(&program, start);
     let mut lost = 0u64;
-    let mut window_start = Instant::now();
-    let mut live_start = Instant::now();
+    let mut reports = super::session::Reports::new();
     let mut waits =
         poortrace::wait::Poller::new(&program, args.stack_bytes as usize, args.record.is_some());
     let result = (|| -> Result<()> {
@@ -179,23 +149,7 @@ pub(super) fn run(args: Args, program: Program) -> Result<i32> {
                     }
                 }
             }
-            if args
-                .window
-                .is_some_and(|period| window_start.elapsed() >= period)
-            {
-                state.report.elapsed = window_start.elapsed().as_secs_f64();
-                state.print_all();
-                state.clear_all();
-                window_start = Instant::now();
-            }
-            if args
-                .live
-                .is_some_and(|period| live_start.elapsed() >= period)
-            {
-                state.report.elapsed = start.elapsed().as_secs_f64();
-                state.live_snapshot();
-                live_start = Instant::now();
-            }
+            reports.refresh(&mut state, &args);
             state.flush()?;
             if state.stopped {
                 break;
@@ -273,7 +227,7 @@ pub(super) fn run(args: Args, program: Program) -> Result<i32> {
     let child_record_result = finalize_recorded_child(&mut state, child.as_mut());
     state.stopped = false;
     invoke_kind(&program, &mut state, target, false);
-    finish_report(&mut state, &args, window_start.elapsed())?;
+    finish_report(&mut state, &args, reports.window_elapsed())?;
     state.flush()?;
     if lost != 0 {
         eprintln!(
@@ -418,6 +372,9 @@ pub(super) fn drain(
                 }
             }
             if let Record::Lost(count) = &record {
+                if let Some(metadata) = &mut state.report.provenance {
+                    metadata.lost_samples = metadata.lost_samples.map(|n| n.saturating_add(*count));
+                }
                 if let Some(recorder) = &mut state.recorder {
                     recorder.metadata(&poortrace::recording::Metadata::Lost {
                         cpu,
@@ -427,6 +384,10 @@ pub(super) fn drain(
                 }
             }
             if let Record::Throttle { time, throttled } = &record {
+                if let Some(metadata) = &mut state.report.provenance {
+                    metadata.discontinuities =
+                        metadata.discontinuities.map(|n| n.saturating_add(1));
+                }
                 stream.discontinuous = true;
                 stream.switched_out = None;
                 if let Some(recorder) = &mut state.recorder {

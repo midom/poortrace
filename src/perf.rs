@@ -266,9 +266,6 @@ impl PerfEvent {
             capture.kernel = true;
             capture.callchain = true;
         }
-        if capture.dwarf_stack != 0 && !capture.kernel_callchain {
-            capture.callchain = false;
-        }
         let sample_type = if capture.offcpu {
             2 | 4 | 128
         } else {

@@ -1,3 +1,7 @@
 /target
 /adapters/node_modules/
 __pycache__/
+
+/fuzz/target/
+/fuzz/artifacts/
+/fuzz/corpus/

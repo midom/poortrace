@@ -13,7 +13,7 @@ use super::{
     events::dispatch_function_events,
     perf::{attach, drain},
 };
-use poortrace::{Result, codegen::Program, language::Probe, perf::Capture};
+use poortrace::{Result, codegen::Program, language::Probe};
 use std::{
     io,
     sync::atomic::Ordering,
@@ -83,24 +83,7 @@ pub(super) fn run_functions(args: &Args, program: &Program) -> Result<i32> {
     tracer.trace_syscalls(program.has_syscalls());
     tracer.track_loads(args.track_loads);
     tracer.follow_forks(args.follow_forks);
-    let capture = Capture {
-        ptrace_functions: true,
-        addr: true,
-        kernel: args.include_kernel || program.needs_kstack(),
-        kernel_callchain: program.needs_kstack() || args.include_kernel && args.record.is_some(),
-        record_raw: args.record_raw,
-        callchain: program.needs_ustack() || args.record.is_some(),
-        dwarf_stack: if (args.stack_mode == "dwarf" && program.needs_ustack())
-            || program.needs_jsstack()
-            || args.record.is_some()
-        {
-            args.stack_bytes
-        } else {
-            0
-        },
-        branches: args.branch_stack || program.needs_branches(),
-        ..Default::default()
-    };
+    let capture = super::session::capture(args, program, true);
     let mut streams = Vec::new();
     if args.attach_descendants || !args.shared_mm_pids.is_empty() {
         for target in tracer.targets() {
@@ -130,7 +113,7 @@ pub(super) fn run_functions(args: &Args, program: &Program) -> Result<i32> {
     let mut refresh = Instant::now();
     let stdout = io::stdout();
     let mut state = program.state(io::BufWriter::new(stdout.lock()));
-    configure_report(&mut state, args)?;
+    configure_report(&mut state, args, program, "functions")?;
     configure_record(&mut state, args, program)?;
     state.max_entries = args.max_map_entries as usize;
     invoke_kind(program, &mut state, Some(pid), true);
@@ -146,24 +129,10 @@ pub(super) fn run_functions(args: &Args, program: &Program) -> Result<i32> {
         }
     }
     let start = Instant::now();
-    let mut window_start = start;
-    let mut live_start = start;
+    let mut reports = super::session::Reports::new();
     let mut waits =
         poortrace::wait::Poller::new(program, args.stack_bytes as usize, args.record.is_some());
-    let mut timers: Vec<_> = program
-        .clauses
-        .iter()
-        .enumerate()
-        .flat_map(|(id, clause)| {
-            clause.probes.iter().filter_map(move |(name, probe)| {
-                if let Probe::Interval(period) = probe {
-                    Some((id, name.clone(), *period, Instant::now() + *period))
-                } else {
-                    None
-                }
-            })
-        })
-        .collect();
+    let mut timers = super::session::intervals(program, start);
     let result = (|| -> Result<()> {
         while !state.stopped
             && !INTERRUPTED.load(Ordering::Relaxed)
@@ -241,23 +210,7 @@ pub(super) fn run_functions(args: &Args, program: &Program) -> Result<i32> {
                     *deadline = Instant::now() + *period;
                 }
             }
-            if args
-                .window
-                .is_some_and(|duration| window_start.elapsed() >= duration)
-            {
-                state.report.elapsed = window_start.elapsed().as_secs_f64();
-                state.print_all();
-                state.clear_all();
-                window_start = Instant::now();
-            }
-            if args
-                .live
-                .is_some_and(|period| live_start.elapsed() >= period)
-            {
-                state.report.elapsed = start.elapsed().as_secs_f64();
-                state.live_snapshot();
-                live_start = Instant::now();
-            }
+            reports.refresh(&mut state, args);
             state.flush()?;
             if idle {
                 unsafe {
@@ -295,7 +248,7 @@ pub(super) fn run_functions(args: &Args, program: &Program) -> Result<i32> {
     let child_record_result = finalize_recorded_child(&mut state, child.as_mut());
     state.stopped = false;
     invoke_kind(program, &mut state, Some(pid), false);
-    finish_report(&mut state, args, window_start.elapsed())?;
+    finish_report(&mut state, args, reports.window_elapsed())?;
     state.flush()?;
     result?;
     child_record_result?;

@@ -1,0 +1,62 @@
+name: Live perf validation
+# Explicitly dispatched on an administrator-provisioned host; this workflow never changes policy.
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  live-perf:
+    runs-on: [self-hosted, linux, poortrace-perf]
+    timeout-minutes: 30
+    env:
+      LLVM_CONFIG: llvm-config-18
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache: false
+      - run: cargo build --locked
+      - name: Record actual host capabilities
+        id: capabilities
+        run: python3 scripts/check-capabilities.py
+      - name: Require software sampling access
+        if: steps.capabilities.outputs.software_perf != 'true'
+        run: |
+          echo '::error::This runner lacks required software perf access. See capabilities.json; no host policy was changed.'
+          exit 1
+      - name: Live software sampling and unwinding
+        run: |
+          cargo test --locked --test cli live_perf -- --ignored --skip live_perf_node --nocapture
+          cargo test --locked --test cli live_user_stack -- --ignored --nocapture
+          cargo test --locked --test cli live_dwarf -- --ignored --nocapture
+          cargo test --locked --test cli live_mixed -- --ignored --nocapture
+          cargo test --locked --test cli live_perf_node -- --ignored --nocapture
+          cargo test --locked --test managed go_perf -- --ignored --nocapture
+      - name: Counters and off-CPU intervals
+        if: steps.capabilities.outputs.hardware_perf == 'true'
+        run: cargo test --locked --test cli live_stat_and_offcpu -- --ignored --nocapture
+      - name: Hardware watchpoints
+        if: steps.capabilities.outputs.watchpoint == 'true'
+        run: cargo test --locked --test cli live_watchpoints -- --ignored --nocapture
+      - name: Kernel trace fields
+        if: steps.capabilities.outputs.kernel_tracepoint == 'true'
+        run: cargo test --locked --test kernel_cli live_kernel -- --ignored --nocapture
+      - name: System-wide counters
+        if: steps.capabilities.outputs.system_wide == 'true'
+        run: cargo test --locked --test kernel_cli live_system_wide -- --ignored --nocapture
+      - name: Capability summary
+        if: always()
+        run: |
+          echo '### Live perf host capabilities' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Unavailable capabilities were not tested; they are not counted as passing.' >> "$GITHUB_STEP_SUMMARY"
+          cat capabilities.json >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: live-perf-capabilities
+          path: capabilities.json

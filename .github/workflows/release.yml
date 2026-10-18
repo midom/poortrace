@@ -1,0 +1,59 @@
+name: Release binaries
+on:
+  push:
+    tags: ['v[0-9]*']
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    env:
+      LLVM_CONFIG: llvm-config-18
+      RUSTFLAGS: -C target-feature=+crt-static
+      CARGO_BUILD_TARGET: ${{ matrix.target }}
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y llvm-18-dev zlib1g-dev libzstd-dev libtinfo-dev libxml2-dev ripgrep
+      - name: Require tag and crate version to match
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, tomllib
+          version = tomllib.loads(pathlib.Path('Cargo.toml').read_text())['package']['version']
+          assert os.environ['RELEASE_TAG'] == 'v' + version, 'Tag does not match Cargo.toml version'
+          PY
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+      - name: Package and test the installed executable
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
+        run: bash scripts/package-release.sh "target/$RELEASE_TARGET/release/poortrace" "${RELEASE_TAG#v}" "$RELEASE_TARGET"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*
+  draft:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+      - name: Assemble a draft release for review
+        run: gh release create "$RELEASE_TAG" --draft --verify-tag --title "poortrace $RELEASE_TAG" --notes-file CHANGELOG.md dist/*

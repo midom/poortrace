@@ -8,6 +8,7 @@ mod process;
 mod reliable;
 mod replay;
 mod report;
+mod session;
 mod stat;
 mod syscalls;
 
@@ -29,6 +30,22 @@ pub(super) fn run() -> Result<i32> {
 }
 
 fn run_with_args(mut args: Args) -> Result<i32> {
+    if let Some(sidecar) = &args.report_metadata {
+        use std::os::unix::fs::MetadataExt;
+        for other in [&args.output, &args.record, &args.replay, &args.script]
+            .into_iter()
+            .flatten()
+        {
+            let same_path = std::path::absolute(sidecar).ok() == std::path::absolute(other).ok();
+            let same_file = std::fs::metadata(sidecar)
+                .ok()
+                .zip(std::fs::metadata(other).ok())
+                .is_some_and(|(a, b)| a.dev() == b.dev() && a.ino() == b.ino());
+            if same_path || same_file {
+                return Err("--report-metadata must differ from report, recording, replay, and script paths".into());
+            }
+        }
+    }
     if args.attach_descendants {
         args.follow_forks = true;
     }

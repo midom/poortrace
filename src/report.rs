@@ -18,6 +18,75 @@ pub struct Row {
     #[serde(default)]
     pub buckets: Vec<(String, i64)>,
 }
+/// Measurement context travels with exported results. Unknown loss is not zero loss.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct Provenance {
+    pub backend: String,
+    pub capture_mode: String,
+    pub stack_mode: String,
+    pub probes: Vec<String>,
+    #[serde(default)]
+    pub observation_semantics: BTreeMap<String, String>,
+    pub elapsed_seconds: f64,
+    pub lost_samples: Option<u64>,
+    pub discontinuities: Option<u64>,
+    pub replay: bool,
+}
+
+/// Versioned CLI JSON envelope. Library callers without provenance retain legacy arrays.
+pub fn json_document(
+    rows: &impl Serialize,
+    provenance: Option<&Provenance>,
+    elapsed: f64,
+) -> Result<String> {
+    let value = if let Some(metadata) = provenance {
+        let mut metadata = metadata.clone();
+        metadata.elapsed_seconds = elapsed;
+        serde_json::json!({"schema_version":1, "metadata":metadata, "rows":rows})
+    } else {
+        serde_json::to_value(rows).map_err(|e| e.to_string())?
+    };
+    serde_json::to_string_pretty(&value)
+        .map(|s| s + "\n")
+        .map_err(|e| e.to_string())
+}
+
+/// Embed provenance in self-contained profile formats without changing their weights.
+pub fn annotate_profile(text: String, format: &str, metadata: &Provenance) -> Result<String> {
+    match format {
+        "speedscope" | "speedscope-timeline" | "speedscope-scheduler" => {
+            let mut json: serde_json::Value =
+                serde_json::from_str(&text).map_err(|e| e.to_string())?;
+            json["poortrace"] = serde_json::to_value(metadata).map_err(|e| e.to_string())?;
+            if let Some(profiles) = json["profiles"].as_array_mut() {
+                for profile in profiles {
+                    let name = profile["name"].as_str().unwrap_or("poortrace");
+                    profile["name"] = format!("{name} ({})", metadata.capture_mode).into();
+                }
+            }
+            serde_json::to_string(&json)
+                .map(|s| s + "\n")
+                .map_err(|e| e.to_string())
+        }
+        "flamegraph" => {
+            let json = serde_json::to_string(metadata)
+                .map_err(|e| e.to_string())?
+                .replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;");
+            let Some(at) = text.find('>') else {
+                return Err("invalid SVG report".into());
+            };
+            Ok(format!(
+                "{}<metadata>{json}</metadata>{}",
+                &text[..=at],
+                &text[at + 1..]
+            ))
+        }
+        _ => Ok(text),
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Options {
     pub format: String,
@@ -27,6 +96,7 @@ pub struct Options {
     pub elapsed: f64,
     pub baseline: Vec<Row>,
     pub quantiles: Vec<f64>,
+    pub provenance: Option<Provenance>,
 }
 
 pub fn baseline(path: &std::path::Path) -> Result<Vec<Row>> {
@@ -38,7 +108,19 @@ pub fn baseline(path: &std::path::Path) -> Result<Vec<Row>> {
     if bytes.len() > 64 * 1024 * 1024 {
         return Err("comparison profile exceeds 64 MiB".into());
     }
-    serde_json::from_slice(&bytes)
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    let rows = if value.is_array() {
+        value
+    } else {
+        if value["schema_version"] != 1 {
+            return Err("unsupported JSON report schema".into());
+        }
+        value
+            .get("rows")
+            .cloned()
+            .ok_or("JSON report is missing rows")?
+    };
+    serde_json::from_value(rows)
         .map_err(|e| format!("comparison requires a poortrace JSON report: {e}"))
 }
 fn bucket_order(a: &str, b: &str) -> std::cmp::Ordering {
@@ -147,10 +229,17 @@ pub fn render(rows: &[Row], options: &Options) -> Result<String> {
         return Err("report rate overflow".into());
     }
     match options.format.as_str() {
-        "json" => serde_json::to_string_pretty(&rows)
-            .map(|text| text + "\n")
-            .map_err(|e| e.to_string()),
-        "folded" | "speedscope" | "flamegraph" => profile(&rows, &options.format),
+        "json" => json_document(&rows, options.provenance.as_ref(), options.elapsed),
+        "folded" | "speedscope" | "flamegraph" => {
+            let text = profile(&rows, &options.format)?;
+            if let Some(metadata) = &options.provenance {
+                let mut metadata = metadata.clone();
+                metadata.elapsed_seconds = options.elapsed;
+                annotate_profile(text, &options.format, &metadata)
+            } else {
+                Ok(text)
+            }
+        }
         "" | "text" => {
             let mut out = String::new();
             for row in &rows {

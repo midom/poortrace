@@ -36,6 +36,9 @@ LLVM_CONFIG=llvm-config-18 cargo build --release --locked
 selected library directory is embedded in the executable's runtime library
 search path. Deployment requires the corresponding LLVM shared library.
 `cargo install --path . --locked` installs the binary in Cargo's bin directory.
+The release workflow also packages native x86-64 and AArch64 static binaries
+with SHA-256 checksums and installation smoke tests. See
+[release and installation validation](docs/validation.md#releases) for the process.
 
 To embed LLVM's static component libraries instead of depending on `libLLVM.so`:
 
@@ -241,7 +244,10 @@ user registers and stack bytes through ELF `.eh_frame`/`.debug_frame` CFI,
 including ordinary native code compiled without frame pointers. `--stack-bytes`
 is a multiple of 8 from 8 to 32768. Only the captured stack bytes are read by
 the unwinder; insufficient bytes, missing/unsupported CFI, and stack switches
-can truncate results. Frame-pointer fallback is available. Large stack samples
+can truncate results. Frame-pointer fallback is available within the CFI unwinder.
+`--stack-mode fp` instead uses frame pointers consistently across perf, ptrace,
+polling, and reliable snapshots. Enabling recording or `jsstack` may archive
+additional bytes but does not change the selected native unwinder. Large stack samples
 need larger rings or lower sample rates. Native CFI unwinding needs unwind
 metadata. `pystack` and `jsstack` separately decode supported managed-runtime
 frames; perf-map files can name native JIT frames (see below).
@@ -342,6 +348,20 @@ order. Float map rows are supported in text/JSON reports, including comparisons
 and rates; weighted profile formats require integer weights. JSON float rows
 carry an optional `float_value` field. Exports allow at most 256 frames per row including
 labels. Empty captures produce empty profiles.
+
+CLI JSON reports (including `--stat`) use a versioned envelope:
+`{"schema_version":1,"metadata":{...},"rows":[...]}`. Metadata records the backend,
+capture mode, per-probe observation semantics, selected native unwinder, requested
+probe names/rates, elapsed time (the final report window with `--window`),
+session-wide observed lost samples and discontinuities, and
+whether results were replayed. A zero loss count means no loss records were
+received; it is not proof of complete capture. Legacy recordings with unknown
+loss accounting report `null`. Speedscope and SVG exports embed provenance;
+`--report-metadata FILE` writes a JSON sidecar for any format, including text and
+folded stacks. The sidecar must differ from report, recording, replay, and script
+paths. Reliable captures retain their wall-clock label through replay.
+Comparisons accept both the envelope and previous JSON row arrays. Library
+report callers without provenance retain the previous array format.
 
 `--top N` ranks final entries by absolute value within each map; `--percent`
 uses the absolute-value total before top-N filtering; `--rate` divides numeric
@@ -964,6 +984,12 @@ Captured stack strings preserve resolved names after the target exits; otherwise
 frames retain raw addresses.
 
 ## Development and validation
+
+See [the mode guide](docs/choosing-mode.md) for choosing an observation method and
+[measurement and validation](docs/validation.md) for benchmarks, fuzzing, live-perf
+runner setup, and draft release packaging. Benchmark CI uploads measurements
+for both supported architectures; it does not treat noisy hosted timings as
+performance guarantees.
 
 The library modules in `src/` implement the tracing language, JIT, runtime,
 collectors, and recording formats. The binary entry point is `src/main.rs`;

@@ -65,7 +65,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: sudo apt-get update && sudo apt-get install -y llvm-18-dev zlib1g-dev libzstd-dev libtinfo-dev libxml2-dev
+      - run: sudo apt-get update && sudo apt-get install -y llvm-18-dev zlib1g-dev libzstd-dev libtinfo-dev libxml2-dev ripgrep
       - run: cargo test --locked
       - run: cargo test --locked --test cli live_process_tree -- --ignored
       - run: cargo test --locked --test cli live_usdt -- --ignored
@@ -82,6 +82,12 @@ jobs:
             exit 1
           fi
           "$binary" -q -e 'BEGIN { printf("%d\n", 6 * 7); exit(); }' | grep -qx 42
+      - name: Exercise release packaging on every build
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
+        run: |
+          version=$(python3 -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("Cargo.toml").read_text())["package"]["version"])')
+          bash scripts/package-release.sh "target/$RELEASE_TARGET/release/poortrace" "$version" "$RELEASE_TARGET"
   msrv:
     runs-on: ubuntu-24.04
     steps:

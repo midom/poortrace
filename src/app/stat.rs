@@ -208,8 +208,14 @@ pub(super) fn run_stat(args: &Args) -> Result<i32> {
         total.3 = total.3.zip(reading.scaled).map(|(a, b)| a + b);
     }
     let rows:Vec<_>=totals.iter().map(|(event,(raw,enabled,running,scaled))|serde_json::json!({"event":event,"raw":raw,"enabled_ns":enabled,"running_ns":running,"scaled":scaled})).collect();
+    let mut provenance = super::report::provenance(args, args.stat_events.clone(), "stat");
+    provenance.capture_mode = "grouped-counters".into();
+    provenance.elapsed_seconds = start.elapsed().as_secs_f64();
+    provenance.lost_samples = None;
+    provenance.discontinuities = None;
+    super::report::write_metadata(args, &provenance)?;
     let text = if args.output_format == "json" {
-        serde_json::to_string_pretty(&rows).map_err(|e| e.to_string())? + "\n"
+        poortrace::report::json_document(&rows, Some(&provenance), provenance.elapsed_seconds)?
     } else {
         let mut out = String::new();
         for (event, (raw, enabled, running, scaled)) in &totals {

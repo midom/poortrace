@@ -136,8 +136,8 @@ fn live_system_wide_stat_reports_cpu_counters_for_the_requested_duration() {
     );
     assert!(start.elapsed() >= std::time::Duration::from_millis(45));
     let rows: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(rows[0]["event"], "software:cpu-clock");
-    assert!(rows[0]["raw"].as_u64().unwrap() > 0);
-    assert!(rows[0]["enabled_ns"].as_u64().unwrap() > 0);
-    assert!(rows[0]["running_ns"].as_u64().unwrap() > 0);
+    assert_eq!(rows["rows"][0]["event"], "software:cpu-clock");
+    assert!(rows["rows"][0]["raw"].as_u64().unwrap() > 0);
+    assert!(rows["rows"][0]["enabled_ns"].as_u64().unwrap() > 0);
+    assert!(rows["rows"][0]["running_ns"].as_u64().unwrap() > 0);
 }

@@ -290,6 +290,44 @@ struct Process {
     maps: Vec<Mapping>,
 }
 
+/// Prefer the kernel's FP callchain; stopped/polling snapshots walk captured bytes.
+/// Never consult current process memory or infer missing frame records.
+pub(crate) fn frame_pointer_stack(sample: &crate::perf::Sample) -> Vec<u64> {
+    if sample.callchain.len() > 1 || sample.stack.is_empty() {
+        return sample.callchain.clone();
+    }
+    let Some(regs) = sample.regs else {
+        return sample.callchain.clone();
+    };
+    let mut frames = vec![regs.ip];
+    let mut fp = regs.fp;
+    while frames.len() < 127 && fp % 8 == 0 {
+        let Some(offset) = fp
+            .checked_sub(regs.sp)
+            .and_then(|n| usize::try_from(n).ok())
+        else {
+            break;
+        };
+        let Some(record) = offset
+            .checked_add(16)
+            .and_then(|end| sample.stack.get(offset..end))
+        else {
+            break;
+        };
+        let next = u64::from_ne_bytes(record[..8].try_into().unwrap());
+        let address = u64::from_ne_bytes(record[8..].try_into().unwrap());
+        if address == 0 {
+            break;
+        }
+        frames.push(address);
+        if next <= fp {
+            break;
+        }
+        fp = next;
+    }
+    frames
+}
+
 struct UnwindState {
     signature: Vec<(u64, u64, u64, u64, u64)>,
     unwinder: framehop::UnwinderNative<std::sync::Arc<[u8]>, framehop::MayAllocateDuringUnwind>,

@@ -26,6 +26,8 @@ pub struct Header {
     pub endianness: Option<String>,
     #[serde(default)]
     pub capture_mode: Option<String>,
+    #[serde(default)]
+    pub provenance: Option<crate::report::Provenance>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MemoryRegion {
@@ -223,6 +225,17 @@ impl Recorder {
         source: &str,
         capture_mode: Option<&str>,
     ) -> Result<Self> {
+        let provenance = capture_mode.map(|mode| crate::report::Provenance {
+            capture_mode: mode.into(),
+            ..Default::default()
+        });
+        Self::create_with_provenance(path, source, provenance.as_ref())
+    }
+    pub fn create_with_provenance(
+        path: &std::path::Path,
+        source: &str,
+        provenance: Option<&crate::report::Provenance>,
+    ) -> Result<Self> {
         let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
         let mut out = Self {
             writer: std::io::BufWriter::new(file),
@@ -230,7 +243,8 @@ impl Recorder {
         };
         out.line(&Header {
             version: 3,
-            capture_mode: capture_mode.map(str::to_owned),
+            capture_mode: provenance.map(|p| p.capture_mode.clone()),
+            provenance: provenance.cloned(),
             source: source.into(),
             architecture: Some(std::env::consts::ARCH.into()),
             endianness: Some(
@@ -277,7 +291,11 @@ pub fn read_full(path: &std::path::Path) -> Result<Recording> {
     if file.metadata().map_err(|e| e.to_string())?.len() > 256 * 1024 * 1024 {
         return Err("recording exceeds 256 MiB".into());
     }
-    let mut reader = std::io::BufReader::new(file);
+    read_from(std::io::BufReader::new(file))
+}
+
+/// Read an untrusted journal with the same byte/line/schema limits as file replay.
+pub fn read_from(mut reader: impl BufRead) -> Result<Recording> {
     let mut line = String::new();
     fn next(reader: &mut impl BufRead, line: &mut String) -> Result<usize> {
         use std::io::Read;
