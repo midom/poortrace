@@ -6,7 +6,7 @@ trap 'rm -f "$log"' EXIT
 if cargo test "$@" 2>&1 | tee "$log"; then
   exit 0
 else
-  status=${PIPESTATUS[0]}
+  status=$?
   if [[ ${GITHUB_ACTIONS:-} == true ]]; then
     python3 - "$log" <<'PY'
 import pathlib

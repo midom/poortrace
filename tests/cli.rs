@@ -382,10 +382,28 @@ fn live_syscalls_default_and_maximum_stack_capture() {
         &source,
         r#"
 #include <unistd.h>
+// Stay in the fixture frame: libc write() need not maintain a frame chain.
+#include <sys/syscall.h>
+__attribute__((always_inline)) static inline void marker(void) {
+#if defined(__x86_64__)
+    long number = SYS_write;
+    __asm__ __volatile__("syscall" : "+a"(number)
+        : "D"(1L), "S"("marker\n"), "d"(7L) : "rcx", "r11", "memory");
+#elif defined(__aarch64__)
+    register long x0 __asm__("x0") = 1;
+    register const char *x1 __asm__("x1") = "marker\n";
+    register long x2 __asm__("x2") = 7;
+    register long x8 __asm__("x8") = SYS_write;
+    __asm__ __volatile__("svc 0" : "+r"(x0)
+        : "r"(x1), "r"(x2), "r"(x8) : "memory", "cc");
+#else
+#error unsupported architecture
+#endif
+}
 __attribute__((noinline)) void leaf(void) {
     volatile char padding[8192];
     for (int i = 0; i < 8192; i++) padding[i] = 1;
-    write(1, "marker\n", 7);
+    marker();
     if (padding[0] == 42) _exit(1);
 }
 __attribute__((noinline)) void caller(void) { leaf(); }

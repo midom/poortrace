@@ -700,7 +700,8 @@ archived names entirely offline.
 file-backed executable library mappings. It prints sorted, deduplicated concrete
 `uprobe:PATH:FUNCTION`, `uretprobe:PATH:FUNCTION`, and `usdt:PATH:PROVIDER:NAME`
 selectors that can be copied into a script. Paths refer to the target's filesystem
-namespace; paths needing quotes are quoted in the output. `--function-filter`
+namespace; paths are quoted in the output so numeric-looking filenames remain
+valid script selectors. `--function-filter`
 matches raw/demangled function names and SDT marker names or `provider:name`.
 Ambiguous or specially encoded symbol names are listed by exact file offset.
 

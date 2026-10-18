@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Preserve ptrace stop identity across non-leader exec, quote discovered selectors containing numeric-looking paths, and retain useful CI failure tails.
+
 - Expand userspace bpftrace helper support: map queries/stats/time series, strings and networking, identity/symbol/register helpers, diagnostics, script arguments, stack formats, and exit statuses. Add explicitly gated commands/signals/writes and session watchpoint removal, with captured-result replay and specific no-BPF capability errors. See the helper compatibility guide for limits and differences.
 
 - Allow `print()` on scalar values, expressions, and map entries; add formatted wall-clock output with `time()` and capture its text for deterministic replay.

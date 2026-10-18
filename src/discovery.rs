@@ -223,12 +223,18 @@ pub(crate) fn component(text: &str, path: bool) -> Result<String> {
     {
         return Err("probe name/path contains unrepresentable control characters".into());
     }
-    if text.bytes().all(|b| {
-        b.is_ascii_alphanumeric()
-            || b == b'_'
-            || b == b':' && !path
-            || path && matches!(b, b'/' | b'.' | b'-')
-    }) {
+    // Paths can contain numeric-looking hashes (8eb..., 1e+...), comments,
+    // or overflowing integers. Quote them before the script lexer sees them.
+    // Unquoted symbol components must begin like language identifiers as well.
+    if !path
+        && !text.is_empty()
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b':'))
+        && text.split(':').all(|part| {
+            part.is_empty() || part.as_bytes()[0].is_ascii_alphabetic() || part.starts_with('_')
+        })
+    {
         Ok(text.into())
     } else {
         serde_json::to_string(text).map_err(|e| e.to_string())
@@ -264,6 +270,36 @@ pub fn function_probe_name(path: &str, name: &str, ret: bool) -> Result<String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn generated_selectors_quote_numeric_paths_and_symbol_components() {
+        for path in [
+            "/tmp/discovery-8eb5172d744b2b37",
+            "/tmp/image-1e+",
+            "/tmp/image-999999999999999999999999999999",
+            "/tmp/image//double-slash",
+            "/tmp/image/*comment*/suffix",
+        ] {
+            for name in [
+                "plain",
+                "123efoo",
+                "ns::123efoo",
+                "999999999999999999999999",
+            ] {
+                let probe = function_probe_name(path, name, false).unwrap();
+                let clauses = crate::language::parse(&format!("{probe} {{}}")).unwrap();
+                let crate::language::Probe::Uprobe {
+                    path: found_path,
+                    function,
+                    ..
+                } = &clauses[0].probes[0].1
+                else {
+                    panic!()
+                };
+                assert_eq!(found_path, path);
+                assert_eq!(function, name);
+            }
+        }
+    }
     #[test]
     fn printed_selectors_roundtrip_without_changing_symbol_names() {
         for name in [
