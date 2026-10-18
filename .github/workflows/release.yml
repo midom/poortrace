@@ -30,7 +30,7 @@ jobs:
           version = tomllib.loads(pathlib.Path('Cargo.toml').read_text())['package']['version']
           assert os.environ['RELEASE_TAG'] == 'v' + version, 'Tag does not match Cargo.toml version'
           PY
-      - run: cargo test --locked
+      - run: bash scripts/ci-test.sh --locked
       - run: cargo build --release --locked
       - name: Package and test the installed executable
         env:

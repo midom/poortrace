@@ -31,30 +31,32 @@ jobs:
           exit 1
       - name: Live software sampling and unwinding
         run: |
-          cargo test --locked --test cli live_perf -- --ignored --skip live_perf_node --nocapture
-          cargo test --locked --test cli live_user_stack -- --ignored --nocapture
-          cargo test --locked --test cli live_dwarf -- --ignored --nocapture
-          cargo test --locked --test cli live_mixed -- --ignored --nocapture
-          cargo test --locked --test cli live_perf_node -- --ignored --nocapture
-          cargo test --locked --test managed go_perf -- --ignored --nocapture
+          bash scripts/ci-test.sh --locked --test cli live_perf -- --ignored --skip live_perf_node --nocapture
+          bash scripts/ci-test.sh --locked --test cli live_user_stack -- --ignored --nocapture
+          bash scripts/ci-test.sh --locked --test cli live_dwarf -- --ignored --nocapture
+          bash scripts/ci-test.sh --locked --test cli live_mixed -- --ignored --nocapture
+          bash scripts/ci-test.sh --locked --test cli live_perf_node -- --ignored --nocapture
+          bash scripts/ci-test.sh --locked --test managed go_perf -- --ignored --nocapture
       - name: Counters and off-CPU intervals
         if: steps.capabilities.outputs.hardware_perf == 'true'
-        run: cargo test --locked --test cli live_stat_and_offcpu -- --ignored --nocapture
+        run: bash scripts/ci-test.sh --locked --test cli live_stat_and_offcpu -- --ignored --nocapture
       - name: Hardware watchpoints
         if: steps.capabilities.outputs.watchpoint == 'true'
-        run: cargo test --locked --test cli live_watchpoints -- --ignored --nocapture
+        run: bash scripts/ci-test.sh --locked --test cli live_watchpoints -- --ignored --nocapture
       - name: Kernel trace fields
         if: steps.capabilities.outputs.kernel_tracepoint == 'true'
-        run: cargo test --locked --test kernel_cli live_kernel -- --ignored --nocapture
+        run: bash scripts/ci-test.sh --locked --test kernel_cli live_kernel -- --ignored --nocapture
       - name: System-wide counters
         if: steps.capabilities.outputs.system_wide == 'true'
-        run: cargo test --locked --test kernel_cli live_system_wide -- --ignored --nocapture
+        run: bash scripts/ci-test.sh --locked --test kernel_cli live_system_wide -- --ignored --nocapture
       - name: Capability summary
         if: always()
         run: |
-          echo '### Live perf host capabilities' >> "$GITHUB_STEP_SUMMARY"
-          echo 'Unavailable capabilities were not tested; they are not counted as passing.' >> "$GITHUB_STEP_SUMMARY"
-          cat capabilities.json >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo '### Live perf host capabilities'
+            echo 'Unavailable capabilities were not tested; they are not counted as passing.'
+            cat capabilities.json
+          } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         if: always()
         with:

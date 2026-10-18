@@ -739,6 +739,9 @@ impl Tracer {
         self.listening.remove(&tid);
         let event = status >> 16;
         if event == libc::PTRACE_EVENT_EXEC {
+            // A non-leader exec reuses the leader TID. Queued stops for the
+            // previous task at that TID no longer describe the new task.
+            self.pending.retain(|(task, _)| *task != tid);
             self.stack_ranges.remove(&tid);
             let mut old = 0usize;
             control(
@@ -881,8 +884,27 @@ impl Tracer {
                     .filter(|tid| !std::path::Path::new(&format!("/proc/{tid}")).exists())
                     .copied()
                     .collect();
-                for tid in vanished {
-                    self.forget(tid);
+                if !vanished.is_empty() {
+                    for tid in vanished {
+                        self.forget(tid);
+                    }
+                    // de_thread can replace a stopped leader while its execing
+                    // sibling disappears, before PTRACE_EVENT_EXEC is waitable.
+                    // Revalidate surviving stops after that disappearance; never
+                    // dispatch an old syscall stop against the replacement task.
+                    for tid in self.stopped.clone() {
+                        let stat = std::fs::read_to_string(format!("/proc/{tid}/stat"));
+                        let stopped = stat.as_ref().ok().is_some_and(|stat| {
+                            stat.rsplit_once(')').is_some_and(|(_, tail)| {
+                                matches!(tail.split_whitespace().next(), Some("t" | "T"))
+                            })
+                        });
+                        if !stopped {
+                            self.stopped.remove(&tid);
+                            self.pending.retain(|(task, _)| *task != tid);
+                            let _ = control(libc::PTRACE_INTERRUPT, tid, 0, 0);
+                        }
+                    }
                 }
                 if self.tids.iter().all(|tid| {
                     self.stopped.contains(tid)
@@ -1312,7 +1334,7 @@ impl Tracer {
                 return Err(std::io::Error::last_os_error().to_string());
             } else if self.active && self.refreshed.elapsed() >= Duration::from_millis(100) {
                 self.stop_world()?;
-                if !self.stopped.is_empty() {
+                if !self.stopped.is_empty() && self.pending.is_empty() {
                     if self.follow
                         && !self.stopped.iter().any(|tid| {
                             tgid(*tid).is_some_and(|group| {

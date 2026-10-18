@@ -19,12 +19,7 @@ jobs:
         env:
           LLVM_CONFIG: llvm-config-18
       - name: Unit and integration tests
-        run: |
-          set -o pipefail
-          cargo test --locked --features '${{ matrix.features }}' 2>&1 | tee "$RUNNER_TEMP/poortrace-tests.log" || {
-            python3 -c 'import pathlib,sys; text=pathlib.Path(sys.argv[1]).read_text(errors="replace")[-12000:]; print("::error title=Cargo test failure::" + text.replace("%","%25").replace("\r","%0D").replace("\n","%0A"))' "$RUNNER_TEMP/poortrace-tests.log"
-            exit 1
-          }
+        run: bash scripts/ci-test.sh --locked --features '${{ matrix.features }}'
         env:
           LLVM_CONFIG: llvm-config-18
       - uses: actions/setup-node@v4
@@ -36,16 +31,16 @@ jobs:
           cache: false
       - name: Native ptrace, SDT, typed argument, CPython, and Node tests
         run: |
-          cargo test --locked --features '${{ matrix.features }}' --test cli live_uprobes -- --ignored
-          cargo test --locked --features '${{ matrix.features }}' --test cli live_syscalls -- --ignored
-          cargo test --locked --features '${{ matrix.features }}' --test cli live_process_tree -- --ignored
-          cargo test --locked --features '${{ matrix.features }}' --test cli live_usdt -- --ignored
-          cargo test --locked --features '${{ matrix.features }}' --test cli live_python -- --ignored
-          cargo test --locked --features '${{ matrix.features }}' --test cli live_node -- --ignored
-          cargo test --locked --features '${{ matrix.features }}' --test process_coverage -- --ignored
-          cargo test --locked --features '${{ matrix.features }}' --test arguments -- --ignored
-          cargo test --locked --features '${{ matrix.features }}' --test expansion -- --ignored
-          cargo test --locked --features '${{ matrix.features }}' --test reliable -- --ignored
+          bash scripts/ci-test.sh --locked --features '${{ matrix.features }}' --test cli live_uprobes -- --ignored
+          bash scripts/ci-test.sh --locked --features '${{ matrix.features }}' --test cli live_syscalls -- --ignored
+          bash scripts/ci-test.sh --locked --features '${{ matrix.features }}' --test cli live_process_tree -- --ignored
+          bash scripts/ci-test.sh --locked --features '${{ matrix.features }}' --test cli live_usdt -- --ignored
+          bash scripts/ci-test.sh --locked --features '${{ matrix.features }}' --test cli live_python -- --ignored
+          bash scripts/ci-test.sh --locked --features '${{ matrix.features }}' --test cli live_node -- --ignored
+          bash scripts/ci-test.sh --locked --features '${{ matrix.features }}' --test process_coverage -- --ignored
+          bash scripts/ci-test.sh --locked --features '${{ matrix.features }}' --test arguments -- --ignored
+          bash scripts/ci-test.sh --locked --features '${{ matrix.features }}' --test expansion -- --ignored
+          bash scripts/ci-test.sh --locked --features '${{ matrix.features }}' --test reliable -- --ignored
         env:
           LLVM_CONFIG: llvm-config-18
   fully-static:
@@ -66,9 +61,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: sudo apt-get update && sudo apt-get install -y llvm-18-dev zlib1g-dev libzstd-dev libtinfo-dev libxml2-dev ripgrep
-      - run: cargo test --locked
-      - run: cargo test --locked --test cli live_process_tree -- --ignored
-      - run: cargo test --locked --test cli live_usdt -- --ignored
+      - run: bash scripts/ci-test.sh --locked
+      - run: bash scripts/ci-test.sh --locked --test cli live_process_tree -- --ignored
+      - run: bash scripts/ci-test.sh --locked --test cli live_usdt -- --ignored
       - run: cargo build --release --locked
       - name: Verify static executable and JIT
         run: |
@@ -138,9 +133,9 @@ jobs:
         env:
           LLVM_CONFIG: llvm-config-18
         run: |
-          cargo test --locked --test managed python_versions -- --ignored --nocapture
-          cargo test --locked --test managed node_ -- --ignored --skip cooperative_ --nocapture
-          cargo test --locked --test managed go_ -- --ignored --skip go_perf --nocapture
+          bash scripts/ci-test.sh --locked --test managed python_versions -- --ignored --nocapture
+          bash scripts/ci-test.sh --locked --test managed node_ -- --ignored --skip cooperative_ --nocapture
+          bash scripts/ci-test.sh --locked --test managed go_ -- --ignored --skip go_perf --nocapture
 
   cooperative-runtimes:
     runs-on: ${{ matrix.os }}
@@ -168,7 +163,7 @@ jobs:
       - run: dotnet tool install --tool-path /tmp/poortrace-dotnet-tools dotnet-stack --version 10.0.750501
       - run: npm ci --prefix adapters --ignore-scripts
       - name: Real JVM, .NET, Python async, JS async and WebAssembly adapters
-        run: cargo test --locked --test managed cooperative_ -- --ignored --nocapture
+        run: bash scripts/ci-test.sh --locked --test managed cooperative_ -- --ignored --nocapture
         env:
           LLVM_CONFIG: llvm-config-18
           DOTNET_STACK: /tmp/poortrace-dotnet-tools/dotnet-stack
@@ -185,7 +180,7 @@ jobs:
           echo '5fe8c39a6536b28d5125be7adfb9da67e39ce7f165f58905a5cf5916f7670722  /tmp/node-pointer-compression.tar.xz' | sha256sum -c -
           tar -xJf /tmp/node-pointer-compression.tar.xz -C /tmp
       - name: Native compressed heap and frame resolution
-        run: cargo test --locked --test managed compressed_scope_live_function_frames -- --ignored --nocapture
+        run: bash scripts/ci-test.sh --locked --test managed compressed_scope_live_function_frames -- --ignored --nocapture
         env:
           LLVM_CONFIG: llvm-config-18
           POORTRACE_NODE_BIN: /tmp/node-v20.0.0-linux-x64-pointer-compression/bin/node

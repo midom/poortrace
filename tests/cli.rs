@@ -1589,3 +1589,30 @@ fn compatibility_getopt_exit_status_and_owned_command_replay() {
     }
     std::fs::remove_dir_all(directory).unwrap();
 }
+
+#[test]
+#[ignore = "requires ptrace and a native C compiler"]
+fn live_process_tree_thread_exec_discards_replaced_stops() {
+    let (directory, binary) = compile_functions("thread-exec-stops");
+    let source = format!(
+        "u:{:?}:traced_add {{ @calls=count(); }} syscall:enter:write {{ @writes=count(); }}",
+        binary.to_str().unwrap()
+    );
+    // Exec from a sibling replaces the stopped leader's task while preserving
+    // its TID. Repeat to cover both queued old stops and delayed exec notices.
+    for attempt in 0..32 {
+        let mut args = vec!["-q", "-f", "-d", "5", "-e", &source];
+        if attempt % 2 == 0 {
+            args.push("--reliable");
+        }
+        args.extend(["--", binary.to_str().unwrap(), "thread-exec"]);
+        let out = trace(&args);
+        assert!(out.status.success(), "attempt {attempt}: {}", errors(&out));
+        assert!(
+            output(&out).lines().any(|line| line == "@calls: 3"),
+            "attempt {attempt}: {}",
+            output(&out)
+        );
+    }
+    std::fs::remove_dir_all(directory).unwrap();
+}
