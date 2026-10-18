@@ -1,4 +1,4 @@
-//! Grouped per-thread counter reads, with explicit enabled/running times.
+//! Grouped per-thread or per-CPU counter reads, with explicit scheduling times.
 use crate::{Result, language::Probe};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 #[repr(C)]
@@ -25,11 +25,39 @@ pub struct Reading {
 }
 pub struct Group {
     pub tid: i32,
+    pub cpu: Option<i32>,
     files: Vec<OwnedFd>,
     names: Vec<String>,
 }
 impl Group {
     pub fn open(tid: i32, events: &[String], on_exec: bool) -> Result<Self> {
+        Self::open_with_kernel(tid, events, on_exec, false)
+    }
+    pub fn open_with_kernel(
+        tid: i32,
+        events: &[String],
+        on_exec: bool,
+        include_kernel: bool,
+    ) -> Result<Self> {
+        if tid <= 0 {
+            return Err("counter target TID must be positive".into());
+        }
+        Self::open_config(tid, None, events, on_exec, include_kernel)
+    }
+    /// Open a system-wide group on one online CPU; host perf policy applies.
+    pub fn open_on_cpu(cpu: i32, events: &[String], include_kernel: bool) -> Result<Self> {
+        if !(0..=1048575).contains(&cpu) {
+            return Err("invalid counter CPU ID".into());
+        }
+        Self::open_config(-1, Some(cpu), events, false, include_kernel)
+    }
+    fn open_config(
+        tid: i32,
+        cpu: Option<i32>,
+        events: &[String],
+        on_exec: bool,
+        include_kernel: bool,
+    ) -> Result<Self> {
         if events.is_empty() || events.len() > 16 {
             return Err("counter groups need 1..16 events".into());
         }
@@ -45,16 +73,28 @@ impl Group {
                 size: size_of::<Attr>() as u32,
                 config,
                 read_format: 11,
-                flags: 1 | 1 << 5 | 1 << 6 | if on_exec { 1 << 12 } else { 0 },
+                flags: 1
+                    | if include_kernel { 0 } else { 1 << 5 }
+                    | 1 << 6
+                    | if on_exec { 1 << 12 } else { 0 },
                 ..Attr::default()
             };
             let leader = files.first().map(AsRawFd::as_raw_fd).unwrap_or(-1);
             let fd = unsafe {
-                libc::syscall(libc::SYS_perf_event_open, &attr, tid, -1i32, leader, 8u64)
+                libc::syscall(
+                    libc::SYS_perf_event_open,
+                    &attr,
+                    tid,
+                    cpu.unwrap_or(-1),
+                    leader,
+                    8u64,
+                )
             };
             if fd < 0 {
                 return Err(format!(
-                    "counter {name} TID {tid}: {} (host perf policy/PMU constraints apply)",
+                    "counter {name} {}: {} (host perf policy/PMU constraints apply)",
+                    cpu.map(|cpu| format!("CPU {cpu}"))
+                        .unwrap_or_else(|| format!("TID {tid}")),
                     std::io::Error::last_os_error()
                 ));
             }
@@ -62,6 +102,7 @@ impl Group {
         }
         Ok(Self {
             tid,
+            cpu,
             files,
             names: events.to_vec(),
         })

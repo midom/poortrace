@@ -1,0 +1,13 @@
+/* All loops share a 4096-iteration budget for each handler invocation. */
+BEGIN {
+    $i = 0;
+    while ($i < 4) {
+        @values[f64($i) / 2] = f64($i) + 0.25;
+        $i++;
+    }
+    /* Iteration snapshots keys and values; mutation does not change this walk. */
+    for ($key, $value in @values) {
+        printf("key=%.2f value=%.2f\n", $key, $value);
+        delete(@values[$key]);
+    }
+}

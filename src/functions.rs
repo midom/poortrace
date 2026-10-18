@@ -105,6 +105,7 @@ impl Registers {
             sp: self.data[19],
             fp: self.data[4],
             lr: 0,
+            runtime_g: self.data[1],
         }
     }
     #[cfg(target_arch = "aarch64")]
@@ -114,6 +115,7 @@ impl Registers {
             sp: self.data[31],
             fp: self.data[29],
             lr: self.data[30],
+            runtime_g: self.data[28],
         }
     }
     #[cfg(target_arch = "x86_64")]
@@ -182,6 +184,41 @@ fn maps(pid: i32) -> Result<Vec<Mapping>> {
         .map(|text| text.lines().filter_map(Mapping::parse).collect())
         .map_err(|e| e.to_string())
 }
+// Include non-executable mappings when deciding whether our saved original
+// bytes still belong to a live image after mprotect removes execute permission.
+fn memory_maps(pid: i32) -> Result<Vec<Mapping>> {
+    let text = std::fs::read_to_string(format!("/proc/{pid}/maps")).map_err(|e| e.to_string())?;
+    Ok(text
+        .lines()
+        .filter_map(|line| {
+            let mut rest = line;
+            let mut field = || {
+                rest = rest.trim_start();
+                let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+                let (value, tail) = rest.split_at(end);
+                rest = tail;
+                value
+            };
+            let (start, end) = field().split_once('-')?;
+            let permissions = field();
+            let offset = u64::from_str_radix(field(), 16).ok()?;
+            let (major, minor) = field().split_once(':')?;
+            let inode = field().parse().ok()?;
+            Some(Mapping {
+                start: u64::from_str_radix(start, 16).ok()?,
+                end: u64::from_str_radix(end, 16).ok()?,
+                offset,
+                inode,
+                device: libc::makedev(
+                    u32::from_str_radix(major, 16).ok()?,
+                    u32::from_str_radix(minor, 16).ok()?,
+                ),
+                path: rest.trim_start().trim_end_matches(" (deleted)").into(),
+                private: permissions.as_bytes().get(3) == Some(&b'p'),
+            })
+        })
+        .collect())
+}
 fn tgid(tid: i32) -> Option<i32> {
     std::fs::read_to_string(format!("/proc/{tid}/status"))
         .ok()?
@@ -246,6 +283,7 @@ pub struct Tracer {
     foreign: BTreeSet<i32>,
     active: bool,
     syscalls: bool,
+    track_loads: bool,
     decoder: crate::syscall::Decoder,
     discovered: Vec<i32>,
     unresolved: bool,
@@ -259,6 +297,19 @@ impl Tracer {
         specs: &[Spec],
         launched: bool,
     ) -> Result<Self> {
+        Self::seize_tree(pid, tids, specs, launched, false)
+    }
+    pub fn seize_tree(
+        pid: i32,
+        tids: impl IntoIterator<Item = i32>,
+        specs: &[Spec],
+        launched: bool,
+        include_descendants: bool,
+    ) -> Result<Self> {
+        let mut tasks: BTreeSet<i32> = tids.into_iter().collect();
+        if include_descendants {
+            tasks.extend(crate::syscall::descendant_tasks(pid)?);
+        }
         if specs.is_empty() || specs.len() > 256 {
             return Err("function tracing supports 1..256 probe bindings".into());
         }
@@ -278,7 +329,7 @@ impl Tracer {
         let mut tracer = Self {
             pid,
             root: pid,
-            follow: false,
+            follow: include_descendants,
             spaces: BTreeMap::new(),
             owners: BTreeMap::from([(pid, pid)]),
             bindings,
@@ -297,6 +348,7 @@ impl Tracer {
             foreign: BTreeSet::new(),
             active: !launched,
             syscalls: false,
+            track_loads: false,
             decoder: crate::syscall::Decoder::default(),
             discovered: Vec::new(),
             unresolved: true,
@@ -309,14 +361,53 @@ impl Tracer {
             | libc::PTRACE_O_TRACEVFORKDONE
             | libc::PTRACE_O_TRACEEXEC
             | libc::PTRACE_O_TRACESYSGOOD;
-        for tid in tids {
+        for tid in tasks {
             control(libc::PTRACE_SEIZE, tid, 0, flags as usize)?;
             tracer.tids.insert(tid);
             tracer.initial.insert(tid);
+            if include_descendants {
+                let group = tgid(tid).unwrap_or(tid);
+                tracer.owners.entry(group).or_insert(group);
+            }
         }
         tracer.stop_world()?;
+        if include_descendants {
+            // kcmp is a read-only identity check. Some hosts deny it even to a
+            // ptracer; in that case existing trap validation still fails safely
+            // rather than adopting another group's patched text as original.
+            let mut representatives: Vec<i32> = Vec::new();
+            let mut groups = vec![pid];
+            groups.extend(tracer.owners.keys().copied().filter(|group| *group != pid));
+            for group in groups {
+                let shared = representatives.iter().copied().find(|other| unsafe {
+                    libc::syscall(libc::SYS_kcmp, group, *other, 1usize, 0usize, 0usize) == 0
+                });
+                if let Some(owner) = shared {
+                    tracer.owners.insert(group, owner);
+                } else {
+                    representatives.push(group);
+                }
+            }
+        }
         if tracer.active {
             tracer.refresh()?;
+            if include_descendants {
+                for tid in tracer.stopped.clone() {
+                    let group = tgid(tid).unwrap_or(tid);
+                    if group != tracer.pid {
+                        tracer.select(tid);
+                        tracer.refresh()?;
+                    }
+                }
+                if let Some(tid) = tracer
+                    .stopped
+                    .iter()
+                    .find(|tid| tgid(**tid) == Some(pid))
+                    .copied()
+                {
+                    tracer.select(tid);
+                }
+            }
         }
         Ok(tracer)
     }
@@ -356,6 +447,10 @@ impl Tracer {
         self.breakpoints = state.breakpoints;
         self.active = state.active;
         self.unresolved = state.unresolved;
+    }
+    /// Observe mapping syscalls so short-lived DSOs are bound before returning to userspace.
+    pub fn track_loads(&mut self, enabled: bool) {
+        self.track_loads = enabled;
     }
     pub fn trace_syscalls(&mut self, enabled: bool) {
         self.syscalls = enabled;
@@ -633,6 +728,27 @@ impl Tracer {
                 Self::identity(word, &current).ok_or("breakpoint is outside executable memory")?;
             let original =
                 control(libc::PTRACE_PEEKDATA, self.memory_tid()?, word as usize, 0)? as u64;
+            // Validate before adopting a word. A pre-existing CLONE_VM group
+            // may expose another group's patch; retaining it as original text
+            // would reintroduce that trap during error cleanup.
+            let bytes = original.to_ne_bytes();
+            let slot = (address - word) as usize;
+            #[cfg(target_arch = "x86_64")]
+            if bytes[slot] == 0xcc {
+                return Err(
+                    "probe point already contains INT3 (possibly an existing shared address space)"
+                        .into(),
+                );
+            }
+            #[cfg(target_arch = "aarch64")]
+            if u32::from_le_bytes(bytes[slot..slot + 4].try_into().unwrap()) & 0xffe0001f
+                == 0xd4200000
+            {
+                return Err(
+                    "probe point already contains BRK (possibly an existing shared address space)"
+                        .into(),
+                );
+            }
             self.words.insert(word, Word { original, identity });
         }
         let original = self.words[&word].original.to_ne_bytes();
@@ -662,9 +778,22 @@ impl Tracer {
             return Ok(());
         }
         let current = self.current_maps()?;
-        self.semaphores.retain(|_, semaphore| {
-            Self::identity(semaphore.site, &current) == Some(semaphore.identity)
-        });
+        let mapped = memory_maps(self.memory_tid()?)?;
+        let inactive: Vec<_> = self
+            .semaphores
+            .iter()
+            .filter(|(_, semaphore)| {
+                Self::identity(semaphore.site, &current) != Some(semaphore.identity)
+            })
+            .map(|(&address, _)| address)
+            .collect();
+        for address in inactive {
+            if let Some(semaphore) = self.semaphores.remove(&address) {
+                if Self::identity(semaphore.site, &mapped) == Some(semaphore.identity) {
+                    adjust_semaphore(self.memory_tid()?, address, -1)?;
+                }
+            }
+        }
         // Never restore stale bytes into an unmapped/replaced image.
         let stale: Vec<_> = self
             .words
@@ -673,6 +802,16 @@ impl Tracer {
             .map(|(&address, _)| address)
             .collect();
         for word in stale {
+            if let Some(original) = self.words.get(&word) {
+                if Self::identity(word, &mapped) == Some(original.identity) {
+                    control(
+                        libc::PTRACE_POKEDATA,
+                        self.memory_tid()?,
+                        word as usize,
+                        original.original as usize,
+                    )?;
+                }
+            }
             self.words.remove(&word);
             self.breakpoints.retain(|address, _| *address & !7 != word);
         }
@@ -750,7 +889,7 @@ impl Tracer {
             if self.listening.contains(&tid) {
                 control(libc::PTRACE_LISTEN, tid, 0, 0)?;
             } else {
-                let op = if !self.active || self.unresolved || self.syscalls {
+                let op = if !self.active || self.unresolved || self.syscalls || self.track_loads {
                     libc::PTRACE_SYSCALL
                 } else {
                     libc::PTRACE_CONT
@@ -940,6 +1079,21 @@ impl Tracer {
             }
             if signal == (libc::SIGTRAP | 0x80) {
                 if self.active {
+                    let mapping_change = if self.track_loads {
+                        let number = Registers::read(tid)?.syscall_number();
+                        matches!(
+                            number,
+                            libc::SYS_mmap
+                                | libc::SYS_mprotect
+                                | libc::SYS_munmap
+                                | libc::SYS_mremap
+                        )
+                    } else {
+                        false
+                    };
+                    if self.unresolved || mapping_change {
+                        self.refresh()?;
+                    }
                     if self.syscalls && (self.follow || !self.foreign.contains(&tid)) {
                         if let Some(event) = self.decoder.stop(tid)? {
                             return Ok(vec![Event {
@@ -952,9 +1106,6 @@ impl Tracer {
                                 syscall: Some(event),
                             }]);
                         }
-                    }
-                    if self.unresolved {
-                        self.refresh()?;
                     }
                 }
                 continue;
@@ -977,6 +1128,34 @@ impl Tracer {
                 let mut output = Vec::new();
                 if self.follow || !self.foreign.contains(&tid) {
                     let calls = self.calls.entry(tid).or_default();
+                    // Downward-growing stacks unwind past abandoned calls after
+                    // longjmp/exception unwinding. Do not report these as returns.
+                    // Limit pruning to the same observed mapping: switched stacks
+                    // can have unrelated numerical SP order.
+                    if calls.last().is_some_and(|call| call.sp < user.sp) {
+                        let map = std::fs::read_to_string(format!("/proc/{tid}/maps"))
+                            .ok()
+                            .filter(|text| text.len() <= 1024 * 1024)
+                            .and_then(|text| {
+                                text.lines().find_map(|line| {
+                                    let (a, b) = line.split_whitespace().next()?.split_once('-')?;
+                                    let (a, b) = (
+                                        u64::from_str_radix(a, 16).ok()?,
+                                        u64::from_str_radix(b, 16).ok()?,
+                                    );
+                                    (a <= user.sp && user.sp < b).then_some((a, b))
+                                })
+                            });
+                        while calls.last().is_some_and(|call| {
+                            call.sp < user.sp
+                                && map.is_some_and(|(a, b)| a <= call.sp && call.sp < b)
+                        }) {
+                            let call = calls.pop().unwrap();
+                            if let Some(bp) = self.breakpoints.get_mut(&call.address) {
+                                bp.returns = bp.returns.saturating_sub(1);
+                            }
+                        }
+                    }
                     while calls
                         .last()
                         .is_some_and(|call| call.address == address && call.sp == user.sp)
@@ -1159,7 +1338,7 @@ impl Tracer {
             if !restored.insert(owner) {
                 continue;
             }
-            if let Ok(current) = maps(tid) {
+            if let Ok(current) = memory_maps(tid) {
                 for (&address, semaphore) in &self.semaphores {
                     if Self::identity(semaphore.site, &current) == Some(semaphore.identity) {
                         let _ = adjust_semaphore(tid, address, -1);
@@ -1475,4 +1654,50 @@ pub fn floating_argument(tid: i32, index: usize, single: bool) -> Result<u64> {
     let mut value = [0; 8];
     value[..size].copy_from_slice(&bytes[offset..offset + size]);
     Ok(u64::from_ne_bytes(value))
+}
+
+/// Read a native integer/pointer argument register at a ptrace function-entry stop.
+/// Stack arguments are deliberately separate because aggregate ABIs consume slots differently.
+pub fn integer_argument(tid: i32, index: usize) -> Result<u64> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let register = [14, 13, 12, 11, 9, 8]
+            .get(index)
+            .copied()
+            .ok_or("integer register index must be 0..5 on x86-64")?;
+        Ok(Registers::read(tid)?.data[register])
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if index >= 8 {
+            return Err("integer register index must be 0..7 on AArch64".into());
+        }
+        Ok(Registers::read(tid)?.data[index])
+    }
+}
+
+/// Read the complete native 128-bit SIMD argument register at a ptrace stop.
+pub fn floating_argument_bits(tid: i32, index: usize) -> Result<[u8; 16]> {
+    if index >= 8 {
+        return Err("floating register index must be 0..7".into());
+    }
+    let mut bytes = [0u8; 528];
+    let mut iov = libc::iovec {
+        iov_base: bytes.as_mut_ptr().cast(),
+        iov_len: bytes.len(),
+    };
+    control(
+        libc::PTRACE_GETREGSET,
+        tid,
+        2,
+        (&mut iov as *mut libc::iovec) as usize,
+    )?;
+    #[cfg(target_arch = "x86_64")]
+    let offset = 160 + index * 16;
+    #[cfg(target_arch = "aarch64")]
+    let offset = index * 16;
+    if offset + 16 > iov.iov_len {
+        return Err("incomplete FP register set".into());
+    }
+    Ok(bytes[offset..offset + 16].try_into().unwrap())
 }

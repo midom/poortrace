@@ -9,6 +9,14 @@ pub enum Probe {
     Wait(Duration),
     Wakeup(Duration),
     OffCpu,
+    Tracepoint {
+        category: String,
+        event: String,
+    },
+    KernelProbe {
+        function: String,
+        ret: bool,
+    },
     Uprobe {
         path: String,
         function: String,
@@ -61,6 +69,37 @@ pub const HARDWARE: &[(&str, u64)] = &[
 
 impl Probe {
     pub fn parse(text: &str) -> Result<Self> {
+        let identifier = |name: &str| {
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.'))
+        };
+        if let Some(rest) = text.strip_prefix("tracepoint:") {
+            let (category, event) = rest
+                .split_once(':')
+                .ok_or("tracepoint requires CATEGORY:EVENT")?;
+            if !identifier(category) || !identifier(event) {
+                return Err("invalid tracepoint identifier".into());
+            }
+            return Ok(Self::Tracepoint {
+                category: category.into(),
+                event: event.into(),
+            });
+        }
+        if let Some((function, ret)) = text
+            .strip_prefix("kprobe:")
+            .map(|f| (f, false))
+            .or_else(|| text.strip_prefix("kretprobe:").map(|f| (f, true)))
+        {
+            if !identifier(function) {
+                return Err("invalid kernel function identifier".into());
+            }
+            return Ok(Self::KernelProbe {
+                function: function.into(),
+                ret,
+            });
+        }
         if let Some(rest) = text.strip_prefix("usdt:") {
             let Self::Uprobe { path, function, .. } = Self::parse(&format!("uprobe:{rest}"))?
             else {
@@ -324,7 +363,7 @@ impl Probe {
                 })
             }
             _ => Err(format!(
-                "unsupported probe '{text}'; see --list (kernel probes and BPF are not supported)"
+                "unsupported probe '{text}'; see --list (BPF programs are not supported)"
             )),
         }
     }
@@ -334,7 +373,12 @@ impl Probe {
     pub fn is_perf(&self) -> bool {
         matches!(
             self,
-            Self::Perf { .. } | Self::Watchpoint { .. } | Self::OffCpu | Self::Uprobe { .. }
+            Self::Tracepoint { .. }
+                | Self::KernelProbe { .. }
+                | Self::Perf { .. }
+                | Self::Watchpoint { .. }
+                | Self::OffCpu
+                | Self::Uprobe { .. }
         )
     }
 }
@@ -366,6 +410,7 @@ pub struct Clause {
 #[derive(Clone, Debug)]
 pub enum Expr {
     Number(i64),
+    Float(f64),
     String(String),
     Builtin(String),
     Local(String),
@@ -383,12 +428,15 @@ pub enum Stmt {
     Call(String, Vec<Expr>),
     If(Expr, Vec<Stmt>, Vec<Stmt>),
     Repeat(u32, Vec<Stmt>),
+    While(Expr, Vec<Stmt>),
+    For(String, String, String, Vec<Stmt>),
 }
 
 #[derive(Clone, Debug)]
 enum TokenKind {
     Word(String),
     Number(i64),
+    Float(f64),
     String(String),
     Symbol(String),
     Eof,
@@ -449,11 +497,47 @@ fn lex(src: &str) -> Result<Vec<Token>> {
                 while i < bytes.len() && bytes[i].is_ascii_digit() {
                     i += 1;
                 }
-                TokenKind::Number(
-                    src[start..i]
-                        .parse::<i64>()
-                        .map_err(|_| diagnostic(src, start, "integer exceeds i64"))?,
-                )
+                let mut floating = false;
+                if bytes.get(i) == Some(&b'.') && bytes.get(i + 1).is_some_and(u8::is_ascii_digit) {
+                    floating = true;
+                    i += 1;
+                    while bytes.get(i).is_some_and(u8::is_ascii_digit) {
+                        i += 1;
+                    }
+                }
+                if bytes.get(i).is_some_and(|c| matches!(c, b'e' | b'E')) {
+                    floating = true;
+                    i += 1;
+                    if bytes.get(i).is_some_and(|c| matches!(c, b'+' | b'-')) {
+                        i += 1;
+                    }
+                    let begin = i;
+                    while bytes.get(i).is_some_and(u8::is_ascii_digit) {
+                        i += 1;
+                    }
+                    if begin == i {
+                        return Err(diagnostic(src, start, "missing floating-point exponent"));
+                    }
+                }
+                if floating {
+                    let value = src[start..i]
+                        .parse::<f64>()
+                        .map_err(|_| diagnostic(src, start, "invalid floating-point literal"))?;
+                    if !value.is_finite() {
+                        return Err(diagnostic(
+                            src,
+                            start,
+                            "floating-point literal must be finite",
+                        ));
+                    }
+                    TokenKind::Float(value)
+                } else {
+                    TokenKind::Number(
+                        src[start..i]
+                            .parse::<i64>()
+                            .map_err(|_| diagnostic(src, start, "integer exceeds i64"))?,
+                    )
+                }
             }
         } else if bytes[i] == b'"' {
             i += 1;
@@ -684,6 +768,30 @@ impl Parser<'_> {
         self.expect("{")?;
         let mut stmts = Vec::new();
         while !self.eat("}") {
+            if self.eat("for") {
+                self.expect("(")?;
+                self.expect("$")?;
+                let key = self.word()?;
+                self.expect(",")?;
+                self.expect("$")?;
+                let value = self.word()?;
+                if key == value {
+                    return Err(self.error("map iteration requires distinct locals"));
+                }
+                self.expect("in")?;
+                self.expect("@")?;
+                let map = self.word()?;
+                self.expect(")")?;
+                stmts.push(Stmt::For(key, value, map, self.block()?));
+                continue;
+            }
+            if self.eat("while") {
+                self.expect("(")?;
+                let condition = self.expr(0)?;
+                self.expect(")")?;
+                stmts.push(Stmt::While(condition, self.block()?));
+                continue;
+            }
             if self.eat("repeat") {
                 self.expect("(")?;
                 let count = match self.expr(0)? {
@@ -778,6 +886,10 @@ impl Parser<'_> {
         } else {
             let kind = self.token().kind.clone();
             match kind {
+                TokenKind::Float(n) => {
+                    self.at += 1;
+                    Expr::Float(n)
+                }
                 TokenKind::Number(n) => {
                     self.at += 1;
                     Expr::Number(n)

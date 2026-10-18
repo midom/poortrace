@@ -31,3 +31,9 @@ pub mod types;
 pub mod wait;
 
 pub mod javascript;
+
+pub mod golang;
+
+pub mod kernel;
+
+pub mod arguments;

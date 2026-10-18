@@ -26,10 +26,10 @@ pub struct Poller {
     stack_bytes: usize,
 }
 impl Poller {
-    pub fn new(program: &crate::codegen::Program, stack_bytes: usize) -> Self {
+    pub fn new(program: &crate::codegen::Program, stack_bytes: usize, capture_raw: bool) -> Self {
         Self {
             sleeping: BTreeMap::new(),
-            stack_bytes: if program.needs_ustack() {
+            stack_bytes: if program.needs_ustack() || capture_raw {
                 stack_bytes
             } else {
                 0
@@ -159,7 +159,7 @@ impl Poller {
                 let stack = Arc::new(if self.stack_bytes == 0 {
                     Vec::new()
                 } else {
-                    crate::memory::read(tid, sp, self.stack_bytes, true).unwrap_or_default()
+                    crate::memory::read_stack(tid, sp, self.stack_bytes).unwrap_or_default()
                 });
                 for (clause, probe, period, wakeup) in &due {
                     let snapshot = Snapshot {
@@ -176,6 +176,7 @@ impl Poller {
                             sp,
                             fp: 0,
                             lr: 0,
+                            runtime_g: 0,
                         },
                         number,
                         args,

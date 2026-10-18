@@ -168,12 +168,25 @@ impl Image {
                 Some(Symbol {
                     address: symbol.address(),
                     size: symbol.size(),
-                    name: demangle(symbol.name().ok()?),
+                    // Unwinding loads all module images, but usually resolves
+                    // only a handful of names. Keep bounded raw names here.
+                    name: symbol.name().ok()?.chars().take(4096).collect(),
                 })
             })
             .collect();
         symbols.sort_by(|a, b| (a.address, &a.name).cmp(&(b.address, &b.name)));
         symbols.dedup_by(|a, b| a.address == b.address && a.name == b.name);
+        let mut first = 0;
+        while first < symbols.len() {
+            let address = symbols[first].address;
+            let end = first + symbols[first..].partition_point(|symbol| symbol.address == address);
+            // Preserve display-name ordering for aliases. Cache each alias's
+            // key once; C++ template parsing inside a comparator is expensive.
+            if end - first > 1 {
+                symbols[first..end].sort_by_cached_key(|symbol| demangle(&symbol.name));
+            }
+            first = end;
+        }
         let section = |name| {
             object
                 .section_by_name(name)
@@ -222,6 +235,7 @@ impl Image {
                 && (symbol.size == 0 || address - symbol.address < symbol.size)
         });
         let delta = closest.map(|symbol| address - symbol.address);
+        let display_name = closest.map(|symbol| demangle(&symbol.name));
         if let Some(loader) = &self.lines {
             if let Ok(mut frames) = loader.find_frames(address) {
                 let mut names = Vec::new();
@@ -235,7 +249,7 @@ impl Image {
                     if name.is_some() || location.is_some() {
                         let name = name.unwrap_or_else(|| "?".into());
                         let offset = closest
-                            .filter(|symbol| symbol.name == name)
+                            .filter(|_| display_name.as_deref() == Some(name.as_str()))
                             .map(|_| format!("+0x{:x}", delta.unwrap()))
                             .unwrap_or_default();
                         names.push(format!(
@@ -266,7 +280,7 @@ impl Image {
         if symbol.size != 0 && delta >= symbol.size {
             return None;
         }
-        Some(format!("{}+0x{delta:x}", symbol.name))
+        Some(format!("{}+0x{delta:x}", demangle(&symbol.name)))
     }
 }
 
@@ -566,6 +580,28 @@ mod tests {
             "demo::worker"
         );
         assert_eq!(demangle("_Z6workeri"), "worker(int)");
+    }
+    #[test]
+    fn raw_symbol_names_demangle_when_resolved() {
+        let image = Image {
+            segments: vec![(0, 0x1000, 0x400000)],
+            lines: None,
+            sections: Default::default(),
+            symbols: vec![
+                Symbol {
+                    address: 0x400100,
+                    size: 16,
+                    name: "_ZN4demo6worker17h0123456789abcdefE".into(),
+                },
+                Symbol {
+                    address: 0x400200,
+                    size: 16,
+                    name: "_Z6workeri".into(),
+                },
+            ],
+        };
+        assert_eq!(image.resolve(0x103).as_deref(), Some("demo::worker+0x3"));
+        assert_eq!(image.resolve(0x203).as_deref(), Some("worker(int)+0x3"));
     }
     #[test]
     fn target_owned_perf_maps_name_anonymous_jit_code() {

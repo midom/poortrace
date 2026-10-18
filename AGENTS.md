@@ -25,15 +25,20 @@ Serde for profile/report formats; LLVM is accessed through direct C API bindings
   and callbacks called by generated code.
 - `src/symbols.rs`: target mappings, ELF/DWARF symbol lookup, sampled-stack CFI
   unwinding, perf-map JIT names, and user-stack rendering.
-- `src/recording.rs`: bounded, versioned invocation/helper journals and offline replay.
+- `src/recording.rs`: versioned raw-context/helper journals, alternate replay
+  coalescing, and chronological Speedscope observation exports.
 - `src/python.rs`: read-only, version-checked CPython frame walking.
 - `src/javascript.rs`: V8 metadata discovery and read-only JavaScript frames.
+- `src/golang.rs`: DWARF-backed running/parked Go goroutine snapshots.
+- `src/kernel.rs`: tracefs field metadata, raw payload decoding, kernel PMU setup,
+  and bounded online CPU enumeration.
+- `src/arguments.rs`: native C ABI argument plans and stopped-register/DWARF reads.
 - `src/types.rs`: bounded DWARF scalar/structure layout reads.
 - `src/usdt.rs`: SystemTap SDT notes and native argument descriptors.
 - `src/wait.rs`: sleeping-thread snapshots and observed wakeup transitions, not exact scheduler events.
 - `src/report.rs`: text/JSON reports, comparisons, folded stacks, Speedscope, and SVG flamegraphs.
 - `src/memory.rs`: bounded read-only process_vm_readv helpers.
-- `src/counters.rs`: grouped per-thread counter reads and scheduling-time scaling.
+- `src/counters.rs`: grouped per-thread/per-CPU counters and scheduling-time scaling.
 - `src/functions.rs`: all-stop ptrace function breakpoints, return matching, fork handling, and text restoration.
 - `src/uprobe.rs`: ELF symbol/file-offset resolution and optional dynamic perf uprobe registration data.
 - `src/syscall.rs`: ptrace syscall/lifecycle tracking and detach cleanup; native
@@ -46,6 +51,8 @@ Serde for profile/report formats; LLVM is accessed through direct C API bindings
   linking, and embeds its version and (for shared builds) runtime library path.
 - `tests/jit.rs`: native JIT integration tests using synthetic events.
 - `tests/cli.rs`: CLI, timers, process lifecycle, and opt-in live perf tests.
+- `tests/{managed,process_coverage,arguments,kernel_cli,recording_features,float_reports}.rs`:
+  focused runtime, lifecycle, ABI, kernel decoder/replay, and report regressions.
 - `examples/*.pt`: sample tracing scripts. `examples/workload.rs` provides CPU
   and allocation work on the main thread and dynamically created worker threads.
 
@@ -79,8 +86,9 @@ covered by synthetic-event JIT tests. CLI and lifecycle changes belong in
 
 Live tests are ignored by default because perf/ptrace access, native C/C++
 compilers, and runtime installations vary by host. The complete suite needs
-CPython 3.12 and Node 22 (V8 12.4), as well as permitted software perf sampling
-and hardware watchpoint support:
+a supported CPython 3.11–3.14, Node 20/22/24, and Go compiler with retained
+DWARF, as well as permitted software perf sampling and hardware watchpoints.
+Kernel live tests separately require readable tracefs and kernel perf access:
 
 ```sh
 LLVM_CONFIG=llvm-config-18 cargo test --locked --test cli -- --ignored --nocapture
@@ -99,17 +107,21 @@ Do not change host perf policy to make tests pass.
 
 ## Tracing behavior and constraints
 
-- Perf probes require an attached PID or a launched command. Each thread/probe
-  has its own descriptor and mmap ring, with `cpu=-1`, kernel/hypervisor execution
-  excluded, and inheritance disabled.
+- Default perf probes require an attached PID or a launched command. Each
+  thread/probe has its own descriptor/ring with `cpu=-1` and inheritance disabled.
+  `--system-wide` instead opens per-online-CPU streams; `--include-kernel`,
+  tracepoints, and kernel probes request kernel execution with host-enforced
+  permissions. Never suppress a CPU attachment error by testing it as a PID.
+  Dynamic kprobes use the perf PMU without global tracefs registration or BPF.
 - In perf-only and counter runs without ptrace tracking, existing threads are
   attached individually and new threads are found by scanning `/proc/PID/task`
   every 100 ms. Early events and threads that finish between scans can be missed.
   Syscall/ptrace function backends already follow thread clones. Opt-in
   `--track-threads` attaches perf streams/counters at clone stops; `--follow-forks`
   also follows children created after attachment across exec and waits for the
-  followed tree after root exit. Pre-existing descendants are not automatically
-  attached; initial attachment races remain.
+  followed tree after root exit. `--attach-descendants -p PID` takes a bounded
+  snapshot of existing descendants and implies fork following. Initial attachment
+  races remain; unsupported pre-existing shared-mm ownership must fail safely.
 - Perf inheritance with `cpu=-1` has mmap sampling restrictions. Account for
   those restrictions when changing thread attachment.
 - Launched commands wait behind a pipe gate until attachment and `BEGIN` finish.
@@ -119,7 +131,10 @@ Do not change host perf policy to make tests pass.
   descendants using pidfds and a tracer-local subreaper (Linux 5.3+). Cleanup must
   never send termination signals to attached processes; preserve signal delivery
   and detach behavior for ptrace targets.
-- Perf samples are asynchronous, ordered within each stream, and not globally sorted.
+- Perf samples explicitly use `CLOCK_MONOTONIC`, matching ptrace/timer events.
+  They remain asynchronous and ordered within each stream, not globally sorted.
+  Cross-CPU scheduler correlations require ordered, complete recorded observations;
+  raw tracepoint fields do not establish higher-level blocking causes.
 - Syscall/function stops can share a run with perf samples. One ptracer owns
   each target; preserve signals/group stops, launch gating, and detach cleanup.
   Keep address-space breakpoint/semaphore state separate across private forks
@@ -127,17 +142,21 @@ Do not change host perf policy to make tests pass.
 - Function probes default to ptrace. Restore patched text and rewind pending INT3
   stops before detach, coordinate all threads while stepping, and restore inherited
   breakpoints in fork children. Never silently fall back between intrusive backends.
-  Restore active SDT semaphores only in their matching images. Kernel perf
+  `--track-loads` refreshes on mapping syscall stops. Restore original words and
+  active SDT semaphores for still-mapped matching images when execute permission
+  disappears, using full mapping identity rather than executable mappings alone.
+  Observable nonlocal unwinding prunes abandoned returns; do not claim support
+  for arbitrary stack switching. Kernel perf
   uprobes are an explicit privileged alternative; no BPF is loaded.
 - Off-CPU intervals require complete switch pairs; clear pending pairs on loss.
   Switch records do not carry a blocking stack or establish why a task waited.
 - Counter reads distinguish raw counts, scheduling times, and scaled estimates.
   Preserve unscheduled (unavailable) results and read groups before dropping them.
 - Memory helpers are read-only, limited to 4096 bytes, and subject to ptrace checks.
-  Current ptrace/polling native-stack reads share this limit: use
-  `--stack-bytes 4096` or less; the 16384-byte default leaves those snapshots empty.
-  Perf-sampled stack capture supports 8..32768 bytes. Ptrace `jsstack` reads frame
-  slots directly; polling snapshots lack FP and cannot provide JS frames.
+  Stack snapshot reads have a separate 32768-byte bound, preserve accessible
+  prefixes, and support the full CLI size range for perf, ptrace, and polling.
+  Ptrace `jsstack` reads frame slots directly; polling snapshots lack FP and
+  cannot provide JS frames.
   `count()` counts delivered samples; `sum(period)` is not an exact counter total.
 
 ## Implementation invariants
@@ -158,13 +177,30 @@ Do not change host perf policy to make tests pass.
 - Retain parser/resource limits and type checks when extending the language.
   Update `README.md`, examples, CLI help, and tests when user-visible behavior
   changes.
-- Script repeats share a 4096-iteration invocation budget; local arrays and
-  inlined expression functions must retain parser, expansion, and type limits.
+- Repeat, while, and map-iteration loops share a 4096-iteration invocation budget.
+  Iteration uses bounded snapshots, so mutation cannot extend the current walk.
+  Retain local-array, expression expansion, snapshot, and type limits.
+- Float maps/keys require finite values; preserve float-key ordering and canonical
+  zero equality. Scalar float operations follow IEEE behavior; integer arithmetic
+  retains its defined wrapping and division behavior. Keep JSON/profile weight
+  type restrictions explicit.
+- Typed C ABI arguments require validated DWARF and native register-bank/stack
+  classification. Reject unsupported layouts, conventions, and variadic signatures.
+  Validate alignment and register exhaustion across aggregates/vectors.
 - Replay must validate helper result types before exposing pointers to JIT code.
-  Never read current target memory to reconstruct a recorded helper result.
-- `pystack` currently supports CPython 3.12 release layouts; `jsstack` requires
-  exported V8 metadata and 8-byte tagged pointers, with ScopeInfo names gated to
-  V8 12.4 (Node 22). Keep these layout gates explicit; unavailable/racy frames are
-  observable labels. V8 heap reads are bounded and read-only; sampled
-  stack slots must come from the captured stack rather than a later live stack.
+  Never read current target memory or its current ELF files to reconstruct a
+  recorded helper result. Alternate replay recomputes deterministic helpers and
+  captured trace fields; other helpers need captured descriptors/results or an
+  explicit raw-address stack/branch fallback. Honor new script exit semantics
+  while running BEGIN/END once. Timeline weights interpolate observations.
+- `pystack` supports verified CPython 3.11–3.14 release layouts; newer versions
+  use validated runtime debug offsets. `jsstack` uses exported V8 metadata and
+  verified Node 20/22/24 schemas, including ordinary compressed heap fields.
+  Verified uncompressed V8 12.4 layouts expose interpreted/optimized current
+  lines and optimized inline chains when source/deoptimization metadata exists;
+  other lines are marked function starts. Keep unknown layouts explicitly unavailable.
+- `gostack`/`goroutines` need retained Go DWARF and runtime ownership checks;
+  validate captured g registers, native TID/curg identity, stack bounds, and
+  observed state before/after reads. Do not guess stripped runtime layouts. V8 heap reads are bounded and
+  read-only; sampled stack slots must come from the captured stack rather than a later live stack.
 - Polling wait/wakeup observations do not identify wakers or exact sleep times.

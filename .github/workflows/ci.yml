@@ -2,9 +2,11 @@ name: Rust
 on: [push, pull_request]
 jobs:
   test:
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
         features: ["", "static-llvm"]
     steps:
       - uses: actions/checkout@v4
@@ -30,14 +32,24 @@ jobs:
           cargo test --locked --features '${{ matrix.features }}' --test cli live_usdt -- --ignored
           cargo test --locked --features '${{ matrix.features }}' --test cli live_python -- --ignored
           cargo test --locked --features '${{ matrix.features }}' --test cli live_node -- --ignored
+          cargo test --locked --features '${{ matrix.features }}' --test process_coverage -- --ignored
+          cargo test --locked --features '${{ matrix.features }}' --test arguments -- --ignored
         env:
           LLVM_CONFIG: llvm-config-18
   fully-static:
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
     env:
       LLVM_CONFIG: llvm-config-18
       RUSTFLAGS: -C target-feature=+crt-static
-      CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
+      CARGO_BUILD_TARGET: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -48,7 +60,7 @@ jobs:
       - run: cargo build --release --locked
       - name: Verify static executable and JIT
         run: |
-          binary=target/x86_64-unknown-linux-gnu/release/poortrace
+          binary=target/${{ matrix.target }}/release/poortrace
           if readelf -d "$binary" | grep -q '(NEEDED)'; then
             echo "Executable depends on shared libraries"
             exit 1
@@ -67,3 +79,39 @@ jobs:
       - run: cargo check --locked --all-targets
         env:
           LLVM_CONFIG: llvm-config-18
+
+  managed-compatibility:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            node: "20"
+            python: "3.11"
+          - os: ubuntu-24.04-arm
+            node: "22"
+            python: "3.12"
+          - os: ubuntu-24.04
+            node: "24"
+            python: "3.13"
+          - os: ubuntu-24.04-arm
+            node: "24"
+            python: "3.14"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y llvm-18-dev golang-go
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Managed stack compatibility
+        env:
+          LLVM_CONFIG: llvm-config-18
+        run: |
+          cargo test --locked --test managed python_versions -- --ignored --nocapture
+          cargo test --locked --test managed node_ -- --ignored --nocapture
+          cargo test --locked --test managed go_running -- --ignored --nocapture

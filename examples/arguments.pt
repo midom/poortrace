@@ -1,0 +1,8 @@
+/* Replace the executable/function before launching with -- ./application.
+ * args() reads the DWARF signature at a ptrace function-entry stop and formats
+ * scalar, plain structure, homogeneous floating aggregate, vector and stack
+ * arguments according to the native System V AMD64 or AAPCS64 ABI.
+ */
+uprobe:/path/to/application:inspect {
+    printf("%s(%s)\n", probe, args());
+}

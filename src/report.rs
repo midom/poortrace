@@ -13,6 +13,8 @@ pub struct Row {
     pub map: String,
     pub keys: Vec<Key>,
     pub value: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub float_value: Option<f64>,
     #[serde(default)]
     pub buckets: Vec<(String, i64)>,
 }
@@ -39,11 +41,21 @@ pub fn baseline(path: &std::path::Path) -> Result<Vec<Row>> {
     serde_json::from_slice(&bytes)
         .map_err(|e| format!("comparison requires a poortrace JSON report: {e}"))
 }
+fn number(row: &Row) -> f64 {
+    row.float_value.unwrap_or(row.value as f64)
+}
 fn identity(row: &Row) -> String {
     serde_json::to_string(&(&row.map, &row.keys)).unwrap()
 }
 
 pub fn render(rows: &[Row], options: &Options) -> Result<String> {
+    if rows
+        .iter()
+        .chain(&options.baseline)
+        .any(|r| r.float_value.is_some_and(|v| !v.is_finite()))
+    {
+        return Err("reports require finite floating-point values".into());
+    }
     let mut rows = rows.to_vec();
     let mut old = BTreeMap::new();
     for row in &options.baseline {
@@ -52,7 +64,12 @@ pub fn render(rows: &[Row], options: &Options) -> Result<String> {
     if !options.baseline.is_empty() {
         for row in &mut rows {
             if let Some(previous) = old.remove(&identity(row)) {
-                row.value = row.value.saturating_sub(previous.value);
+                if row.float_value.is_some() || previous.float_value.is_some() {
+                    row.float_value = Some(number(row) - number(&previous));
+                    row.value = 0;
+                } else {
+                    row.value = row.value.saturating_sub(previous.value);
+                }
                 let mut buckets: BTreeMap<_, _> = row.buckets.iter().cloned().collect();
                 for (label, count) in previous.buckets {
                     let current = buckets.entry(label).or_default();
@@ -73,6 +90,7 @@ pub fn render(rows: &[Row], options: &Options) -> Result<String> {
             if old.remove(&identity(row)).is_some() {
                 let mut missing = row.clone();
                 missing.value = missing.value.saturating_neg();
+                missing.float_value = missing.float_value.map(|v| -v);
                 for (_, count) in &mut missing.buckets {
                     *count = count.saturating_neg();
                 }
@@ -80,15 +98,28 @@ pub fn render(rows: &[Row], options: &Options) -> Result<String> {
             }
         }
     }
+    if rows
+        .iter()
+        .any(|r| r.float_value.is_some_and(|v| !v.is_finite()))
+    {
+        return Err("floating-point comparison overflow".into());
+    }
     let totals: BTreeMap<String, f64> = rows.iter().fold(BTreeMap::new(), |mut totals, row| {
-        *totals.entry(row.map.clone()).or_default() += (row.value as f64).abs();
+        *totals.entry(row.map.clone()).or_default() += number(row).abs();
         totals
     });
+    if options.percent && totals.values().any(|v| !v.is_finite()) {
+        return Err("report percentage total overflow".into());
+    }
     if options.top.is_some() {
         rows.sort_by(|a, b| {
-            a.map
-                .cmp(&b.map)
-                .then_with(|| b.value.unsigned_abs().cmp(&a.value.unsigned_abs()))
+            a.map.cmp(&b.map).then_with(|| {
+                if a.float_value.is_none() && b.float_value.is_none() {
+                    b.value.unsigned_abs().cmp(&a.value.unsigned_abs())
+                } else {
+                    number(b).abs().total_cmp(&number(a).abs())
+                }
+            })
         });
         let mut seen = BTreeMap::new();
         rows.retain(|row| {
@@ -96,6 +127,13 @@ pub fn render(rows: &[Row], options: &Options) -> Result<String> {
             *count += 1;
             *count <= options.top.unwrap()
         });
+    }
+    if options.rate
+        && rows
+            .iter()
+            .any(|row| !(number(row) / options.elapsed.max(1e-9)).is_finite())
+    {
+        return Err("report rate overflow".into());
     }
     match options.format.as_str() {
         "json" => serde_json::to_string_pretty(&rows)
@@ -148,17 +186,27 @@ pub fn render(rows: &[Row], options: &Options) -> Result<String> {
                     }
                     continue;
                 }
-                out.push_str(&format!(": {}", row.value));
+                if let Some(value) = row.float_value {
+                    out.push_str(&format!(": {value}"));
+                } else {
+                    out.push_str(&format!(": {}", row.value));
+                }
                 if options.percent {
                     out.push_str(&format!(
                         " ({:.2}%)",
-                        row.value as f64 * 100.0 / totals[&row.map].max(1.0)
+                        number(row)
+                            / if totals[&row.map] > 0.0 {
+                                totals[&row.map]
+                            } else {
+                                1.0
+                            }
+                            * 100.0
                     ));
                 }
                 if options.rate {
                     out.push_str(&format!(
                         " ({:.3}/s)",
-                        row.value as f64 / options.elapsed.max(1e-9)
+                        number(row) / options.elapsed.max(1e-9)
                     ));
                 }
                 out.push('\n');
@@ -173,6 +221,9 @@ pub fn render(rows: &[Row], options: &Options) -> Result<String> {
 }
 
 fn stacks(rows: &[Row], signed: bool) -> Result<Vec<(Vec<String>, i64)>> {
+    if rows.iter().any(|row| row.float_value.is_some()) {
+        return Err("stack profile exports require integer weights; use text or JSON for floating-point maps".into());
+    }
     let mut output = Vec::new();
     for row in rows {
         if !row.keys.iter().any(|key| key.kind == "stack") {
@@ -319,6 +370,7 @@ mod tests {
                 value: "    leaf\n    root\n".into(),
             }],
             value: 5,
+            float_value: None,
             buckets: vec![],
         }]
     }
@@ -373,12 +425,14 @@ mod tests {
             map: "h".into(),
             keys: vec![],
             value: 0,
+            float_value: None,
             buckets: vec![("[1, 2)".into(), 1), ("[2, 4)".into(), 3)],
         }];
         let old = vec![Row {
             map: "h".into(),
             keys: vec![],
             value: 0,
+            float_value: None,
             buckets: vec![("[1, 2)".into(), 2), ("[4, 8)".into(), 1)],
         }];
         let text = render(
@@ -411,6 +465,7 @@ mod tests {
                 value: "    leaf\n".into(),
             }],
             value: -3,
+            float_value: None,
             buckets: vec![],
         }];
         let svg = render(

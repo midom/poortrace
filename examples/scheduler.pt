@@ -1,0 +1,17 @@
+// Kernel event timestamps and waking context, rather than polling observations.
+// Requires tracefs/perf permission. Capture with --system-wide --record sched.jsonl.
+// For cross-CPU ordering, replay with --sort-events and this script.
+tracepoint:sched:sched_wakeup, tracepoint:sched:sched_wakeup_new {
+    $task = tp("pid");
+    @woke[$task] = nsecs;
+    @waker[$task] = tid;
+}
+tracepoint:sched:sched_switch {
+    $task = tp("next_pid");
+    if (@woke[$task] && nsecs >= @woke[$task]) {
+        @runqueue_ns[@waker[$task], $task] = hist(nsecs - @woke[$task]);
+        delete(@woke[$task]);
+        delete(@waker[$task]);
+    }
+}
+END { clear(@woke); clear(@waker); }

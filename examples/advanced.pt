@@ -1,0 +1,7 @@
+BEGIN {
+    $i = 0;
+    while ($i < 4) { @squares[$i] = $i * $i; $i++; }
+    for ($key, $value in @squares) { printf("%d: %d\n", $key, $value); }
+    $ratio = f64(7) / 2.0;
+    printf("ratio=%f\n", $ratio);
+}

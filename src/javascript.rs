@@ -1,6 +1,6 @@
 //! Read-only V8 frame decoding using the target's exported postmortem metadata.
 //! Object layouts: Node deps/v8/tools/gen-postmortem-metadata.py; ScopeInfo's
-//! optional fields are version-gated to V8 12.4's objects/scope-info.tq.
+//! optional fields are gated to verified Node 20/22/24 scope-info.tq layouts.
 use crate::{Result, memory, perf::UserRegs};
 use object::{Object, ObjectSegment, ObjectSymbol};
 use std::{
@@ -15,6 +15,7 @@ pub struct Reader {
 struct Layout {
     values: BTreeMap<String, i32>,
     version: (i32, i32),
+    interpreter_ranges: Vec<(u64, u64)>,
 }
 fn word(pid: u32, address: u64) -> Result<u64> {
     Ok(u64::from_ne_bytes(
@@ -31,10 +32,47 @@ impl Layout {
         self.values
             .get(name)
             .copied()
+            .or_else(|| {
+                // Torque's type spelling changes across V8 versions; the
+                // exported class and member still identify the same offset.
+                if name.starts_with("class_") {
+                    let (prefix, _) = name.rsplit_once("__")?;
+                    let prefix = format!("{prefix}__");
+                    self.values
+                        .iter()
+                        .find(|(key, _)| key.starts_with(&prefix))
+                        .map(|(_, value)| *value)
+                } else if matches!(name, "FirstJSFunctionType" | "LastJSFunctionType") {
+                    self.values
+                        .get("type_JSFunction__JS_FUNCTION_TYPE")
+                        .copied()
+                } else {
+                    None
+                }
+            })
             .ok_or_else(|| format!("missing V8 metadata {name}"))
     }
     fn field(&self, pid: u32, object: u64, name: &str) -> Result<u64> {
-        word(pid, add(self.object(object)?, self.get(name)?)?)
+        self.tagged(pid, add(self.object(object)?, self.get(name)?)?, object)
+    }
+    fn tagged(&self, pid: u32, address: u64, owner: u64) -> Result<u64> {
+        if self.get("TaggedSize")? == 4 {
+            let value =
+                u32::from_ne_bytes(memory::read(pid, address, 4, false)?.try_into().unwrap());
+            // V8 heap compression uses an aligned 4-GiB cage; stack pointers
+            // retain the full address, and all ordinary heap fields share its cage.
+            Ok(
+                if value & self.get("HeapObjectTagMask")? as u32
+                    == self.get("HeapObjectTag")? as u32
+                {
+                    (owner & !0xffff_ffff) | value as u64
+                } else {
+                    value as i32 as i64 as u64
+                },
+            )
+        } else {
+            word(pid, address)
+        }
     }
     fn object(&self, value: u64) -> Result<u64> {
         let tag = self.get("HeapObjectTag")? as u64;
@@ -69,7 +107,12 @@ impl Layout {
         if !(1..64).contains(&shift) {
             return Err("unsupported V8 Smi layout".into());
         }
-        Ok((value as i64) >> shift)
+        let value = if self.get("TaggedSize")? == 4 {
+            value as i32 as i64
+        } else {
+            value as i64
+        };
+        Ok(value >> shift)
     }
     fn string(&self, pid: u32, value: u64, budget: &mut usize) -> Result<String> {
         if *budget == 0 {
@@ -138,52 +181,415 @@ impl Layout {
                 budget,
             );
         }
+        if representation == self.get("SlicedStringTag")? {
+            let parent = self.field(pid, value, "class_SlicedString__parent__String")?;
+            let offset = self.smi(self.field(pid, value, "class_SlicedString__offset__SMI")?)?;
+            if !(0..=4096).contains(&offset) {
+                return Err("invalid V8 string slice offset".into());
+            }
+            let parent = self.string(pid, parent, budget)?;
+            // SlicedString offsets count UTF-16 code units, including surrogate pairs.
+            let units: Vec<_> = parent.encode_utf16().collect();
+            let units = units
+                .get(offset as usize..offset as usize + length as usize)
+                .ok_or("V8 string slice exceeds parent")?;
+            return Ok(String::from_utf16_lossy(units));
+        }
         Err("unsupported V8 string representation".into())
     }
-    fn name(&self, pid: u32, shared: u64) -> Result<String> {
+    fn name(&self, pid: u32, shared: u64) -> Result<(String, Option<i64>)> {
         let value = self.field(
             pid,
             shared,
             "class_SharedFunctionInfo__name_or_scope_info__Tagged_Object_",
         )?;
         if self.kind(pid, value)? < self.get("FirstNonstringType")? {
-            return self.string(pid, value, &mut 32);
+            return Ok((self.string(pid, value, &mut 32)?, None));
         }
         if self.kind(pid, value)? != self.get("type_ScopeInfo__SCOPE_INFO_TYPE")?
-            || self.version != (12, 4)
+            || !matches!(self.version, (11, 3) | (12, 4) | (13, 6))
         {
-            return Err("unsupported V8 ScopeInfo layout (currently V8 12.4)".into());
+            return Err("unsupported V8 ScopeInfo layout (verified V8 11.3, 12.4, 13.6)".into());
         }
         let base = self.object(value)?;
-        let flags = self.smi(word(pid, add(base, 8)?)?)? as u64;
-        let locals = self.smi(word(pid, add(base, 24)?)?)?;
-        // V8 12.4 inlines small local-name tables.
-        // Reject large scopes rather than guessing an unexported threshold.
-        if !(0..=32).contains(&locals) {
+        let size = self.get("TaggedSize")?;
+        let flags = if self.version == (13, 6) {
+            u32::from_ne_bytes(
+                memory::read(pid, add(base, size)?, 4, false)?
+                    .try_into()
+                    .unwrap(),
+            ) as u64
+        } else {
+            self.smi(self.tagged(pid, add(base, size)?, value)?)? as u64
+        };
+        let locals = self.smi(self.tagged(pid, add(base, size * 3)?, value)?)?;
+        // globals.h fixes the inline-name threshold at 75 in all verified
+        // versions. Larger scopes reserve one hash-table slot, then local info.
+        if !(0..=8192).contains(&locals) {
             return Err("V8 scope has too many context locals".into());
         }
-        let mut offset = 32 + locals as i32 * 16;
-        if flags & 15 == 3 {
-            offset += 8;
-        } // module_variable_count
+        let slots = if locals < 75 { locals * 2 } else { locals + 1 };
+        let mut offset = size * (4 + slots as i32);
+        if self.version == (13, 6) {
+            offset += size * 2;
+        } // position_info moved before locals
+        let module_scope = if self.version == (13, 6) { 5 } else { 3 };
+        if self.version != (11, 3) && flags & 15 == module_scope {
+            offset += size;
+        }
         if flags & (1 << 10) != 0 {
-            offset += 8;
+            offset += size;
         } // saved class variable
+        let mut name = String::new();
         if flags & (3 << 12) != 0 {
-            let name = word(pid, add(base, offset)?)?;
-            if let Ok(text) = self.string(pid, name, &mut 32) {
-                if !text.is_empty() {
-                    return Ok(text);
-                }
+            if let Ok(text) =
+                self.string(pid, self.tagged(pid, add(base, offset)?, value)?, &mut 32)
+            {
+                name = text;
             }
-            offset += 16;
+            offset += size * 2;
         }
         if flags & (1 << 14) != 0 {
-            return self.string(pid, word(pid, add(base, offset)?)?, &mut 32);
+            if name.is_empty() {
+                name = self.string(pid, self.tagged(pid, add(base, offset)?, value)?, &mut 32)?;
+            }
+            offset += size;
         }
-        Ok(String::new())
+        // ScopeInfo PositionInfo contains source UTF-16 offsets, not PCs.
+        // Restrict old schemas to function scopes, where its presence is guaranteed.
+        let position = if self.version == (13, 6) {
+            self.smi(self.tagged(pid, add(base, size * 4)?, value)?)
+                .ok()
+        } else if flags & 15 == 2 {
+            self.smi(self.tagged(pid, add(base, offset)?, value)?).ok()
+        } else {
+            None
+        };
+        Ok((name, position.filter(|p| *p >= 0)))
     }
-    fn frame(&self, pid: u32, function: u64) -> Result<String> {
+    fn source_line(&self, pid: u32, script: u64, position: i64) -> Result<i64> {
+        let size = self.get("TaggedSize")?;
+        // script.tq places line_offset directly after the exported name field.
+        let line_offset = self.smi(
+            self.tagged(
+                pid,
+                add(
+                    self.object(script)?,
+                    self.get("class_Script__name__Object")?
+                        .checked_add(size)
+                        .ok_or("V8 script offset overflow")?,
+                )?,
+                script,
+            )?,
+        )?;
+        if line_offset < 0 {
+            return Err("invalid V8 script line offset".into());
+        }
+        let line_ends = self.field(pid, script, "class_Script__line_ends__Object")?;
+        if self.kind(pid, line_ends).is_ok_and(|kind| {
+            self.get("type_FixedArray__FIXED_ARRAY_TYPE")
+                .is_ok_and(|expected| kind == expected)
+        }) {
+            let count =
+                self.smi(self.field(pid, line_ends, "class_FixedArrayBase__length__SMI")?)?;
+            if !(0..=1_000_000).contains(&count) {
+                return Err("invalid V8 line-end table length".into());
+            }
+            let data = add(
+                self.object(line_ends)?,
+                self.get("class_FixedArray__data__uintptr_t")?,
+            )?;
+            let (mut low, mut high) = (0, count);
+            while low < high {
+                let mid = low + (high - low) / 2;
+                let end = self.smi(
+                    self.tagged(
+                        pid,
+                        data.checked_add(mid as u64 * size as u64)
+                            .ok_or("V8 line table overflow")?,
+                        line_ends,
+                    )?,
+                )?;
+                if end < position {
+                    low = mid + 1;
+                } else {
+                    high = mid;
+                }
+            }
+            return Ok(line_offset + low + 1);
+        }
+        // Line-end arrays are initialized lazily. Read only the source prefix
+        // needed for this location, in bounded chunks, without invoking V8.
+        if position > 65536 {
+            return Err("V8 source position exceeds prefix capture limit".into());
+        }
+        let source = self.field(pid, script, "class_Script__source__Object")?;
+        let kind = self.kind(pid, source)?;
+        if kind >= self.get("FirstNonstringType")?
+            || kind & self.get("StringRepresentationMask")? != self.get("SeqStringTag")?
+        {
+            return Err("V8 source is not a sequential string".into());
+        }
+        let base = self.object(source)?;
+        let length = i32::from_ne_bytes(
+            memory::read(
+                pid,
+                add(base, self.get("class_String__length__int32_t")?)?,
+                4,
+                false,
+            )?
+            .try_into()
+            .unwrap(),
+        );
+        if length < 0 || position > length as i64 {
+            return Err("V8 source position exceeds string".into());
+        }
+        let one = kind & self.get("StringEncodingMask")? == self.get("OneByteStringTag")?;
+        let offset = self.get(if one {
+            "class_SeqOneByteString__chars__char"
+        } else {
+            "class_SeqTwoByteString__chars__char"
+        })?;
+        let bytes = position as usize * if one { 1 } else { 2 };
+        let start = add(base, offset)?;
+        let mut units = Vec::new();
+        for offset in (0..bytes).step_by(4096) {
+            let data = memory::read(
+                pid,
+                start
+                    .checked_add(offset as u64)
+                    .ok_or("V8 source overflow")?,
+                (bytes - offset).min(4096),
+                false,
+            )?;
+            if one {
+                units.extend(data.into_iter().map(u16::from));
+            } else {
+                units.extend(
+                    data.chunks_exact(2)
+                        .map(|b| u16::from_ne_bytes(b.try_into().unwrap())),
+                );
+            }
+        }
+        let mut line = line_offset + 1;
+        let mut previous = 0;
+        for unit in units {
+            if unit == 13 || unit == 0x2028 || unit == 0x2029 || unit == 10 && previous != 13 {
+                line += 1;
+            }
+            previous = unit;
+        }
+        Ok(line)
+    }
+    fn current_position(
+        &self,
+        pid: u32,
+        fp: u64,
+        pc: u64,
+        stack_word: &impl Fn(u64) -> Result<u64>,
+    ) -> Result<i64> {
+        // Trusted byte-array layouts below are verified for noncompressed V8
+        // 12.4. Require a known interpreter PC so optimized stack slots cannot
+        // accidentally be interpreted as bytecode state.
+        if self.version != (12, 4)
+            || self.get("TaggedSize")? != 8
+            || !self
+                .interpreter_ranges
+                .iter()
+                .any(|(start, end)| *start <= pc && pc < *end)
+        {
+            return Err("current position requires a verified V8 interpreted frame".into());
+        }
+        let bytecode = stack_word(add(fp, self.get("off_fp_bytecode_array")?)?)?;
+        if self.kind(pid, bytecode)? != self.get("type_BytecodeArray__BYTECODE_ARRAY_TYPE")? {
+            return Err("invalid V8 interpreted bytecode array".into());
+        }
+        let raw_offset = self.smi(stack_word(add(fp, self.get("off_fp_bytecode_offset")?)?)?)?;
+        let offset = raw_offset - self.get("class_BytecodeArray__data__uintptr_t")? as i64
+            + self.get("HeapObjectTag")? as i64;
+        let length = self.smi(self.field(pid, bytecode, "class_BytecodeArray__length__SMI")?)?;
+        if offset < 0 || offset >= length {
+            return Err("invalid V8 bytecode position".into());
+        }
+        let table = self.tagged(
+            pid,
+            add(
+                self.object(bytecode)?,
+                self.get("class_BytecodeArray__wrapper__Tagged_BytecodeWrapper_")?
+                    .checked_add(8)
+                    .ok_or("V8 bytecode offset overflow")?,
+            )?,
+            bytecode,
+        )?;
+        if self.kind(pid, table)? != self.get("type_TrustedByteArray__TRUSTED_BYTE_ARRAY_TYPE")? {
+            return Err(
+                "V8 source-position table is unavailable (use --no-enable-lazy-source-positions)"
+                    .into(),
+            );
+        }
+        let base = self.object(table)?;
+        let length = self.smi(word(pid, add(base, 8)?)?)?;
+        if !(1..=65536).contains(&length) {
+            return Err("invalid V8 source-position table length".into());
+        }
+        let mut bytes = Vec::new();
+        for offset in (0..length as usize).step_by(4096) {
+            bytes.extend(memory::read(
+                pid,
+                add(base, 16 + offset as i32)?,
+                (length as usize - offset).min(4096),
+                false,
+            )?);
+        }
+        source_position(&bytes, offset)
+    }
+    fn byte_array(&self, pid: u32, value: u64, kind: &str) -> Result<Vec<u8>> {
+        if self.kind(pid, value)? != self.get(kind)? {
+            return Err("invalid V8 byte array".into());
+        }
+        let base = self.object(value)?;
+        let length = self.smi(word(pid, add(base, 8)?)?)?;
+        if !(1..=65536).contains(&length) {
+            return Err("V8 byte array exceeds capture limit".into());
+        }
+        let mut data = Vec::new();
+        for offset in (0..length as usize).step_by(4096) {
+            data.extend(memory::read(
+                pid,
+                add(base, 16 + offset as i32)?,
+                (length as usize - offset).min(4096),
+                false,
+            )?);
+        }
+        Ok(data)
+    }
+    fn fixed_element(&self, pid: u32, array: u64, index: i32, kind: &str) -> Result<u64> {
+        if self.kind(pid, array)? != self.get(kind)? {
+            return Err("invalid V8 fixed array".into());
+        }
+        let base = self.object(array)?;
+        let length = self.smi(word(pid, add(base, 8)?)?)?;
+        if index < 0 || index as i64 >= length || length > 65536 {
+            return Err("V8 fixed array index exceeds capture limit".into());
+        }
+        word(pid, add(base, 16 + index * 8)?)
+    }
+    fn optimized_frames(
+        &self,
+        pid: u32,
+        function: u64,
+        pc: u64,
+        is_return: bool,
+    ) -> Result<String> {
+        if self.version != (12, 4) || self.get("TaggedSize")? != 8 {
+            return Err("optimized positions require noncompressed V8 12.4".into());
+        }
+        if self.get("class_Code__flags__uint32_t")?
+            != self
+                .get("class_Code__instruction_start__Address")?
+                .checked_add(8)
+                .ok_or("V8 code offset overflow")?
+        {
+            return Err("V8 sandboxed instruction pointers are unsupported".into());
+        }
+        let function_kind = self.kind(pid, function)?;
+        if function_kind < self.get("FirstJSFunctionType")?
+            || function_kind > self.get("LastJSFunctionType")?
+        {
+            return Err("not a JavaScript function".into());
+        }
+        let code = self.field(pid, function, "class_JSFunction__code__Tagged_Code_")?;
+        if self.kind(pid, code)? != self.get("type_Code__CODE_TYPE")? {
+            return Err("invalid V8 function code".into());
+        }
+        let start = self.field(pid, code, "class_Code__instruction_start__Address")?;
+        let length = u32::from_ne_bytes(
+            memory::read(
+                pid,
+                add(
+                    self.object(code)?,
+                    self.get("class_Code__instruction_size__int")?,
+                )?,
+                4,
+                false,
+            )?
+            .try_into()
+            .unwrap(),
+        ) as u64;
+        if length == 0 || length > 64 * 1024 * 1024 || pc < start || pc - start >= length {
+            return Err("PC is outside current V8 function code".into());
+        }
+        let offset = (pc - start).saturating_sub(u64::from(is_return));
+        // Code::CODE_DATA_FIELDS puts deopt and position pointers directly
+        // before the exported wrapper slot. Gate the private adjacency above.
+        let wrapper = self.get("class_Code__wrapper__Tagged_CodeWrapper_")?;
+        if !(16..=65536).contains(&wrapper) {
+            return Err("invalid V8 code wrapper offset".into());
+        }
+        let table = word(pid, add(self.object(code)?, wrapper - 8)?)?;
+        let raw = source_position_raw(
+            &self.byte_array(pid, table, "type_TrustedByteArray__TRUSTED_BYTE_ARRAY_TYPE")?,
+            offset as i64,
+        )?;
+        let mut raw = raw;
+        let shared = self.field(
+            pid,
+            function,
+            "class_JSFunction__shared__SharedFunctionInfo",
+        )?;
+        let deopt = word(pid, add(self.object(code)?, wrapper - 16)?)?;
+        let mut output = String::new();
+        let mut seen = BTreeSet::new();
+        for _ in 0..64 {
+            if raw < 0 || raw & 1 != 0 {
+                return Err("V8 position is external or invalid".into());
+            }
+            let source = ((raw >> 1) & 0x3fff_ffff) - 1;
+            if source < 0 {
+                return Err("unknown V8 script position".into());
+            }
+            let inline = ((raw >> 31) & 0xffff) - 1;
+            if inline < 0 {
+                output.push_str(&self.shared_frame(pid, shared, Some(source), "current")?);
+                return Ok(output);
+            }
+            if !seen.insert(inline) {
+                return Err("cyclic V8 inline position".into());
+            }
+            let positions = self.fixed_element(
+                pid,
+                deopt,
+                self.get("DeoptimizationDataInliningPositionsIndex")?,
+                "type_TrustedFixedArray__TRUSTED_FIXED_ARRAY_TYPE",
+            )?;
+            let data = self.byte_array(pid, positions, "type_ByteArray__BYTE_ARRAY_TYPE")?;
+            let slot = (inline as usize)
+                .checked_mul(16)
+                .ok_or("V8 inline position overflow")?;
+            let entry = data
+                .get(slot..slot + 16)
+                .ok_or("V8 inline position exceeds table")?;
+            let parent = i64::from_ne_bytes(entry[..8].try_into().unwrap());
+            let literal = i32::from_ne_bytes(entry[8..12].try_into().unwrap());
+            let literals = self.fixed_element(
+                pid,
+                deopt,
+                self.get("DeoptimizationDataLiteralArrayIndex")?,
+                "type_TrustedFixedArray__TRUSTED_FIXED_ARRAY_TYPE",
+            )?;
+            // DeoptimizationLiteralArray stores weak references to SFIs.
+            let inner = self.fixed_element(
+                pid,
+                literals,
+                literal,
+                "type_WeakFixedArray__WEAK_FIXED_ARRAY_TYPE",
+            )? & !2;
+            output.push_str(&self.shared_frame(pid, inner, Some(source), "current; inlined")?);
+            raw = parent;
+        }
+        Err("V8 inline depth exceeds64".into())
+    }
+    fn frame(&self, pid: u32, function: u64, current: Option<i64>) -> Result<String> {
         let kind = self.kind(pid, function)?;
         if kind < self.get("FirstJSFunctionType")? || kind > self.get("LastJSFunctionType")? {
             return Err("not a JavaScript function".into());
@@ -193,7 +599,21 @@ impl Layout {
             function,
             "class_JSFunction__shared__SharedFunctionInfo",
         )?;
-        let name = self.name(pid, shared)?;
+        self.shared_frame(pid, shared, current, "current")
+    }
+    fn shared_frame(
+        &self,
+        pid: u32,
+        shared: u64,
+        current: Option<i64>,
+        label: &str,
+    ) -> Result<String> {
+        if self.kind(pid, shared)?
+            != self.get("type_SharedFunctionInfo__SHARED_FUNCTION_INFO_TYPE")?
+        {
+            return Err("not a V8 shared function".into());
+        }
+        let (name, position) = self.name(pid, shared)?;
         let script = self
             .field(
                 pid,
@@ -206,6 +626,13 @@ impl Layout {
                     shared,
                     "class_SharedFunctionInfo__raw_script__Tagged_Object_",
                 )
+            })
+            .or_else(|_| {
+                self.field(
+                    pid,
+                    shared,
+                    "class_SharedFunctionInfo__script_or_debug_info__HeapObject",
+                )
             })?;
         let file = self
             .field(pid, script, "class_Script__name__Object")
@@ -216,12 +643,68 @@ impl Layout {
         } else {
             name
         };
+        let location = current
+            .or(position)
+            .and_then(|position| self.source_line(pid, script, position).ok())
+            .map(|line| {
+                if current.is_some() {
+                    format!(" [line {line}; {label}]")
+                } else {
+                    format!(" [line {line}; function start]")
+                }
+            })
+            .unwrap_or_default();
         Ok(format!(
-            "    {} ({})\n",
+            "    {} ({}){location}\n",
             name.replace(['\n', '\r', '\0'], "?"),
             file.replace(['\n', '\r', '\0'], "?")
         ))
     }
+}
+fn source_position(bytes: &[u8], target: i64) -> Result<i64> {
+    let raw = source_position_raw(bytes, target)?;
+    if raw & 1 != 0 || raw >> 31 != 0 {
+        return Err("V8 bytecode position is external or inlined".into());
+    }
+    let source = ((raw >> 1) & 0x3fff_ffff) - 1;
+    if source < 0 {
+        return Err("unknown V8 script position".into());
+    }
+    Ok(source)
+}
+fn source_position_raw(bytes: &[u8], target: i64) -> Result<i64> {
+    fn decode(bytes: &[u8], index: &mut usize) -> Result<i64> {
+        let mut value = 0u64;
+        for shift in (0..63).step_by(7) {
+            let byte = *bytes.get(*index).ok_or("truncated V8 source position")?;
+            *index += 1;
+            value |= (byte as u64 & 127) << shift;
+            if byte & 128 == 0 {
+                return Ok(((value >> 1) as i64) ^ -((value & 1) as i64));
+            }
+        }
+        Err("V8 source-position varint overflow".into())
+    }
+    let (mut index, mut offset, mut position) = (0, 0i64, 0i64);
+    let mut found = None;
+    while index < bytes.len() {
+        let code = decode(bytes, &mut index)?;
+        let delta = if code < 0 { -(code + 1) } else { code };
+        offset = offset
+            .checked_add(delta)
+            .ok_or("V8 bytecode offset overflow")?;
+        position = position
+            .checked_add(decode(bytes, &mut index)?)
+            .ok_or("V8 source offset overflow")?;
+        if offset > target {
+            break;
+        }
+        if position < 0 {
+            return Err("negative V8 source position".into());
+        }
+        found = Some(position);
+    }
+    found.ok_or_else(|| "no current JavaScript source position".into())
 }
 fn discover(pid: u32, maps: &str) -> Result<Layout> {
     let mut paths = BTreeSet::new();
@@ -265,19 +748,33 @@ fn discover(pid: u32, maps: &str) -> Result<Layout> {
             let (offset, size) = segment.file_range();
             (map.offset >= offset && map.offset - offset < size).then(|| {
                 map.start
-                    .wrapping_sub(segment.address() + map.offset - offset)
+                    .wrapping_sub(segment.address().wrapping_add(map.offset - offset))
             })
         }) else {
             continue;
         };
         let mut values = BTreeMap::new();
         let mut version = (0, 0);
+        let mut interpreter_ranges = Vec::new();
         for symbol in elf
             .symbols()
             .chain(elf.dynamic_symbols())
             .filter(|s| !s.is_undefined())
         {
             let name = symbol.name().unwrap_or("");
+            if matches!(
+                name,
+                "Builtins_InterpreterEntryTrampoline"
+                    | "Builtins_InterpreterEntryTrampolineForProfiling"
+                    | "Builtins_InterpreterEnterAtBytecode"
+                    | "Builtins_InterpreterEnterAtNextBytecode"
+            ) && symbol.size() > 0
+            {
+                let start = bias.wrapping_add(symbol.address());
+                if let Some(end) = start.checked_add(symbol.size()) {
+                    interpreter_ranges.push((start, end));
+                }
+            }
             if let Some(name) = name.strip_prefix("v8dbg_") {
                 if values.len() >= 4096 {
                     return Err("too many V8 metadata symbols".into());
@@ -304,9 +801,14 @@ fn discover(pid: u32, maps: &str) -> Result<Layout> {
             }
         }
         if values.contains_key("HeapObjectTag") {
-            let layout = Layout { values, version };
-            if layout.get("TaggedSize")? != 8 || layout.get("SystemPointerSize")? != 8 {
-                return Err("V8 pointer-compressed builds are unsupported".into());
+            let layout = Layout {
+                values,
+                version,
+                interpreter_ranges,
+            };
+            if ![4, 8].contains(&layout.get("TaggedSize")?) || layout.get("SystemPointerSize")? != 8
+            {
+                return Err("unsupported V8 pointer size".into());
             }
             return Ok(layout);
         }
@@ -357,6 +859,8 @@ impl Reader {
             word(tid, address)
         };
         let mut fp = regs.fp;
+        let mut pc = regs.ip;
+        let mut is_return = false;
         let mut output = String::new();
         for _ in 0..512 {
             if fp == 0 || fp & 7 != 0 {
@@ -364,8 +868,18 @@ impl Reader {
             }
             let function = stack_word(add(fp, layout.get("off_fp_function")?)?);
             if let Ok(function) = function {
-                if let Ok(frame) = layout.frame(pid, function) {
-                    output.push_str(&frame);
+                let frame = layout
+                    .optimized_frames(pid, function, pc, is_return)
+                    .or_else(|_| {
+                        let current = layout.current_position(pid, fp, pc, &stack_word).ok();
+                        layout.frame(pid, function, current)
+                    });
+                if let Ok(frame) = frame {
+                    let remaining = depth.min(127).saturating_sub(output.lines().count());
+                    for line in frame.lines().take(remaining) {
+                        output.push_str(line);
+                        output.push('\n');
+                    }
                     if output.lines().count() >= depth.min(127) {
                         break;
                     }
@@ -379,7 +893,9 @@ impl Reader {
             if next <= fp || next - fp > 16 * 1024 * 1024 {
                 break;
             }
+            pc = stack_word(add(fp, 8)?).unwrap_or(0);
             fp = next;
+            is_return = true;
         }
         if output.is_empty() {
             return Err(
@@ -402,7 +918,9 @@ mod tests {
     fn layout() -> Layout {
         Layout {
             version: (12, 4),
+            interpreter_ranges: Vec::new(),
             values: [
+                ("TaggedSize", 8),
                 ("HeapObjectTag", 1),
                 ("HeapObjectTagMask", 3),
                 ("class_HeapObject__map__Map", 0),
@@ -415,6 +933,9 @@ mod tests {
                 ("SeqStringTag", 0),
                 ("ConsStringTag", 1),
                 ("ThinStringTag", 5),
+                ("SlicedStringTag", 3),
+                ("class_SlicedString__parent__String", 16),
+                ("class_SlicedString__offset__SMI", 24),
                 ("class_SeqOneByteString__chars__char", 16),
                 ("class_SeqTwoByteString__chars__char", 16),
                 ("class_ConsString__first__String", 16),
@@ -428,6 +949,69 @@ mod tests {
             .map(|(k, v)| (k.into(), v))
             .collect(),
         }
+    }
+    #[test]
+    fn bytecode_source_positions_validate_varints_and_deltas() {
+        let bytes = [0, 24, 4, 20, 5, 11];
+        assert_eq!(source_position(&bytes, 0).unwrap(), 5);
+        assert_eq!(source_position(&bytes, 1).unwrap(), 5);
+        assert_eq!(source_position(&bytes, 2).unwrap(), 10);
+        assert_eq!(source_position(&bytes, 4).unwrap(), 7);
+        assert!(source_position(&[0], 0).is_err());
+        assert!(source_position(&[255; 16], 0).is_err());
+        assert!(source_position(&[], 0).is_err());
+    }
+    #[test]
+    fn compressed_heap_fields_and_signed_smis() {
+        let pid = std::process::id();
+        let mut layout = layout();
+        layout.values.insert("TaggedSize".into(), 4);
+        layout.values.insert("SmiShiftSize".into(), 0);
+        layout
+            .values
+            .insert("class_Map__instance_type__uint16_t".into(), 4);
+        layout
+            .values
+            .insert("class_String__length__int32_t".into(), 8);
+        // Keep map and object in one allocation, so they share their compression cage.
+        let mut storage = [0u64; 16];
+        let map = storage.as_ptr() as u64;
+        let object = map + 32;
+        storage[0] = 8u64 << 32;
+        storage[4] = (map as u32 + 1) as u64;
+        storage[5] = 3;
+        storage[6] = u64::from_ne_bytes(*b"abc\0\0\0\0\0");
+        std::hint::black_box(&storage);
+        assert_eq!(layout.string(pid, object + 1, &mut 32).unwrap(), "abc");
+        assert_eq!(layout.smi((-123i32 << 1) as u32 as u64).unwrap(), -123);
+    }
+    #[test]
+    fn sliced_strings_use_utf16_offsets() {
+        let pid = std::process::id();
+        let layout = layout();
+        let map = [0u64, 0];
+        let sliced_map = [0u64, 3];
+        let mut parent = Text {
+            map: map.as_ptr() as u64 + 1,
+            length: 4,
+            bytes: [0; 16],
+        };
+        for (i, unit) in "A😀B".encode_utf16().enumerate() {
+            parent.bytes[i * 2..i * 2 + 2].copy_from_slice(&unit.to_ne_bytes());
+        }
+        let slice = [
+            sliced_map.as_ptr() as u64 + 1,
+            2,
+            &parent as *const _ as u64 + 1,
+            1u64 << 32,
+        ];
+        std::hint::black_box((&parent, &slice));
+        assert_eq!(
+            layout
+                .string(pid, slice.as_ptr() as u64 + 1, &mut 32)
+                .unwrap(),
+            "😀"
+        );
     }
     #[test]
     fn strings_smis_and_malformed_objects_are_bounded() {

@@ -62,10 +62,15 @@ impl Program {
             .recorder
             .as_ref()
             .map(|_| crate::recording::Saved::capture(clause, state.stopped, event));
+        if let Some(saved) = &mut recorded {
+            saved.capture_raw(state.js_snapshot.as_ref());
+            saved.trace_fields = state.trace_fields.clone();
+        }
         state.journal.clear();
         state.stack_strings.clear();
         state.fuel = 4096;
         state.scratch.clear();
+        state.iterations.clear();
         // Handler lifetime is bounded by the Engine held by this Program. Event
         // strings stay alive throughout this synchronous invocation.
         unsafe {
@@ -79,7 +84,7 @@ impl Program {
                 }
             }
         }
-        if state.replay.as_ref().is_some_and(|queue| !queue.is_empty()) {
+        if !state.replay_lookup && state.replay.as_ref().is_some_and(|queue| !queue.is_empty()) {
             state.fail("recording has unused helper results".into());
         }
     }
@@ -183,12 +188,40 @@ impl Generator {
         }
         Ok(v.reg)
     }
+    fn truth(&mut self, expression: &Expr) -> Result<String> {
+        let value = self.expr(expression)?;
+        if value.ty == Type::Float {
+            let raw = self.float_operand(value)?;
+            let test = self
+                .value(format!("fcmp une double {raw}, 0.0"), Type::Number)
+                .reg;
+            Ok(self
+                .value(format!("zext i1 {test} to i64"), Type::Number)
+                .reg)
+        } else if value.ty == Type::Number {
+            Ok(value.reg)
+        } else {
+            Err("condition requires a number".into())
+        }
+    }
     fn infer(&self, e: &Expr) -> Type {
         Self::infer_with(e, &self.local_types)
     }
     fn infer_with(e: &Expr, types: &BTreeMap<String, Type>) -> Type {
         match e {
             Expr::String(_) => Type::String,
+            Expr::Float(_) => Type::Float,
+            Expr::Call(name, _) if matches!(name.as_str(), "f64" | "f32" | "fieldf") => Type::Float,
+            Expr::Unary(op, value) if matches!(op.as_str(), "+" | "-") => {
+                Self::infer_with(value, types)
+            }
+            Expr::Binary(op, lhs, rhs)
+                if matches!(op.as_str(), "+" | "-" | "*" | "/" | "%")
+                    && (Self::infer_with(lhs, types) == Type::Float
+                        || Self::infer_with(rhs, types) == Type::Float) =>
+            {
+                Type::Float
+            }
             Expr::Inline(arguments, body) => {
                 let mut scope = types.clone();
                 let arguments: Vec<_> = arguments
@@ -199,20 +232,42 @@ impl Generator {
                 Self::infer_with(body, &scope)
             }
             Expr::Local(name) => types.get(name).copied().unwrap_or(Type::Number),
+            Expr::Map(name, _) => types
+                .get(&format!("@{name}"))
+                .copied()
+                .unwrap_or(Type::Number),
             Expr::Builtin(n)
-                if n == "comm" || n == "probe" || n == "syscall" || n == "wait_reason" =>
+                if n == "goroutines"
+                    || n == "comm"
+                    || n == "probe"
+                    || n == "syscall"
+                    || n == "wait_reason" =>
             {
                 Type::String
             }
             Expr::Builtin(n) | Expr::Call(n, _)
-                if n == "ustack" || n == "branches" || n == "pystack" || n == "jsstack" =>
+                if n == "ustack"
+                    || n == "branches"
+                    || n == "pystack"
+                    || n == "jsstack"
+                    || n == "gostack" =>
             {
                 Type::Stack
             }
             Expr::Call(n, _)
                 if matches!(
                     n.as_str(),
-                    "usym" | "str" | "buf" | "strcat" | "substr" | "fieldstr" | "farg"
+                    "usym"
+                        | "str"
+                        | "buf"
+                        | "strcat"
+                        | "substr"
+                        | "fieldstr"
+                        | "value"
+                        | "args"
+                        | "goroutines"
+                        | "farg"
+                        | "tpstr"
                 ) =>
             {
                 Type::String
@@ -253,12 +308,17 @@ impl Generator {
         lhs: &Expr,
         agg: Aggregate,
         linear: Option<(i64, i64, i64)>,
+        value_type: Type,
     ) -> Result<()> {
         if let Expr::Map(name, keys) = lhs {
             let types: Vec<_> = keys.iter().map(|key| self.infer(key)).collect();
             if let Some(id) = self.ids.get(name) {
                 let old = &self.specs[*id];
-                if old.keys != types || old.aggregate != agg || old.linear != linear {
+                if old.keys != types
+                    || old.aggregate != agg
+                    || old.linear != linear
+                    || old.value_type != value_type
+                {
                     return Err(format!("inconsistent key types or aggregation for @{name}"));
                 }
             } else {
@@ -268,7 +328,9 @@ impl Generator {
                     keys: types,
                     aggregate: agg,
                     linear,
+                    value_type,
                 });
+                self.local_types.insert(format!("@{name}"), value_type);
             }
         }
         Ok(())
@@ -317,10 +379,52 @@ impl Generator {
                     } else {
                         None
                     };
-                    self.declare_map(lhs, agg, linear)?;
+                    let value_type = if matches!(lhs, Expr::Map(..)) {
+                        Self::aggregate(rhs)?
+                            .1
+                            .map(|e| self.infer(e))
+                            .unwrap_or(Type::Number)
+                    } else {
+                        Type::Number
+                    };
+                    if !matches!(value_type, Type::Number | Type::Float) {
+                        return Err("map values require numbers".into());
+                    }
+                    if value_type == Type::Float
+                        && matches!(agg, Aggregate::Hist | Aggregate::Lhist | Aggregate::Count)
+                    {
+                        return Err(
+                            "floating-point histograms require an explicit integer cast".into()
+                        );
+                    }
+                    self.declare_map(lhs, agg, linear, value_type)?;
                 }
-                Stmt::Increment(lhs, _) => self.declare_map(lhs, Aggregate::Set, None)?,
-                Stmt::Repeat(_, body) => self.declare_maps(body)?,
+                Stmt::Increment(lhs, _) => {
+                    let ty = if let Expr::Map(name, _) = lhs {
+                        self.ids
+                            .get(name)
+                            .map(|id| self.specs[*id].value_type)
+                            .unwrap_or(Type::Number)
+                    } else {
+                        Type::Number
+                    };
+                    self.declare_map(lhs, Aggregate::Set, None, ty)?;
+                }
+                Stmt::Repeat(_, body) | Stmt::While(_, body) => self.declare_maps(body)?,
+                Stmt::For(key, value, map, body) => {
+                    if let Some(spec) = self.ids.get(map).map(|id| &self.specs[*id]) {
+                        if let [ty] = spec.keys.as_slice() {
+                            self.local_types.insert(key.clone(), *ty);
+                        }
+                    }
+                    let value_type = self
+                        .ids
+                        .get(map)
+                        .map(|id| self.specs[*id].value_type)
+                        .unwrap_or(Type::Number);
+                    self.local_types.insert(value.clone(), value_type);
+                    self.declare_maps(body)?;
+                }
                 Stmt::If(_, yes, no) => {
                     self.declare_maps(yes)?;
                     self.declare_maps(no)?;
@@ -332,6 +436,44 @@ impl Generator {
     }
     fn local_types(&mut self, body: &[Stmt]) -> Result<()> {
         self.local_types.clear();
+        for spec in &self.specs {
+            self.local_types
+                .insert(format!("@{}", spec.name), spec.value_type);
+        }
+        fn iterators(
+            body: &[Stmt],
+            ids: &BTreeMap<String, usize>,
+            specs: &[MapSpec],
+            types: &mut BTreeMap<String, Type>,
+        ) {
+            for stmt in body {
+                match stmt {
+                    Stmt::For(key, value, map, body) => {
+                        if let Some(spec) = ids.get(map).map(|id| &specs[*id]) {
+                            if let [ty] = spec.keys.as_slice() {
+                                types.insert(key.clone(), *ty);
+                            }
+                        }
+                        types.insert(
+                            value.clone(),
+                            ids.get(map)
+                                .map(|id| specs[*id].value_type)
+                                .unwrap_or(Type::Number),
+                        );
+                        iterators(body, ids, specs, types);
+                    }
+                    Stmt::Repeat(_, body) | Stmt::While(_, body) => {
+                        iterators(body, ids, specs, types)
+                    }
+                    Stmt::If(_, yes, no) => {
+                        iterators(yes, ids, specs, types);
+                        iterators(no, ids, specs, types);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        iterators(body, &self.ids, &self.specs, &mut self.local_types);
         fn collect<'a>(body: &'a [Stmt], out: &mut Vec<(&'a str, &'a Expr)>) {
             for stmt in body {
                 match stmt {
@@ -340,7 +482,9 @@ impl Generator {
                         collect(y, out);
                         collect(n, out);
                     }
-                    Stmt::Repeat(_, body) => collect(body, out),
+                    Stmt::Repeat(_, body) | Stmt::While(_, body) | Stmt::For(_, _, _, body) => {
+                        collect(body, out)
+                    }
                     _ => {}
                 }
             }
@@ -384,7 +528,12 @@ impl Generator {
                     Stmt::Assign(Expr::Local(n), _) | Stmt::Increment(Expr::Local(n), _) => {
                         out.insert(n.clone());
                     }
-                    Stmt::Repeat(_, body) => collect(body, out),
+                    Stmt::For(key, value, _, body) => {
+                        out.insert(key.clone());
+                        out.insert(value.clone());
+                        collect(body, out);
+                    }
+                    Stmt::Repeat(_, body) | Stmt::While(_, body) => collect(body, out),
                     Stmt::If(_, y, n) => {
                         collect(y, out);
                         collect(n, out);
@@ -397,12 +546,14 @@ impl Generator {
         for (i, name) in locals.iter().enumerate() {
             let reg = format!("%local{i}");
             self.emit(format!("{reg} = alloca i64"));
-            let initial =
-                if self.local_types.get(name).copied().unwrap_or(Type::Number) == Type::Number {
-                    "0".into()
-                } else {
-                    self.expr(&Expr::String(String::new()))?.reg
-                };
+            let initial = if self.local_types.get(name).copied().unwrap_or(Type::Number)
+                != Type::String
+                && self.local_types.get(name).copied().unwrap_or(Type::Number) != Type::Stack
+            {
+                "0".into()
+            } else {
+                self.expr(&Expr::String(String::new()))?.reg
+            };
             self.emit(format!("store i64 {initial}, ptr {reg}"));
             self.locals.insert(name.clone(), reg);
         }
@@ -458,6 +609,10 @@ impl Generator {
     }
     fn expr(&mut self, expr: &Expr) -> Result<Value> {
         match expr {
+            Expr::Float(n) => Ok(Value {
+                reg: n.to_bits().to_string(),
+                ty: Type::Float,
+            }),
             Expr::Number(n) => Ok(Value {
                 reg: n.to_string(),
                 ty: Type::Number,
@@ -476,8 +631,15 @@ impl Generator {
                 Ok(self.value(format!("ptrtoint ptr @str{id} to i64"), Type::String))
             }
             Expr::Builtin(name) => {
+                if name == "goroutines" {
+                    return self.helper(53, "128".into(), 32, Type::String);
+                }
                 if name == "wait_reason" {
                     return self.helper(70, "0".into(), 0, Type::String);
+                }
+                if name == "gostack" {
+                    self.jsstack = true;
+                    return self.helper(52, "0".into(), 127, Type::Stack);
                 }
                 if name == "jsstack" {
                     self.jsstack = true;
@@ -602,7 +764,7 @@ impl Generator {
                         "call i64 @pt_map_get(ptr %state, i64 {id}, ptr {array}, i64 {})",
                         keys.len()
                     ),
-                    Type::Number,
+                    self.specs[id].value_type,
                 ))
             }
             Expr::Call(name, args)
@@ -638,6 +800,39 @@ impl Generator {
                     if op >= 3 { Type::Number } else { Type::String },
                 )
             }
+            Expr::Call(name, args) if name == "goroutines" => {
+                let (depth, limit) = match args.as_slice() {
+                    [] => (32, 128),
+                    [Expr::Number(depth), Expr::Number(limit)]
+                        if (1..=127).contains(depth) && (1..=1024).contains(limit) =>
+                    {
+                        (*depth, *limit)
+                    }
+                    _ => {
+                        return Err(
+                            "goroutines() accepts constant depth1..127 and limit1..1024".into()
+                        );
+                    }
+                };
+                self.helper(53, limit.to_string(), depth, Type::String)
+            }
+            Expr::Call(name, args) if name == "args" => {
+                let (path, function) = match args.as_slice() {
+                    [] => ("", ""),
+                    [Expr::String(path), Expr::String(function)] => {
+                        (path.as_str(), function.as_str())
+                    }
+                    _ => {
+                        return Err(
+                            "args() accepts an optional literal ELF path and function name".into(),
+                        );
+                    }
+                };
+                let descriptor =
+                    serde_json::to_string(&(path, function, "")).map_err(|e| e.to_string())?;
+                let descriptor = self.expr(&Expr::String(descriptor))?.reg;
+                Ok(self.value(format!("call i64 @pt_helper(ptr %state, ptr %event, i64 46, i64 0, i64 {descriptor})"),Type::String))
+            }
             Expr::Call(name, args) if name == "farg" || name == "sarg" => {
                 let (index, bits) = match args.as_slice() {
                     [Expr::Number(index)] if name == "sarg" && (0..16).contains(index) => {
@@ -666,10 +861,32 @@ impl Generator {
                     },
                 )
             }
+            Expr::Call(name, args) if matches!(name.as_str(), "tp" | "tpstr") => {
+                let [Expr::String(field)] = args.as_slice() else {
+                    return Err("tp/tpstr require one literal field name".into());
+                };
+                if field.is_empty() || field.len() > 256 {
+                    return Err("invalid tracepoint field name".into());
+                }
+                let pointer = self.expr(&Expr::String(field.clone()))?.reg;
+                self.helper(
+                    if name == "tp" { 80 } else { 81 },
+                    pointer,
+                    0,
+                    if name == "tp" {
+                        Type::Number
+                    } else {
+                        Type::String
+                    },
+                )
+            }
             Expr::Call(name, args)
-                if matches!(name.as_str(), "field" | "fieldstr" | "offsetof" | "sizeof") =>
+                if matches!(
+                    name.as_str(),
+                    "field" | "fieldf" | "fieldstr" | "value" | "offsetof" | "sizeof"
+                ) =>
             {
-                let read = name == "field" || name == "fieldstr";
+                let read = matches!(name.as_str(), "field" | "fieldstr" | "fieldf" | "value");
                 let address = if read {
                     let arg = args.first().ok_or("field requires an address")?;
                     self.numeric(arg)?
@@ -678,11 +895,15 @@ impl Generator {
                 };
                 let descriptors = &args[usize::from(read)..];
                 let (path, ty, field) = match descriptors {
-                    [Expr::String(ty)] if name == "sizeof" => ("", ty.as_str(), ""),
+                    [Expr::String(ty)] if name == "sizeof" || name == "value" => {
+                        ("", ty.as_str(), "")
+                    }
                     [Expr::String(ty), Expr::String(field)] if name != "sizeof" => {
                         ("", ty.as_str(), field.as_str())
                     }
-                    [Expr::String(path), Expr::String(ty)] if name == "sizeof" => {
+                    [Expr::String(path), Expr::String(ty)]
+                        if name == "sizeof" || name == "value" =>
+                    {
                         (path.as_str(), ty.as_str(), "")
                     }
                     [Expr::String(path), Expr::String(ty), Expr::String(field)]
@@ -703,9 +924,11 @@ impl Generator {
                     "field" => 40,
                     "offsetof" => 41,
                     "sizeof" => 42,
+                    "fieldf" => 44,
+                    "value" => 45,
                     _ => 43,
                 };
-                Ok(self.value(format!("call i64 @pt_helper(ptr %state, ptr %event, i64 {op}, i64 {address}, i64 {descriptor})"),if name=="fieldstr"{Type::String}else{Type::Number}))
+                Ok(self.value(format!("call i64 @pt_helper(ptr %state, ptr %event, i64 {op}, i64 {address}, i64 {descriptor})"),if name=="fieldstr" || name=="value" {Type::String}else if name=="fieldf" {Type::Float}else{Type::Number}))
             }
             Expr::Call(name, args)
                 if matches!(
@@ -754,6 +977,22 @@ impl Generator {
                 };
                 Ok(self.value(format!("call i64 @pt_helper(ptr %state, ptr %event, i64 {op}, i64 {}, i64 {second})",first.reg),if op>=15 {Type::String}else{Type::Number}))
             }
+            Expr::Call(name, args) if matches!(name.as_str(), "f64" | "f32") => {
+                let [arg] = args.as_slice() else {
+                    return Err("floating-point cast requires one argument".into());
+                };
+                let value = self.expr(arg)?;
+                let mut raw = self.float_operand(value)?;
+                if name == "f32" {
+                    let narrow = self
+                        .value(format!("fptrunc double {raw} to float"), Type::Float)
+                        .reg;
+                    raw = self
+                        .value(format!("fpext float {narrow} to double"), Type::Float)
+                        .reg;
+                }
+                Ok(self.value(format!("bitcast double {raw} to i64"), Type::Float))
+            }
             Expr::Call(name, args)
                 if matches!(
                     name.as_str(),
@@ -763,7 +1002,20 @@ impl Generator {
                 let [arg] = args.as_slice() else {
                     return Err("cast requires one integer".into());
                 };
-                let value = self.numeric(arg)?;
+                let input = self.expr(arg)?;
+                let value = if input.ty == Type::Float {
+                    self.helper(
+                        110,
+                        input.reg,
+                        i64::from(name.starts_with('u')),
+                        Type::Number,
+                    )?
+                    .reg
+                } else if input.ty == Type::Number {
+                    input.reg
+                } else {
+                    return Err("integer cast requires a number".into());
+                };
                 let bits = name[1..].parse::<u32>().unwrap();
                 if bits == 64 {
                     return Ok(Value {
@@ -787,7 +1039,10 @@ impl Generator {
                 ))
             }
             Expr::Call(name, args)
-                if name == "ustack" || name == "pystack" || name == "jsstack" =>
+                if name == "ustack"
+                    || name == "pystack"
+                    || name == "jsstack"
+                    || name == "gostack" =>
             {
                 let depth = match args.as_slice() {
                     [] => 127,
@@ -798,7 +1053,10 @@ impl Generator {
                         ));
                     }
                 };
-                if name == "jsstack" {
+                if name == "gostack" {
+                    self.jsstack = true;
+                    self.helper(52, "0".into(), depth, Type::Stack)
+                } else if name == "jsstack" {
                     self.jsstack = true;
                     self.helper(51, "0".into(), depth, Type::Stack)
                 } else if name == "pystack" {
@@ -811,6 +1069,24 @@ impl Generator {
                 "{name}() cannot be used here; aggregations must be assigned directly to maps"
             )),
             Expr::Unary(op, e) => {
+                if self.infer(e) == Type::Float {
+                    let value = self.expr(e)?;
+                    let raw = self.float_operand(value)?;
+                    return match op.as_str() {
+                        "+" => Ok(self.value(format!("bitcast double {raw} to i64"), Type::Float)),
+                        "-" => {
+                            let neg = self.value(format!("fneg double {raw}"), Type::Float).reg;
+                            Ok(self.value(format!("bitcast double {neg} to i64"), Type::Float))
+                        }
+                        "!" => {
+                            let test = self
+                                .value(format!("fcmp oeq double {raw}, 0.0"), Type::Number)
+                                .reg;
+                            Ok(self.value(format!("zext i1 {test} to i64"), Type::Number))
+                        }
+                        _ => Err("bitwise operations require integers".into()),
+                    };
+                }
                 let v = self.numeric(e)?;
                 match op.as_str() {
                     "+" => Ok(Value {
@@ -827,7 +1103,7 @@ impl Generator {
                 }
             }
             Expr::Binary(op, lhs, rhs) if op == "&&" || op == "||" => {
-                let v = self.numeric(lhs)?;
+                let v = self.truth(lhs)?;
                 let c = self.value(format!("icmp ne i64 {v}, 0"), Type::Number).reg;
                 let from = self.current.clone();
                 let next = self.label_name();
@@ -839,7 +1115,7 @@ impl Generator {
                 };
                 self.emit(format!("br i1 {c}, label %{yes}, label %{no}"));
                 self.label(&next);
-                let v = self.numeric(rhs)?;
+                let v = self.truth(rhs)?;
                 let c = self.value(format!("icmp ne i64 {v}, 0"), Type::Number).reg;
                 let v = self.value(format!("zext i1 {c} to i64"), Type::Number).reg;
                 let rhs_from = self.current.clone();
@@ -856,6 +1132,47 @@ impl Generator {
             Expr::Binary(op, lhs, rhs) => {
                 let a = self.expr(lhs)?;
                 let b = self.expr(rhs)?;
+                if a.ty == Type::Float || b.ty == Type::Float {
+                    let a = self.float_operand(a)?;
+                    let b = self.float_operand(b)?;
+                    if op == "%" {
+                        let a = self
+                            .value(format!("bitcast double {a} to i64"), Type::Number)
+                            .reg;
+                        let b = self
+                            .value(format!("bitcast double {b} to i64"), Type::Number)
+                            .reg;
+                        return Ok(self.value(format!("call i64 @pt_helper(ptr %state, ptr %event, i64 111, i64 {a}, i64 {b})"),Type::Float));
+                    }
+                    let opcode = match op.as_str() {
+                        "+" => "fadd",
+                        "-" => "fsub",
+                        "*" => "fmul",
+                        "/" => "fdiv",
+                        "%" => "frem",
+                        comparison => {
+                            let predicate = match comparison {
+                                "==" => "oeq",
+                                "!=" => "une",
+                                "<" => "olt",
+                                "<=" => "ole",
+                                ">" => "ogt",
+                                ">=" => "oge",
+                                _ => return Err("bitwise operations require integers".into()),
+                            };
+                            let comparison = self
+                                .value(format!("fcmp {predicate} double {a}, {b}"), Type::Number)
+                                .reg;
+                            return Ok(
+                                self.value(format!("zext i1 {comparison} to i64"), Type::Number)
+                            );
+                        }
+                    };
+                    let value = self
+                        .value(format!("{opcode} double {a}, {b}"), Type::Float)
+                        .reg;
+                    return Ok(self.value(format!("bitcast double {value} to i64"), Type::Float));
+                }
                 if a.ty != b.ty {
                     return Err("cannot mix strings and integers".into());
                 }
@@ -952,6 +1269,17 @@ impl Generator {
             }
         }
     }
+    fn float_operand(&mut self, value: Value) -> Result<String> {
+        match value.ty {
+            Type::Float => Ok(self
+                .value(format!("bitcast i64 {} to double", value.reg), Type::Float)
+                .reg),
+            Type::Number => Ok(self
+                .value(format!("sitofp i64 {} to double", value.reg), Type::Float)
+                .reg),
+            _ => Err("floating-point expressions require numbers".into()),
+        }
+    }
     fn array_index(&mut self, name: &str, index: &Expr) -> Result<String> {
         if self.locals.contains_key(name) {
             return Err(format!("${name} cannot be both a scalar and an array"));
@@ -984,7 +1312,11 @@ impl Generator {
                 Stmt::Assign(Expr::Map(name, keys), rhs) => {
                     let (agg, expr) = Self::aggregate(rhs)?;
                     let value = if let Some(e) = expr {
-                        self.numeric(e)?
+                        let value = self.expr(e)?;
+                        if !matches!(value.ty, Type::Number | Type::Float) {
+                            return Err("map value requires a number".into());
+                        }
+                        value.reg
                     } else {
                         "1".into()
                     };
@@ -1011,6 +1343,11 @@ impl Generator {
                 }
                 Stmt::Increment(Expr::Map(name, keys), amount) => {
                     let (id, array) = self.keys(name, keys)?;
+                    let amount = if self.specs[id].value_type == Type::Float {
+                        (*amount as f64).to_bits() as i64
+                    } else {
+                        *amount
+                    };
                     self.emit(format!("call void @pt_map_update(ptr %state, i64 {id}, ptr {array}, i64 {}, i64 {amount}, i64 2)", keys.len()));
                 }
                 Stmt::Increment(Expr::Array(name, index), amount) => {
@@ -1022,6 +1359,17 @@ impl Generator {
                     self.emit(format!("call i64 @pt_helper(ptr %state, ptr %event, i64 31, i64 {encoded}, i64 {next})"));
                 }
                 Stmt::Increment(Expr::Local(name), amount) => {
+                    if self.local_types.get(name) == Some(&Type::Float) {
+                        let next = self
+                            .expr(&Expr::Binary(
+                                "+".into(),
+                                Box::new(Expr::Local(name.clone())),
+                                Box::new(Expr::Float(*amount as f64)),
+                            ))?
+                            .reg;
+                        self.emit(format!("store i64 {next}, ptr {}", self.locals[name]));
+                        continue;
+                    }
                     let v = self.numeric(&Expr::Local(name.clone()))?;
                     let next = self
                         .value(format!("add i64 {v}, {amount}"), Type::Number)
@@ -1029,6 +1377,85 @@ impl Generator {
                     self.emit(format!("store i64 {next}, ptr {}", self.locals[name]));
                 }
                 Stmt::Increment(..) => return Err("increment requires a local or map".into()),
+                Stmt::For(key, value, map, body) => {
+                    let id = *self
+                        .ids
+                        .get(map)
+                        .ok_or_else(|| format!("map @{map} is never assigned"))?;
+                    let spec = &self.specs[id];
+                    if spec.keys.len() != 1
+                        || matches!(spec.aggregate, Aggregate::Hist | Aggregate::Lhist)
+                    {
+                        return Err(
+                            "map iteration requires one key and a scalar aggregation".into()
+                        );
+                    }
+                    let key_type = spec.keys[0];
+                    let value_type = spec.value_type;
+                    if self.local_types.get(key).copied().unwrap_or(Type::Number) != key_type
+                        || self.local_types.get(value).copied().unwrap_or(Type::Number)
+                            != value_type
+                    {
+                        return Err("map iteration local type mismatch".into());
+                    }
+                    let snapshot = self.helper(90, id.to_string(), 0, Type::Number)?.reg;
+                    let count = self.helper(93, snapshot.clone(), 0, Type::Number)?.reg;
+                    let index = self.value("alloca i64", Type::Number).reg;
+                    self.emit(format!("store i64 0, ptr {index}"));
+                    let head = self.label_name();
+                    let loop_body = self.label_name();
+                    let done = self.label_name();
+                    self.emit(format!("br label %{head}"));
+                    self.label(&head);
+                    let n = self
+                        .value(format!("load i64, ptr {index}"), Type::Number)
+                        .reg;
+                    let test = self
+                        .value(format!("icmp ult i64 {n}, {count}"), Type::Number)
+                        .reg;
+                    self.emit(format!("br i1 {test}, label %{loop_body}, label %{done}"));
+                    self.label(&loop_body);
+                    let fuel = self.helper(20, "0".into(), 0, Type::Number)?.reg;
+                    let allowed = self
+                        .value(format!("icmp ne i64 {fuel}, 0"), Type::Number)
+                        .reg;
+                    let valid = self.label_name();
+                    self.emit(format!("br i1 {allowed}, label %{valid}, label %return"));
+                    self.label(&valid);
+                    for (name, op) in [(key, 91), (value, 92)] {
+                        let item = self.value(format!("call i64 @pt_helper(ptr %state, ptr %event, i64 {op}, i64 {snapshot}, i64 {n})"), Type::Number).reg;
+                        let pointer = self.locals[name].clone();
+                        self.emit(format!("store i64 {item}, ptr {pointer}"));
+                    }
+                    self.stmts(body)?;
+                    let next = self.value(format!("add i64 {n}, 1"), Type::Number).reg;
+                    self.emit(format!("store i64 {next}, ptr {index}"));
+                    self.emit(format!("br label %{head}"));
+                    self.label(&done);
+                }
+                Stmt::While(condition, body) => {
+                    let head = self.label_name();
+                    let loop_body = self.label_name();
+                    let done = self.label_name();
+                    self.emit(format!("br label %{head}"));
+                    self.label(&head);
+                    let value = self.truth(condition)?;
+                    let test = self
+                        .value(format!("icmp ne i64 {value}, 0"), Type::Number)
+                        .reg;
+                    self.emit(format!("br i1 {test}, label %{loop_body}, label %{done}"));
+                    self.label(&loop_body);
+                    let fuel = self.helper(20, "0".into(), 0, Type::Number)?.reg;
+                    let allowed = self
+                        .value(format!("icmp ne i64 {fuel}, 0"), Type::Number)
+                        .reg;
+                    let valid = self.label_name();
+                    self.emit(format!("br i1 {allowed}, label %{valid}, label %return"));
+                    self.label(&valid);
+                    self.stmts(body)?;
+                    self.emit(format!("br label %{head}"));
+                    self.label(&done);
+                }
                 Stmt::Repeat(count, body) => {
                     let counter = self.value("alloca i64", Type::Number).reg;
                     self.emit(format!("store i64 {count}, ptr {counter}"));
@@ -1057,7 +1484,7 @@ impl Generator {
                     self.label(&done);
                 }
                 Stmt::If(e, yes, no) => {
-                    let v = self.numeric(e)?;
+                    let v = self.truth(e)?;
                     let c = self.value(format!("icmp ne i64 {v}, 0"), Type::Number).reg;
                     let y = self.label_name();
                     let n = self.label_name();

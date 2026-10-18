@@ -106,6 +106,21 @@ impl Tracer {
         }
         Ok(tracer)
     }
+    /// Attach a bounded snapshot of already-existing descendants as well as the root.
+    pub fn seize_tree(
+        pid: i32,
+        tids: impl IntoIterator<Item = i32>,
+        launched: bool,
+        include_descendants: bool,
+    ) -> Result<Self> {
+        let mut tasks: BTreeSet<i32> = tids.into_iter().collect();
+        if include_descendants {
+            tasks.extend(descendant_tasks(pid)?);
+        }
+        let mut tracer = Self::seize(pid, tasks, launched)?;
+        tracer.follow = include_descendants;
+        Ok(tracer)
+    }
     pub fn trace_syscalls(&mut self, enabled: bool) {
         self.observe_syscalls = enabled;
     }
@@ -439,4 +454,64 @@ impl Decoder {
             Ok(None)
         }
     }
+}
+
+/// Snapshot descendants through every thread's children list, with explicit bounds.
+/// Tasks can still exit or reparent while this snapshot is collected.
+pub fn descendants(pid: i32) -> Result<Vec<i32>> {
+    let mut seen = BTreeSet::from([pid]);
+    let mut queue = std::collections::VecDeque::from([pid]);
+    let mut output = Vec::new();
+    while let Some(parent) = queue.pop_front() {
+        let tasks = match std::fs::read_dir(format!("/proc/{parent}/task")) {
+            Ok(tasks) => tasks,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("discover descendants of {parent}: {error}")),
+        };
+        for task in tasks {
+            let task = task.map_err(|e| e.to_string())?;
+            let children = match std::fs::read_to_string(task.path().join("children")) {
+                Ok(text) => text,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(format!("read descendant list: {error}")),
+            };
+            for child in children
+                .split_whitespace()
+                .filter_map(|s| s.parse::<i32>().ok())
+            {
+                if seen.insert(child) {
+                    if seen.len() > 1024 {
+                        return Err("existing descendant limit (1024) exceeded".into());
+                    }
+                    output.push(child);
+                    queue.push_back(child);
+                }
+            }
+        }
+    }
+    Ok(output)
+}
+pub(crate) fn descendant_tasks(pid: i32) -> Result<Vec<i32>> {
+    let mut output = Vec::new();
+    for child in descendants(pid)? {
+        let tasks = match std::fs::read_dir(format!("/proc/{child}/task")) {
+            Ok(tasks) => tasks,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.to_string()),
+        };
+        for task in tasks {
+            if let Ok(tid) = task
+                .map_err(|e| e.to_string())?
+                .file_name()
+                .to_string_lossy()
+                .parse::<i32>()
+            {
+                output.push(tid);
+            }
+            if output.len() > 4096 {
+                return Err("existing descendant thread limit (4096) exceeded".into());
+            }
+        }
+    }
+    Ok(output)
 }

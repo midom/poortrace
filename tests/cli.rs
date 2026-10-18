@@ -371,6 +371,67 @@ fn live_syscalls_memory_and_exit_status() {
 }
 
 #[test]
+#[ignore = "requires ptrace access and a C compiler"]
+fn live_syscalls_default_and_maximum_stack_capture() {
+    let directory =
+        std::env::temp_dir().join(format!("poortrace-stack-size-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let source = directory.join("stack.c");
+    let binary = directory.join("stack");
+    std::fs::write(
+        &source,
+        r#"
+#include <unistd.h>
+__attribute__((noinline)) void leaf(void) {
+    volatile char padding[8192];
+    for (int i = 0; i < 8192; i++) padding[i] = 1;
+    write(1, "marker\n", 7);
+    if (padding[0] == 42) _exit(1);
+}
+__attribute__((noinline)) void caller(void) { leaf(); }
+int main(void) { caller(); return 0; }
+"#,
+    )
+    .unwrap();
+    let compile = Command::new("cc")
+        .args(["-O0", "-g", "-fno-omit-frame-pointer", "-o"])
+        .arg(&binary)
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(compile.status.success(), "{}", errors(&compile));
+    for maximum in [false, true] {
+        let recording = directory.join(if maximum {
+            "maximum.jsonl"
+        } else {
+            "default.jsonl"
+        });
+        let mut command = Command::new(env!("CARGO_BIN_EXE_poortrace"));
+        command.args(["-q", "-d", "10", "--record"]).arg(&recording);
+        if maximum {
+            command.args(["--stack-bytes", "32768"]);
+        }
+        let out = command
+            .args(["-e", "syscall:enter:write { printf(\"%s\",ustack); }", "--"])
+            .arg(&binary)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", errors(&out));
+        let text = output(&out);
+        assert!(text.contains("leaf") && text.contains("caller"), "{text}");
+        let (_, events) = poortrace::recording::read(&recording).unwrap();
+        assert!(
+            events.iter().any(|event| event
+                .raw
+                .as_ref()
+                .is_some_and(|raw| raw.stack_bytes.len() > 4096)),
+            "raw stack capture was truncated to helper bounds"
+        );
+    }
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 #[ignore = "requires perf user-register/stack sampling and a C compiler"]
 fn live_dwarf_unwinds_without_frame_pointers() {
     let directory = std::env::temp_dir().join(format!("poortrace-dwarf-{}", std::process::id()));

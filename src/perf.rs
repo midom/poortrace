@@ -27,6 +27,7 @@ struct Attr {
     regs_user: u64,
     stack_user: u32,
     clockid: i32,
+    regs_intr: u64,
 }
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -40,10 +41,15 @@ pub struct UserRegs {
     pub sp: u64,
     pub fp: u64,
     pub lr: u64,
+    pub runtime_g: u64,
 }
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Capture {
     pub ptrace_functions: bool,
+    pub cpu: Option<i32>,
+    pub raw: bool,
+    pub kernel: bool,
+    pub kernel_regs: bool,
     pub callchain: bool,
     pub dwarf_stack: u32,
     pub branches: bool,
@@ -69,8 +75,16 @@ pub struct Sample {
     pub preempt: bool,
     pub args: [u64; 6],
     pub retval: i64,
+    pub trace: Option<Box<TraceData>>,
+}
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TraceData {
+    pub raw: Vec<u8>,
+    pub fields: crate::kernel::Fields,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
+// Samples dominate this hot path; keep them inline rather than allocate once per record.
+#[allow(clippy::large_enum_variant)]
 pub enum Record {
     Sample(Sample),
     Comm {
@@ -98,6 +112,7 @@ pub struct PerfEvent {
     size: usize,
     tail: u64,
     capture: Capture,
+    trace_format: Option<crate::kernel::Format>,
 }
 impl PerfEvent {
     pub fn open(tid: i32, probe: &Probe, pages: usize) -> Result<Self> {
@@ -139,7 +154,7 @@ impl PerfEvent {
         on_exec: bool,
         mut capture: Capture,
     ) -> Result<Option<Self>> {
-        if tid <= 0 {
+        if tid <= 0 && !(tid == -1 && capture.cpu.is_some()) {
             return Err("perf target TID must be positive".into());
         }
         if !pages.is_power_of_two() || pages > 1024 {
@@ -155,7 +170,39 @@ impl PerfEvent {
         } else {
             None
         };
+        let trace_format = match probe {
+            Probe::Tracepoint { category, event } => {
+                Some(crate::kernel::Format::load(category, event)?)
+            }
+            _ => None,
+        };
+        let kernel_probe = match probe {
+            Probe::KernelProbe { function, ret } => {
+                Some(crate::kernel::ProbeConfig::load(function, *ret)?)
+            }
+            _ => None,
+        };
         let (kind, config, period, frequency, bp_type, config1, config2) = match probe {
+            Probe::Tracepoint { .. } => {
+                capture.raw = true;
+                capture.kernel = true;
+                (2, trace_format.as_ref().unwrap().id, 1, false, 0, 0, 0)
+            }
+            Probe::KernelProbe { ret, .. } => {
+                capture.retprobe = *ret;
+                capture.kernel = true;
+                capture.kernel_regs = true;
+                let probe = kernel_probe.as_ref().unwrap();
+                (
+                    probe.kind,
+                    probe.config,
+                    1,
+                    false,
+                    0,
+                    probe.function.as_ptr() as u64,
+                    0,
+                )
+            }
             Probe::Uprobe { ret, .. } => {
                 capture.uprobe = true;
                 capture.retprobe = *ret;
@@ -210,6 +257,8 @@ impl PerfEvent {
             SAMPLE_TYPE
                 | if capture.callchain { 1 << 5 } else { 0 }
                 | if capture.addr { 1 << 3 } else { 0 }
+                | if capture.raw { 1 << 10 } else { 0 }
+                | if capture.kernel_regs { 1 << 18 } else { 0 }
                 | if capture.branches { 1 << 11 } else { 0 }
                 | if capture.dwarf_stack != 0 || capture.uprobe {
                     1 << 12
@@ -220,22 +269,15 @@ impl PerfEvent {
         };
         let attr = Attr {
             kind,
-            size: if capture.dwarf_stack != 0 || capture.uprobe {
-                96
-            } else if capture.branches {
-                80
-            } else if bp_type != 0 {
-                72
-            } else {
-                64
-            },
+            size: if capture.kernel_regs { 104 } else { 96 },
             config,
             sample_period: period,
             sample_type,
             flags: 1
-                | 1 << 5
+                | if capture.kernel { 0 } else { 1 << 5 }
                 | 1 << 6
                 | 1 << 9
+                | 1 << 25
                 | if frequency { 1 << 10 } else { 0 }
                 | if capture.callchain { 1 << 21 } else { 0 }
                 | if on_exec { 1 << 12 } else { 0 }
@@ -255,6 +297,12 @@ impl PerfEvent {
                 0
             },
             stack_user: capture.dwarf_stack,
+            clockid: libc::CLOCK_MONOTONIC,
+            regs_intr: if capture.kernel_regs {
+                register_mask(true)
+            } else {
+                0
+            },
             ..Attr::default()
         };
         let fd = unsafe {
@@ -262,14 +310,14 @@ impl PerfEvent {
                 libc::SYS_perf_event_open,
                 &attr as *const Attr,
                 tid,
-                -1i32,
+                capture.cpu.unwrap_or(-1),
                 -1i32,
                 8u64,
             )
         };
         if fd < 0 {
             let error = io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::ESRCH) {
+            if tid > 0 && error.raw_os_error() == Some(libc::ESRCH) {
                 return Ok(None);
             }
             if capture.uprobe && matches!(error.raw_os_error(), Some(libc::EACCES | libc::EPERM)) {
@@ -278,7 +326,11 @@ impl PerfEvent {
                     open_error(tid, error)
                 ));
             }
-            return Err(open_error(tid, error));
+            return Err(if let Some(cpu) = capture.cpu {
+                format!("system-wide CPU {cpu}: {}", open_error(tid, error))
+            } else {
+                open_error(tid, error)
+            });
         }
         let fd = unsafe { OwnedFd::from_raw_fd(fd as i32) };
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
@@ -307,6 +359,7 @@ impl PerfEvent {
             size: pages * page_size,
             tail: 0,
             capture,
+            trace_format,
         };
         // UAPI offsets in perf_event_mmap_page are architecture independent.
         let offset = unsafe { event.base().add(1040).cast::<u64>().read_volatile() } as usize;
@@ -327,6 +380,9 @@ impl PerfEvent {
     }
     fn base(&self) -> *mut u8 {
         self.mapping.as_ptr().cast()
+    }
+    pub fn system_wide(&self) -> bool {
+        self.capture.cpu.is_some()
     }
     pub fn fd(&self) -> i32 {
         self.fd.as_raw_fd()
@@ -363,7 +419,12 @@ impl PerfEvent {
             }
             let mut bytes = vec![0; size];
             self.copy(self.tail, &mut bytes);
-            records.push(decode_capture(&bytes, self.capture)?);
+            let mut record = decode_capture(&bytes, self.capture)?;
+            if let (Record::Sample(sample), Some(format)) = (&mut record, &self.trace_format) {
+                let trace = sample.trace.as_mut().ok_or("missing tracepoint payload")?;
+                trace.fields = format.decode(&trace.raw)?;
+            }
+            records.push(record);
             self.tail = self.tail.wrapping_add(size as u64);
         }
         // The kernel must not reuse these bytes until all our reads complete.
@@ -418,18 +479,19 @@ fn open_error(tid: i32, error: io::Error) -> String {
 
 #[cfg(target_arch = "x86_64")]
 fn register_mask(arguments: bool) -> u64 {
-    (1 << 6)
+    (1 << 22)
+        | (1 << 6)
         | (1 << 7)
         | (1 << 8)
         | if arguments {
-            (1 << 0) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 11) | (1 << 12)
+            (1 << 0) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 16) | (1 << 17)
         } else {
             0
         }
 }
 #[cfg(target_arch = "aarch64")]
 fn register_mask(arguments: bool) -> u64 {
-    (1 << 29) | (1 << 30) | (1 << 31) | (1 << 32) | if arguments { 63 } else { 0 }
+    (1 << 28) | (1 << 29) | (1 << 30) | (1 << 31) | (1 << 32) | if arguments { 63 } else { 0 }
 }
 #[cfg(test)]
 fn decode(bytes: &[u8], callchain: bool) -> Result<Record> {
@@ -516,6 +578,18 @@ fn decode_capture(bytes: &[u8], capture: Capture) -> Result<Record> {
                     sample.callchain.push(ip);
                 }
             }
+            if capture.raw {
+                let size = u32::from_ne_bytes(c.take(4)?.try_into().unwrap()) as usize;
+                if size > 65536 {
+                    return Err("perf raw payload exceeds 64 KiB".into());
+                }
+                sample.trace = Some(Box::new(TraceData {
+                    raw: c.take(size)?.to_vec(),
+                    fields: Default::default(),
+                }));
+                let padding = (8 - c.at % 8) % 8;
+                c.take(padding)?;
+            }
             if capture.branches {
                 let count = c.word()?;
                 if count > (bytes.len().saturating_sub(c.at) / 24) as u64 {
@@ -549,9 +623,10 @@ fn decode_capture(bytes: &[u8], capture: Capture) -> Result<Record> {
                             sp: values[7],
                             ip: values[8],
                             lr: 0,
+                            runtime_g: values[22],
                         },
                         [
-                            values[5], values[4], values[3], values[2], values[11], values[12],
+                            values[5], values[4], values[3], values[2], values[16], values[17],
                         ],
                         values[0] as i64,
                     );
@@ -562,6 +637,7 @@ fn decode_capture(bytes: &[u8], capture: Capture) -> Result<Record> {
                             lr: values[30],
                             sp: values[31],
                             ip: values[32],
+                            runtime_g: values[28],
                         },
                         values[..6].try_into().unwrap(),
                         values[0] as i64,
@@ -587,6 +663,48 @@ fn decode_capture(bytes: &[u8], capture: Capture) -> Result<Record> {
                         return Err("invalid dynamic user stack size".into());
                     }
                     sample.stack = stack[..dynamic as usize].to_vec();
+                }
+            }
+            if capture.kernel_regs {
+                let abi = c.word()?;
+                if abi != 0 {
+                    if abi != 2 {
+                        return Err("only native 64-bit interrupt registers are supported".into());
+                    }
+                    let mut values = [0u64; 33];
+                    for (index, value) in values.iter_mut().enumerate() {
+                        if register_mask(true) & (1u64 << index) != 0 {
+                            *value = c.word()?;
+                        }
+                    }
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        sample.args = if capture.retprobe {
+                            [0; 6]
+                        } else {
+                            [
+                                values[5], values[4], values[3], values[2], values[16], values[17],
+                            ]
+                        };
+                        sample.retval = if capture.retprobe {
+                            values[0] as i64
+                        } else {
+                            0
+                        };
+                    }
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        sample.args = if capture.retprobe {
+                            [0; 6]
+                        } else {
+                            values[..6].try_into().unwrap()
+                        };
+                        sample.retval = if capture.retprobe {
+                            values[0] as i64
+                        } else {
+                            0
+                        };
+                    }
                 }
             }
             Record::Sample(sample)
@@ -726,6 +844,7 @@ mod tests {
             size: 4096,
             tail: 4092,
             capture: Capture::default(),
+            trace_format: None,
         };
         let bytes = record(13, &42u64.to_ne_bytes());
         for (i, b) in bytes.iter().enumerate() {
@@ -742,7 +861,8 @@ mod tests {
     }
     #[test]
     fn attr_matches_version_zero_abi() {
-        assert_eq!(size_of::<Attr>(), 96);
+        assert_eq!(size_of::<Attr>(), 104);
+        assert_eq!(std::mem::offset_of!(Attr, regs_intr), 96);
         assert_eq!(std::mem::offset_of!(Attr, regs_user), 80);
         assert_eq!(std::mem::offset_of!(Attr, flags), 40);
     }
@@ -850,7 +970,7 @@ mod extended_tests {
         #[cfg(target_arch = "aarch64")]
         assert_eq!(sample.args, [1000, 1001, 1002, 1003, 1004, 1005]);
         #[cfg(target_arch = "x86_64")]
-        assert_eq!(sample.args, [1005, 1004, 1003, 1002, 1011, 1012]);
+        assert_eq!(sample.args, [1005, 1004, 1003, 1002, 1016, 1017]);
         for length in 0..bytes.len() {
             assert!(
                 decode_capture(&record(9, &bytes[..length], 0), capture).is_err(),
@@ -891,5 +1011,77 @@ mod extended_tests {
             Record::Lost(7)
         );
         assert!(decode_capture(&record(14, &bytes[..16], 0), capture).is_err());
+    }
+}
+
+#[cfg(test)]
+mod kernel_capture_tests {
+    use super::*;
+    fn header(payload: &[u8]) -> Vec<u8> {
+        let mut bytes = 9u32.to_ne_bytes().to_vec();
+        bytes.extend(0u16.to_ne_bytes());
+        bytes.extend(((payload.len() + 8) as u16).to_ne_bytes());
+        bytes.extend(payload);
+        bytes
+    }
+    #[test]
+    fn raw_fields_precede_branch_and_interrupt_registers() {
+        let capture = Capture {
+            raw: true,
+            branches: true,
+            kernel_regs: true,
+            ..Default::default()
+        };
+        let mut data = Vec::new();
+        for value in [0x1234u64, (43 << 32) | 42, 100, 3, 1] {
+            data.extend(value.to_ne_bytes());
+        }
+        data.extend(4u32.to_ne_bytes());
+        data.extend([1u8, 2, 3, 4]);
+        data.extend(1u64.to_ne_bytes());
+        data.extend(0x11u64.to_ne_bytes());
+        data.extend(0x22u64.to_ne_bytes());
+        data.extend(0u64.to_ne_bytes());
+        data.extend(2u64.to_ne_bytes());
+        for i in 0..33 {
+            if register_mask(true) & (1u64 << i) != 0 {
+                data.extend((i as u64 + 100).to_ne_bytes());
+            }
+        }
+        let Record::Sample(sample) = decode_capture(&header(&data), capture).unwrap() else {
+            panic!()
+        };
+        assert_eq!(sample.trace.unwrap().raw, [1, 2, 3, 4]);
+        assert_eq!(
+            sample.branches,
+            [Branch {
+                from: 0x11,
+                to: 0x22
+            }]
+        );
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(sample.args, [100, 101, 102, 103, 104, 105]);
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(sample.args, [105, 104, 103, 102, 116, 117]);
+        let Record::Sample(returned) = decode_capture(
+            &header(&data),
+            Capture {
+                retprobe: true,
+                ..capture
+            },
+        )
+        .unwrap() else {
+            panic!()
+        };
+        assert_eq!(returned.args, [0; 6]);
+        assert_eq!(returned.retval, 100);
+        for length in 0..data.len() {
+            assert!(
+                decode_capture(&header(&data[..length]), capture).is_err(),
+                "{length}"
+            );
+        }
+        data[40..44].copy_from_slice(&u32::MAX.to_ne_bytes());
+        assert!(decode_capture(&header(&data), capture).is_err());
     }
 }

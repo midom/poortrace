@@ -31,6 +31,18 @@ struct Args {
     /// Attach to all currently visible threads of this process
     #[arg(short = 'p', long, value_parser = clap::value_parser!(i32).range(1..), conflicts_with_all = ["command", "shell_command"])]
     pid: Option<i32>,
+    /// Trace all online CPUs; requires host permission and perf-only probes
+    #[arg(long, conflicts_with_all=["pid","command","shell_command","track_threads","follow_forks","attach_descendants"])]
+    system_wide: bool,
+    /// Include kernel execution in perf counters/sampling (host policy applies)
+    #[arg(long)]
+    include_kernel: bool,
+    /// Also seize descendants that already exist when attaching with -p
+    #[arg(long, requires = "pid")]
+    attach_descendants: bool,
+    /// Refresh function bindings at mapping syscall stops (adds ptrace overhead)
+    #[arg(long)]
+    track_loads: bool,
     /// Launch a command through /bin/sh -c
     #[arg(short = 'c', long = "command", conflicts_with = "command")]
     shell_command: Option<String>,
@@ -50,7 +62,7 @@ struct Args {
     #[arg(long, conflicts_with_all=["replay","stat"])]
     record: Option<PathBuf>,
     /// Replay a recording without attaching to a live target
-    #[arg(long, conflicts_with_all=["expression","script","pid","shell_command","command","stat","check","emit_llvm","list","list_functions","list_usdt","track_threads","follow_forks","live","window","duration"])]
+    #[arg(long, conflicts_with_all=["pid","shell_command","command","stat","check","emit_llvm","list","list_functions","list_usdt","track_threads","follow_forks","attach_descendants","system_wide","track_loads","live","window","duration"])]
     replay: Option<PathBuf>,
     /// Sort recorded events globally by monotonic timestamp during replay
     #[arg(long, requires = "replay")]
@@ -85,7 +97,7 @@ struct Args {
     )]
     stat_events: Vec<String>,
     /// Report encoding; script printf output is separate when --output is used
-    #[arg(long, default_value="text",value_parser=["text","json","folded","speedscope","flamegraph"])]
+    #[arg(long, default_value="text",value_parser=["text","json","folded","speedscope","speedscope-timeline","flamegraph"])]
     output_format: String,
     /// Write the final report to a file
     #[arg(short = 'o', long)]
@@ -176,7 +188,13 @@ fn main() {
         }
     }
 }
-fn run(args: Args) -> Result<i32> {
+fn run(mut args: Args) -> Result<i32> {
+    if args.attach_descendants {
+        args.follow_forks = true;
+    }
+    if args.output_format == "speedscope-timeline" && args.replay.is_none() {
+        return Err("--output-format speedscope-timeline requires --replay".into());
+    }
     if let Some(path) = &args.list_usdt {
         for site in poortrace::usdt::sites(args.pid.unwrap_or(std::process::id() as i32), path)? {
             println!(
@@ -205,7 +223,7 @@ fn run(args: Args) -> Result<i32> {
     }
     if args.list {
         println!(
-            "BEGIN\nEND\ninterval:{{ns,us,ms,s,hz}}:N\nprofile:{{ns,us,ms,s,hz}}:N\nwait:{{ms,s,hz}}:N\nwakeup:{{ms,s,hz}}:N\nuprobe:PATH:FUNCTION\nuretprobe:PATH:FUNCTION\nusdt:PATH:PROVIDER:NAME"
+            "BEGIN\nEND\ntracepoint:CATEGORY:EVENT\nkprobe:FUNCTION\nkretprobe:FUNCTION\ninterval:{{ns,us,ms,s,hz}}:N\nprofile:{{ns,us,ms,s,hz}}:N\nwait:{{ms,s,hz}}:N\nwakeup:{{ms,s,hz}}:N\nuprobe:PATH:FUNCTION\nuretprobe:PATH:FUNCTION\nusdt:PATH:PROVIDER:NAME"
         );
         println!(
             "offcpu\nwatchpoint:ADDRESS:LENGTH:{{r,w,rw,x}}\nraw:CONFIG[:PERIOD]\npmu:NAME:CONFIG[:PERIOD]\ncache:CACHE:OP:RESULT[:PERIOD]\nsyscall:{{enter,exit}}:{{NAME,NUMBER,*}}"
@@ -362,6 +380,34 @@ fn run(args: Args) -> Result<i32> {
         }
         clause.probes = probes;
     }
+    if args.system_wide
+        && program.clauses.iter().any(|c| {
+            c.probes.iter().any(|(_, p)| {
+                matches!(
+                    p,
+                    Probe::Syscall { .. }
+                        | Probe::Uprobe { .. }
+                        | Probe::Wait(_)
+                        | Probe::Wakeup(_)
+                        | Probe::OffCpu
+                )
+            })
+        })
+    {
+        return Err("--system-wide supports perf sampling, tracepoint/kernel probes, and lifecycle/timer handlers; ptrace, wait/wakeup, uprobes and offcpu require a target".into());
+    }
+    if args.track_loads && args.uprobe_backend != "ptrace" {
+        return Err("--track-loads requires --uprobe-backend ptrace".into());
+    }
+    if args.track_loads
+        && !program.clauses.iter().any(|c| {
+            c.probes
+                .iter()
+                .any(|(_, p)| matches!(p, Probe::Uprobe { .. }))
+        })
+    {
+        return Err("--track-loads requires ptrace function/USDT probes".into());
+    }
     if (program.has_perf()
         || program.has_syscalls()
         || program.clauses.iter().any(|c| {
@@ -369,6 +415,7 @@ fn run(args: Args) -> Result<i32> {
                 .iter()
                 .any(|(_, p)| matches!(p, Probe::Wait(_) | Probe::Wakeup(_)))
         }))
+        && !args.system_wide
         && args.pid.is_none()
         && args.command.is_empty()
         && args.shell_command.is_none()
@@ -389,9 +436,11 @@ fn run(args: Args) -> Result<i32> {
     }
     let capture = Capture {
         addr: true,
-        callchain: program.needs_ustack(),
+        kernel: args.include_kernel,
+        callchain: program.needs_ustack() || args.record.is_some(),
         dwarf_stack: if (args.stack_mode == "dwarf" && program.needs_ustack())
             || program.needs_jsstack()
+            || args.record.is_some()
         {
             args.stack_bytes
         } else {
@@ -411,8 +460,12 @@ fn run(args: Args) -> Result<i32> {
     } else {
         Some(Child::spawn(&command, args.follow_forks)?)
     };
-    let target = child.as_ref().map(|c| c.pid).or(args.pid);
-    if target.is_some_and(|pid| !alive(pid)) {
+    let target = child
+        .as_ref()
+        .map(|c| c.pid)
+        .or(args.pid)
+        .or(args.system_wide.then_some(-1));
+    if target.is_some_and(|pid| pid != -1 && !alive(pid)) {
         return Err("target process does not exist or has exited".into());
     }
     let mut streams = Vec::new();
@@ -474,7 +527,8 @@ fn run(args: Args) -> Result<i32> {
     let mut lost = 0u64;
     let mut window_start = Instant::now();
     let mut live_start = Instant::now();
-    let mut waits = poortrace::wait::Poller::new(&program, args.stack_bytes as usize);
+    let mut waits =
+        poortrace::wait::Poller::new(&program, args.stack_bytes as usize, args.record.is_some());
     let result = (|| -> Result<()> {
         let mut refresh = Instant::now();
         loop {
@@ -491,7 +545,7 @@ fn run(args: Args) -> Result<i32> {
             if args.duration.is_some_and(|d| start.elapsed() >= d) {
                 break;
             }
-            if target.is_some_and(|p| !alive(p)) {
+            if target.is_some_and(|p| p != -1 && !alive(p)) {
                 break;
             }
             if refresh.elapsed() >= Duration::from_millis(100) {
@@ -628,10 +682,14 @@ fn attach(
     if !program.has_perf() {
         return Ok(());
     }
-    let tids = match threads(pid) {
-        Ok(t) => t,
-        Err(_) if !alive(pid) => return Ok(()),
-        Err(e) => return Err(e),
+    let tids = if pid == -1 {
+        poortrace::kernel::online_cpus()?.into_iter().collect()
+    } else {
+        match threads(pid) {
+            Ok(t) => t,
+            Err(_) if !alive(pid) => return Ok(()),
+            Err(e) => return Err(e),
+        }
     };
     for (clause, c) in program.clauses.iter().enumerate() {
         for (name, probe) in &c.probes {
@@ -646,7 +704,13 @@ fn attach(
                 {
                     continue;
                 }
-                let event = PerfEvent::try_open_config(*tid, probe, pages, on_exec, capture);
+                let actual_tid = if pid == -1 { -1 } else { *tid };
+                let event_capture = Capture {
+                    cpu: if pid == -1 { Some(*tid) } else { None },
+                    ..capture
+                };
+                let event =
+                    PerfEvent::try_open_config(actual_tid, probe, pages, on_exec, event_capture);
                 match event {
                     Ok(Some(event)) => {
                         if enabled {
@@ -664,7 +728,7 @@ fn attach(
                         });
                     }
                     Ok(None) => {}
-                    Err(_) if !alive(*tid) => {}
+                    Err(_) if pid != -1 && !alive(*tid) => {}
                     Err(e) => return Err(format!("{name}: {e}")),
                 }
             }
@@ -703,7 +767,11 @@ fn drain(
                     Some(sample.pid as i32),
                     &stream.name,
                     Some(&sample),
-                    Some(&stream.comm),
+                    if stream.event.system_wide() {
+                        None
+                    } else {
+                        Some(&stream.comm)
+                    },
                 ),
                 Record::Comm { tid, name, .. } if tid as i32 == stream.tid => {
                     stream.comm = CString::new(name).unwrap()
@@ -782,7 +850,9 @@ fn invoke(
     sample: Option<&poortrace::perf::Sample>,
     comm: Option<&std::ffi::CStr>,
 ) {
-    let pid = target.unwrap_or_else(|| std::process::id() as i32);
+    let pid = target
+        .filter(|pid| *pid >= 0)
+        .unwrap_or_else(|| std::process::id() as i32);
     let tid = sample.map(|s| s.tid as i32).unwrap_or(pid);
     let fallback;
     let comm = match comm {
@@ -793,7 +863,7 @@ fn invoke(
         }
     };
     let name = CString::new(name).unwrap();
-    let frames = if program.needs_ustack() {
+    let frames = if program.needs_ustack() || state.recorder.is_some() {
         sample
             .map(|sample| state.unwind_sample(sample))
             .unwrap_or_default()
@@ -816,13 +886,18 @@ fn invoke(
     event.nsecs = sample.map(|s| s.time).unwrap_or_else(monotonic_ns);
     event.ip = sample.map(|s| s.ip).unwrap_or(0);
     event.period = sample.map(|s| s.period).unwrap_or(0);
-    state.js_snapshot = if program.needs_jsstack() {
+    state.trace_fields = sample
+        .and_then(|sample| sample.trace.as_ref())
+        .map(|trace| trace.fields.clone())
+        .unwrap_or_default();
+    state.js_snapshot = if program.needs_jsstack() || state.recorder.is_some() {
         sample.and_then(|sample| sample.regs.map(|regs| (regs, sample.stack.clone())))
     } else {
         None
     };
     program.invoke(clause, state, &event);
     state.js_snapshot = None;
+    state.trace_fields.clear();
 }
 fn invoke_kind(program: &Program, state: &mut State<'_>, target: Option<i32>, begin: bool) {
     for (id, c) in program.clauses.iter().enumerate() {
@@ -1045,9 +1120,27 @@ fn run_stat(args: &Args) -> Result<i32> {
         .as_ref()
         .map(|c| c.pid)
         .or(args.pid)
-        .ok_or("--stat requires -p PID or a command")?;
-    let mut monitor = if args.follow_forks || args.track_threads {
-        let mut monitor = poortrace::syscall::Tracer::seize(pid, threads(pid)?, child.is_some())?;
+        .or(args.system_wide.then_some(-1))
+        .ok_or("--stat requires -p PID, a command, or --system-wide")?;
+    let open_group = |id: i32, on_exec: bool| {
+        if args.system_wide {
+            poortrace::counters::Group::open_on_cpu(id, &args.stat_events, args.include_kernel)
+        } else {
+            poortrace::counters::Group::open_with_kernel(
+                id,
+                &args.stat_events,
+                on_exec,
+                args.include_kernel,
+            )
+        }
+    };
+    let mut monitor = if !args.system_wide && (args.follow_forks || args.track_threads) {
+        let mut monitor = poortrace::syscall::Tracer::seize_tree(
+            pid,
+            threads(pid)?,
+            child.is_some(),
+            args.attach_descendants,
+        )?;
         monitor.follow_forks(args.follow_forks);
         monitor.trace_syscalls(false);
         Some(monitor)
@@ -1055,11 +1148,20 @@ fn run_stat(args: &Args) -> Result<i32> {
         None
     };
     let mut groups = std::collections::BTreeMap::new();
-    for tid in threads(pid)? {
-        groups.insert(
-            tid,
-            poortrace::counters::Group::open(tid, &args.stat_events, child.is_some())?,
-        );
+    let initial_targets = monitor
+        .as_ref()
+        .map(|monitor| monitor.targets())
+        .unwrap_or_else(|| BTreeSet::from([pid]));
+    let initial_tids: BTreeSet<_> = if args.system_wide {
+        poortrace::kernel::online_cpus()?.into_iter().collect()
+    } else {
+        initial_targets
+            .into_iter()
+            .flat_map(|pid| threads(pid).unwrap_or_default())
+            .collect()
+    };
+    for tid in initial_tids {
+        groups.insert(tid, open_group(tid, child.is_some())?);
     }
     for group in groups.values() {
         if child.is_none() {
@@ -1078,7 +1180,7 @@ fn run_stat(args: &Args) -> Result<i32> {
             track_owned_descendants(&mut child, args.follow_forks, monitor.targets())?;
             for tid in monitor.take_discovered() {
                 if let std::collections::btree_map::Entry::Vacant(entry) = groups.entry(tid) {
-                    let group = poortrace::counters::Group::open(tid, &args.stat_events, false)?;
+                    let group = open_group(tid, false)?;
                     group.enable()?;
                     entry.insert(group);
                 }
@@ -1102,7 +1204,7 @@ fn run_stat(args: &Args) -> Result<i32> {
         } else if let Some(child) = &mut child {
             child.check()?.is_some()
         } else {
-            !alive(pid)
+            !args.system_wide && !alive(pid)
         };
         if done
             || INTERRUPTED.load(Ordering::Relaxed)
@@ -1115,10 +1217,14 @@ fn run_stat(args: &Args) -> Result<i32> {
                 .as_ref()
                 .map(|monitor| monitor.targets())
                 .unwrap_or_else(|| BTreeSet::from([pid]));
-            let tids: BTreeSet<_> = targets
-                .into_iter()
-                .flat_map(|target| threads(target).unwrap_or_default())
-                .collect();
+            let tids: BTreeSet<_> = if args.system_wide {
+                poortrace::kernel::online_cpus()?.into_iter().collect()
+            } else {
+                targets
+                    .into_iter()
+                    .flat_map(|target| threads(target).unwrap_or_default())
+                    .collect()
+            };
             let dead: Vec<_> = groups
                 .keys()
                 .filter(|tid| !tids.contains(tid))
@@ -1131,12 +1237,17 @@ fn run_stat(args: &Args) -> Result<i32> {
             }
             for tid in tids {
                 if let std::collections::btree_map::Entry::Vacant(entry) = groups.entry(tid) {
-                    match poortrace::counters::Group::open(tid, &args.stat_events, false) {
+                    match open_group(tid, false) {
                         Ok(group) => {
                             group.enable()?;
                             entry.insert(group);
                         }
-                        Err(_) if !std::path::Path::new(&format!("/proc/{tid}")).exists() => {}
+                        Err(_)
+                            if !args.system_wide
+                                && !std::path::Path::new(&format!("/proc/{tid}")).exists() => {}
+                        Err(_)
+                            if args.system_wide
+                                && !poortrace::kernel::online_cpus()?.contains(&tid) => {}
                         Err(error) => return Err(error),
                     }
                 }
@@ -1225,15 +1336,22 @@ fn run_syscalls(args: &Args, program: &Program) -> Result<i32> {
         .map(|child| child.pid)
         .or(args.pid)
         .ok_or("syscall probes require a target")?;
-    let mut tracer = poortrace::syscall::Tracer::seize(pid, threads(pid)?, child.is_some())?;
+    let mut tracer = poortrace::syscall::Tracer::seize_tree(
+        pid,
+        threads(pid)?,
+        child.is_some(),
+        args.attach_descendants,
+    )?;
     tracer.follow_forks(args.follow_forks);
     tracer.trace_syscalls(program.has_syscalls());
     let capture = Capture {
         ptrace_functions: false,
         addr: true,
-        callchain: program.needs_ustack(),
+        kernel: args.include_kernel,
+        callchain: program.needs_ustack() || args.record.is_some(),
         dwarf_stack: if (args.stack_mode == "dwarf" && program.needs_ustack())
             || program.needs_jsstack()
+            || args.record.is_some()
         {
             args.stack_bytes
         } else {
@@ -1243,6 +1361,21 @@ fn run_syscalls(args: &Args, program: &Program) -> Result<i32> {
         ..Default::default()
     };
     let mut streams = Vec::new();
+    if args.attach_descendants {
+        for target in tracer.targets() {
+            if target != pid {
+                attach(
+                    program,
+                    target,
+                    args.mmap_pages,
+                    &mut streams,
+                    false,
+                    false,
+                    capture,
+                )?;
+            }
+        }
+    }
     attach(
         program,
         pid,
@@ -1274,7 +1407,8 @@ fn run_syscalls(args: &Args, program: &Program) -> Result<i32> {
     let start = Instant::now();
     let mut window_start = start;
     let mut live_start = start;
-    let mut waits = poortrace::wait::Poller::new(program, args.stack_bytes as usize);
+    let mut waits =
+        poortrace::wait::Poller::new(program, args.stack_bytes as usize, args.record.is_some());
     let mut timers: Vec<_> = program
         .clauses
         .iter()
@@ -1331,17 +1465,27 @@ fn run_syscalls(args: &Args, program: &Program) -> Result<i32> {
             }
             let idle = events.is_empty();
             for event in events {
+                let selected = program.clauses.iter().any(|clause| {
+                    clause.probes.iter().any(|(_, probe)| {
+                        matches!(probe, Probe::Syscall { enter, number }
+                            if *enter == event.enter
+                                && number.is_none_or(|number| number == event.number))
+                    })
+                });
+                if !selected {
+                    tracer.resume(event.tid)?;
+                    continue;
+                }
                 let name = poortrace::syscall::name(event.number);
                 let syscall_name = CString::new(name).unwrap();
                 let event_pid = poortrace::syscall::tgid(event.tid).unwrap_or(pid);
                 let comm = task_comm(event_pid, event.tid);
-                let frames = if program.needs_ustack() {
+                let frames = if program.needs_ustack() || args.record.is_some() {
                     let regs = poortrace::functions::user_registers(event.tid)?;
-                    let stack = poortrace::memory::read(
+                    let stack = poortrace::memory::read_stack(
                         event.tid as u32,
                         regs.sp,
                         args.stack_bytes as usize,
-                        true,
                     )
                     .unwrap_or_default();
                     state.unwind_sample(&poortrace::perf::Sample {
@@ -1356,6 +1500,7 @@ fn run_syscalls(args: &Args, program: &Program) -> Result<i32> {
                 } else {
                     Vec::new()
                 };
+                let event_nsecs = monotonic_ns();
                 for (id, clause) in program.clauses.iter().enumerate() {
                     for (probe_name, probe) in &clause.probes {
                         if let Probe::Syscall { enter, number } = probe {
@@ -1370,7 +1515,7 @@ fn run_syscalls(args: &Args, program: &Program) -> Result<i32> {
                                 .with_ustack(&frames);
                             sample.pid = event_pid as u64;
                             sample.tid = event.tid as u64;
-                            sample.nsecs = monotonic_ns();
+                            sample.nsecs = event_nsecs;
                             sample.ip = event.ip;
                             sample.sysno = event.number as u64;
                             sample.retval = event.retval;
@@ -1509,16 +1654,24 @@ fn run_functions(args: &Args, program: &Program) -> Result<i32> {
             }
         }
     }
-    let mut tracer =
-        poortrace::functions::Tracer::seize(pid, threads(pid)?, &specs, child.is_some())?;
+    let mut tracer = poortrace::functions::Tracer::seize_tree(
+        pid,
+        threads(pid)?,
+        &specs,
+        child.is_some(),
+        args.attach_descendants,
+    )?;
     tracer.trace_syscalls(program.has_syscalls());
+    tracer.track_loads(args.track_loads);
     tracer.follow_forks(args.follow_forks);
     let capture = Capture {
         ptrace_functions: true,
         addr: true,
-        callchain: program.needs_ustack(),
+        kernel: args.include_kernel,
+        callchain: program.needs_ustack() || args.record.is_some(),
         dwarf_stack: if (args.stack_mode == "dwarf" && program.needs_ustack())
             || program.needs_jsstack()
+            || args.record.is_some()
         {
             args.stack_bytes
         } else {
@@ -1528,6 +1681,21 @@ fn run_functions(args: &Args, program: &Program) -> Result<i32> {
         ..Default::default()
     };
     let mut streams = Vec::new();
+    if args.attach_descendants {
+        for target in tracer.targets() {
+            if target != pid {
+                attach(
+                    program,
+                    target,
+                    args.mmap_pages,
+                    &mut streams,
+                    false,
+                    false,
+                    capture,
+                )?;
+            }
+        }
+    }
     attach(
         program,
         pid,
@@ -1559,7 +1727,8 @@ fn run_functions(args: &Args, program: &Program) -> Result<i32> {
     let start = Instant::now();
     let mut window_start = start;
     let mut live_start = start;
-    let mut waits = poortrace::wait::Poller::new(program, args.stack_bytes as usize);
+    let mut waits =
+        poortrace::wait::Poller::new(program, args.stack_bytes as usize, args.record.is_some());
     let mut timers: Vec<_> = program
         .clauses
         .iter()
@@ -1638,6 +1807,9 @@ fn run_functions(args: &Args, program: &Program) -> Result<i32> {
                 } else {
                     vec![bindings[event.binding].clone()]
                 };
+                if destinations.is_empty() {
+                    continue;
+                }
                 let syscall_name = CString::new(
                     event
                         .syscall
@@ -1648,12 +1820,11 @@ fn run_functions(args: &Args, program: &Program) -> Result<i32> {
                 .unwrap();
                 let event_pid = poortrace::syscall::tgid(event.tid).unwrap_or(pid);
                 let comm = task_comm(event_pid, event.tid);
-                let frames = if program.needs_ustack() {
-                    let stack = poortrace::memory::read(
+                let frames = if program.needs_ustack() || args.record.is_some() {
+                    let stack = poortrace::memory::read_stack(
                         event.tid as u32,
                         event.regs.sp,
                         args.stack_bytes as usize,
-                        true,
                     )
                     .unwrap_or_default();
                     state.unwind_sample(&poortrace::perf::Sample {
@@ -1668,6 +1839,7 @@ fn run_functions(args: &Args, program: &Program) -> Result<i32> {
                 } else {
                     Vec::new()
                 };
+                let event_nsecs = monotonic_ns();
                 for (id, name) in destinations {
                     let name = CString::new(name).unwrap();
                     let mut sample = Event::new(&comm, &name)
@@ -1676,7 +1848,7 @@ fn run_functions(args: &Args, program: &Program) -> Result<i32> {
                     sample.sysno = event.syscall.as_ref().map(|e| e.number as u64).unwrap_or(0);
                     sample.pid = event_pid as u64;
                     sample.tid = event.tid as u64;
-                    sample.nsecs = monotonic_ns();
+                    sample.nsecs = event_nsecs;
                     sample.ip = event.regs.ip;
                     sample.args = event.args;
                     sample.retval = event.retval;
@@ -1790,8 +1962,69 @@ fn configure_record(state: &mut State<'_>, args: &Args, program: &Program) -> Re
 }
 fn run_replay(args: &Args, path: &std::path::Path) -> Result<i32> {
     let (header, mut events) = poortrace::recording::read(path)?;
-    let program = Program::compile(&header.source)?;
-    if args.sort_events {
+    let alternate = args.expression.is_some() || args.script.is_some();
+    if args.output_format == "speedscope-timeline" {
+        if alternate {
+            return Err("timeline export uses captured stacks; omit an alternate script".into());
+        }
+        let report = poortrace::recording::timeline_speedscope(&events)?;
+        if let Some(path) = &args.output {
+            std::fs::write(path, report).map_err(|e| e.to_string())?;
+        } else {
+            use std::io::Write;
+            io::stdout()
+                .write_all(report.as_bytes())
+                .map_err(|e| e.to_string())?;
+        }
+        return Ok(0);
+    }
+    if alternate {
+        events = poortrace::recording::coalesce(events);
+        let pid = events.first().map(|e| e.pid).unwrap_or(0);
+        let tid = events.first().map(|e| e.tid).unwrap_or(0);
+        let first = events.iter().map(|e| e.nsecs).min().unwrap_or(0);
+        let last = events.iter().map(|e| e.nsecs).max().unwrap_or(first);
+        let mut begin = poortrace::recording::Saved::lifecycle("BEGIN", pid, tid, first);
+        let mut end = poortrace::recording::Saved::lifecycle("END", pid, tid, last);
+        let mut middle = Vec::new();
+        for event in events {
+            match event.probe.as_str() {
+                "BEGIN" => begin.helpers.extend(event.helpers),
+                "END" => end.helpers.extend(event.helpers),
+                _ => middle.push(event),
+            }
+        }
+        if args.sort_events {
+            middle.sort_by_key(|e| e.nsecs);
+        }
+        events = std::iter::once(begin)
+            .chain(middle)
+            .chain(std::iter::once(end))
+            .collect();
+    }
+    let source = if let Some(expression) = &args.expression {
+        expression.clone()
+    } else if let Some(script) = &args.script {
+        use std::io::Read;
+        let mut source = String::new();
+        if script.as_os_str() == "-" {
+            io::stdin()
+                .take(262145)
+                .read_to_string(&mut source)
+                .map_err(|e| e.to_string())?;
+        } else {
+            std::fs::File::open(script)
+                .map_err(|e| e.to_string())?
+                .take(262145)
+                .read_to_string(&mut source)
+                .map_err(|e| e.to_string())?;
+        }
+        source
+    } else {
+        header.source
+    };
+    let program = Program::compile(&source)?;
+    if args.sort_events && !alternate {
         events.sort_by_key(|event| event.nsecs);
     }
     let mut state = program.state(io::stdout());
@@ -1799,14 +2032,62 @@ fn run_replay(args: &Args, path: &std::path::Path) -> Result<i32> {
     state.max_entries = args.max_map_entries as usize;
     let mut first = u64::MAX;
     let mut last = 0;
+    let mut exited = false;
     for saved in events {
-        if saved.clause >= program.clauses.len() {
-            return Err("recording clause index is out of range".into());
+        if alternate && exited && saved.probe != "END" {
+            continue;
+        }
+        let actual_probe = saved.actual_probe();
+        let destinations: Vec<usize> = if alternate {
+            program
+                .clauses
+                .iter()
+                .enumerate()
+                .filter_map(|(id, clause)| {
+                    clause
+                        .probes
+                        .iter()
+                        .any(|(name, probe)| match probe {
+                            Probe::Syscall { enter, number } => {
+                                actual_probe.starts_with(if *enter {
+                                    "syscall:enter:"
+                                } else {
+                                    "syscall:exit:"
+                                }) && number.is_none_or(|number| number as u64 == saved.sysno)
+                            }
+                            _ => {
+                                name == &actual_probe
+                                    || poortrace::uprobe::matches(name, &actual_probe)
+                            }
+                        })
+                        .then_some(id)
+                })
+                .collect()
+        } else {
+            if saved.clause >= program.clauses.len() {
+                return Err("recording clause index is out of range".into());
+            }
+            vec![saved.clause]
+        };
+        if destinations.is_empty() {
+            continue;
         }
         let comm = CString::new(saved.comm).map_err(|e| e.to_string())?;
-        let probe = CString::new(saved.probe).map_err(|e| e.to_string())?;
+        let probe = CString::new(if alternate { actual_probe } else { saved.probe })
+            .map_err(|e| e.to_string())?;
         let syscall = CString::new(saved.syscall).map_err(|e| e.to_string())?;
-        let mut event = Event::new(&comm, &probe).with_syscall(&syscall);
+        let branches: Vec<_> = saved
+            .branches
+            .iter()
+            .map(|p| poortrace::perf::Branch {
+                from: p[0],
+                to: p[1],
+            })
+            .collect();
+        let mut event = Event::new(&comm, &probe)
+            .with_syscall(&syscall)
+            .with_ustack(&saved.stack)
+            .with_branches(&branches);
         event.pid = saved.pid;
         event.tid = saved.tid;
         event.cpu = saved.cpu;
@@ -1822,10 +2103,35 @@ fn run_replay(args: &Args, path: &std::path::Path) -> Result<i32> {
         event.args = saved.args;
         first = first.min(event.nsecs);
         last = last.max(event.nsecs);
-        state.stopped = saved.stopped;
-        state.replay_helpers(saved.helpers);
-        program.invoke(saved.clause, &mut state, &event);
-        state.flush()?;
+        state.trace_fields = saved.trace_fields;
+        state.js_snapshot = saved.raw.and_then(|raw| {
+            (raw.architecture == std::env::consts::ARCH).then(|| {
+                (
+                    poortrace::perf::UserRegs {
+                        ip: raw.registers[0],
+                        sp: raw.registers[1],
+                        fp: raw.registers[2],
+                        lr: raw.registers[3],
+                        runtime_g: raw.runtime_g,
+                    },
+                    raw.stack_bytes,
+                )
+            })
+        });
+        for id in destinations {
+            state.stopped = if alternate { false } else { saved.stopped };
+            if alternate {
+                state.replay_captured_helpers(saved.helpers.clone());
+            } else {
+                state.replay_helpers(saved.helpers.clone());
+            }
+            program.invoke(id, &mut state, &event);
+            state.flush()?;
+            if alternate && state.stopped {
+                exited = true;
+                break;
+            }
+        }
     }
     finish_report(
         &mut state,
@@ -1846,7 +2152,7 @@ fn dispatch_waits(
         if state.stopped {
             break;
         }
-        let frames = if program.needs_ustack() {
+        let frames = if program.needs_ustack() || state.recorder.is_some() {
             let stack = (*snapshot.stack).clone();
             state.unwind_sample(&poortrace::perf::Sample {
                 pid: snapshot.pid,

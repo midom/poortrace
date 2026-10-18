@@ -138,7 +138,7 @@ fn malformed_and_inconsistent_scripts_are_rejected() {
         "BEGIN { $x = comm; $x = 3; }",
         "BEGIN { printf(\"%d\", missing); }",
         "BEGIN { printf(\"%d\", $missing); }",
-        "kprobe:do_sys_open { @x++; }",
+        "kprobe:bad-name { @x++; }",
         "profile:hz:0 { @x++; }",
         "BEGIN { /* unterminated",
         "BEGIN { printf(\"bad\\q\"); }",
@@ -417,6 +417,7 @@ fn javascript_stack_types_depth_and_recorded_results() {
                     value: 0,
                     length,
                     number: 0,
+                    descriptor: None,
                     text: Some("    leaf (example.js)\n".into()),
                     error: None,
                 })
@@ -429,4 +430,206 @@ fn javascript_stack_types_depth_and_recorded_results() {
     let text = String::from_utf8(output).unwrap();
     assert!(text.contains("leaf (example.js)"));
     assert!(text.contains(": 1"));
+}
+
+#[test]
+fn while_and_map_iteration_are_bounded_and_snapshot_values() {
+    let text = execute(
+        r#"BEGIN {
+        $i=0; while ($i<4) { @numbers[$i]=$i+1; $i++; }
+        for ($key,$value in @numbers) { @total=$value+@total; delete(@numbers[$key]); }
+        @names["a"]=2; @names["b"]=3;
+        for ($name,$amount in @names) { printf("%s=%d\n",$name,$amount); @names[$name]=99; }
+        @empty[1]=1; clear(@empty);
+        for ($unused,$zero in @empty) { @bad++; }
+        while (0) { @bad++; }
+    }"#,
+        &[0],
+    );
+    assert!(text.contains("@total: 10"), "{text}");
+    assert!(text.contains("a=2\nb=3\n"), "{text}");
+    assert!(!text.contains("@numbers["), "{text}");
+    assert!(!text.contains("@bad"), "{text}");
+    let program = Program::compile("BEGIN { while(1) { @x++; } }").unwrap();
+    let mut state = program.state(Vec::new());
+    program.invoke(0, &mut state, &Event::new(c"x", c"x"));
+    assert!(
+        state
+            .error
+            .as_ref()
+            .is_some_and(|e| e.contains("loop iterations")),
+        "{:?}",
+        state.error
+    );
+    for source in [
+        "BEGIN { @x[1,2]++; for($k,$v in @x) { @y++; } }",
+        "BEGIN { @x[1]=hist(2); for($k,$v in @x) { @y++; } }",
+        "BEGIN { @x[1]++; for($k,$k in @x) { @y++; } }",
+        "BEGIN { while(\"x\") { @x++; } }",
+    ] {
+        assert!(Program::compile(source).is_err(), "{source}");
+    }
+}
+
+#[test]
+fn tracepoint_helpers_are_typed_and_validate_missing_fields() {
+    let program =
+        Program::compile(r#"BEGIN { printf("%d %s\n",tp("value"),tpstr("name")); }"#).unwrap();
+    let mut output = Vec::new();
+    {
+        let mut state = program.state(&mut output);
+        state
+            .trace_fields
+            .insert("value".into(), poortrace::kernel::Value::Integer(42));
+        state.trace_fields.insert(
+            "name".into(),
+            poortrace::kernel::Value::String("worker".into()),
+        );
+        program.invoke(0, &mut state, &Event::new(c"x", c"x"));
+        state.flush().unwrap();
+    }
+    assert_eq!(String::from_utf8(output).unwrap(), "42 worker\n");
+    let mut state = program.state(Vec::new());
+    program.invoke(0, &mut state, &Event::new(c"x", c"x"));
+    assert!(
+        state
+            .error
+            .as_ref()
+            .is_some_and(|e| e.contains("unavailable"))
+    );
+}
+
+#[test]
+fn floating_point_locals_arithmetic_comparisons_and_casts() {
+    let text = execute(
+        r#"fn square($x)=$x*$x; BEGIN {
+       $x=1.25; $x+=2.5; $x++; $x--;
+       printf("%g %f %e %d %d %d %d %g\n",square($x),f64(2)/4,-0.5,3.0<4,3==3.0,!0.0,i64(-3.75),f32(1.25));
+       printf("%g\n",5.5%2.0);
+       $i=0.0; while($i<3) { $i++; } printf("%g\n",$i);
+       printf("%d %d %d\n",(0.0/0.0)!=0.0,(0.0/0.0)==(0.0/0.0),1.0&&2.0);
+    }"#,
+        &[0],
+    );
+    assert_eq!(
+        text,
+        "14.0625 0.500000 -5.000000e-1 1 1 1 -3 1.25\n1.5\n3\n1 0 1\n"
+    );
+    for source in [
+        "BEGIN { printf(\"%g\",1.0 & 2); }",
+        "BEGIN { $x=1e999; }",
+        "BEGIN { $x=1.25; $x=1; }",
+    ] {
+        assert!(Program::compile(source).is_err(), "{source}");
+    }
+}
+
+#[test]
+fn floating_point_maps_and_snapshot_iteration() {
+    let text = execute(
+        r#"BEGIN {
+        @set=1.25; @set++; @set--;
+        @sum=sum(1.5); @sum=sum(2.25);
+        @min=min(2.5); @min=min(-1.25);
+        @max=max(-1.5); @max=max(2.25);
+        @avg=avg(1.0); @avg=avg(2.0);
+        @values["x"]=1.25; @values["y"]=2.5;
+        for($key,$value in @values) { printf("%s=%.2f\n",$key,$value); }
+        printf("read=%.2f missing=%g\n",@sum,@values["missing"]);
+    }"#,
+        &[0],
+    );
+    for expected in [
+        "@set: 1.25",
+        "@sum: 3.75",
+        "@min: -1.25",
+        "@max: 2.25",
+        "@avg: 1.5",
+        "x=1.25\ny=2.50\n",
+        "read=3.75 missing=0",
+    ] {
+        assert!(text.contains(expected), "{expected}: {text}");
+    }
+    for source in ["BEGIN { @x=1.0; @x=1; }", "BEGIN { @x=hist(1.0); }"] {
+        assert!(Program::compile(source).is_err(), "{source}");
+    }
+    let program = Program::compile("BEGIN { @x=1.0/0.0; }").unwrap();
+    let mut state = program.state(Vec::new());
+    program.invoke(0, &mut state, &Event::new(c"x", c"x"));
+    assert!(
+        state
+            .error
+            .as_ref()
+            .is_some_and(|e| e.contains("remain finite"))
+    );
+}
+
+#[test]
+fn go_stacks_and_goroutine_snapshots_replay_without_a_runtime() {
+    let program =
+        Program::compile(r#"BEGIN { $s=gostack(2); printf("%s%s",$s,goroutines(8,16)); }"#)
+            .unwrap();
+    assert!(program.needs_jsstack());
+    let mut output = Vec::new();
+    {
+        let mut state = program.state(&mut output);
+        state.replay_helpers(vec![
+            poortrace::recording::Helper {
+                op: 52,
+                value: 0,
+                length: 2,
+                number: 0,
+                text: Some("goroutine 1\n    main.leaf\n".into()),
+                error: None,
+                descriptor: None,
+            },
+            poortrace::recording::Helper {
+                op: 53,
+                value: 16,
+                length: 8,
+                number: 0,
+                text: Some("goroutine 2\n    main.parkedLeaf\n".into()),
+                error: None,
+                descriptor: None,
+            },
+        ]);
+        program.invoke(0, &mut state, &Event::new(c"go", c"synthetic"));
+        state.flush().unwrap();
+    }
+    let text = String::from_utf8(output).unwrap();
+    assert!(text.contains("main.leaf"));
+    assert!(text.contains("main.parkedLeaf"));
+    for expression in [
+        "gostack(0)",
+        "gostack(128)",
+        "goroutines(0,10)",
+        "goroutines(2,1025)",
+        "goroutines(2)",
+    ] {
+        assert!(
+            Program::compile(&format!("BEGIN {{printf(\"%s\",{expression});}}")).is_err(),
+            "{expression}"
+        );
+    }
+}
+
+#[test]
+fn floating_point_keys_have_numeric_order_and_signed_zero_identity() {
+    let text = execute(
+        r#"BEGIN {
+        @keys[-2.0]=2; @keys[-1.0]=1; @keys[0.0]=3; @keys[-0.0]=4; @keys[1.0]=5;
+        for($key,$value in @keys) {printf("%g:%d\n",$key,$value);}
+    }"#,
+        &[0],
+    );
+    assert!(text.starts_with("-2:2\n-1:1\n0:4\n1:5\n"), "{text}");
+    let program = Program::compile("BEGIN { @x[0.0/0.0]++; }").unwrap();
+    let mut state = program.state(Vec::new());
+    program.invoke(0, &mut state, &Event::new(c"x", c"x"));
+    assert!(
+        state
+            .error
+            .as_ref()
+            .is_some_and(|e| e.contains("keys must be finite"))
+    );
 }
