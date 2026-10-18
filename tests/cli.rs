@@ -1145,3 +1145,320 @@ fn live_usdt_discovery_for_pid() {
     drop(fixture);
     std::fs::remove_dir_all(directory).unwrap();
 }
+
+#[test]
+fn short_alias_cli_checks_and_missing_process_diagnostics() {
+    let out = trace(&["-q", "-e", "i:ms:1 { @ticks=count(); exit(); }"]);
+    assert!(out.status.success(), "{}", errors(&out));
+    assert!(output(&out).contains("@ticks: 1"));
+    for source in ["u:*http* {}", "ur:http_work {}", "u:*.so:http_work {}"] {
+        let out = trace(&["--check", "-e", source]);
+        assert!(out.status.success(), "{}", errors(&out));
+        let out = trace(&["-q", "-e", source]);
+        assert!(!out.status.success());
+        assert!(errors(&out).contains("require -p PID"), "{}", errors(&out));
+    }
+}
+
+#[test]
+#[ignore = "requires ptrace access and a native C compiler"]
+fn live_uprobes_process_wildcards_and_aliases() {
+    use std::io::{BufRead, BufReader};
+    let (directory, binary) = compile_functions("implicit-aliases");
+    let mut child = Command::new(&binary)
+        .arg("attach")
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    struct Target(std::process::Child);
+    impl Drop for Target {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut target = Target(child);
+    let mut ready = String::new();
+    stdout.read_line(&mut ready).unwrap();
+    assert!(!ready.is_empty());
+    let pid = target.0.id().to_string();
+    let journal = directory.join("run.jsonl");
+    let script = "u:*traced_ad*,u:traced_add { @entries=count(); } ur:traced_ad* { @returns=count(); @values=sum(retval); }";
+    let out = Command::new(env!("CARGO_BIN_EXE_poortrace"))
+        .args(["-q", "-p", &pid, "-d", "0.05", "--record"])
+        .arg(&journal)
+        .args(["-e", script])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", errors(&out));
+    let text = output(&out);
+    assert!(
+        text.contains("@entries:") && text.contains("@returns:"),
+        "{text}"
+    );
+    let archive = poortrace::recording::read_full(&journal).unwrap();
+    assert!(
+        archive
+            .events
+            .iter()
+            .any(|e| e.probe.starts_with("uprobe:") && e.probe.contains("traced_add"))
+    );
+    assert!(
+        archive
+            .events
+            .iter()
+            .any(|e| e.probe.starts_with("uretprobe:") && e.probe.contains("traced_add"))
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_poortrace"))
+        .args(["-q", "--replay"])
+        .arg(&journal)
+        .args(["-e", script])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", errors(&out));
+    assert_eq!(output(&out), text);
+    let image_pattern = format!(
+        "u:{:?}:traced_ad* {{ @image=count(); }}",
+        format!("{}/*", directory.display())
+    );
+    let out = trace(&["-q", "-p", &pid, "-d", "0.02", "-e", &image_pattern]);
+    assert!(out.status.success(), "{}", errors(&out));
+    assert!(output(&out).contains("@image:"), "{}", output(&out));
+    let out = trace(&[
+        "-q",
+        "-p",
+        &pid,
+        "-d",
+        "0.03",
+        "-e",
+        "u:libc.so*:usleep { @library=count(); }",
+    ]);
+    assert!(out.status.success(), "{}", errors(&out));
+    assert!(output(&out).contains("@library:"), "{}", output(&out));
+    let out = trace(&[
+        "-q",
+        "-p",
+        &pid,
+        "-e",
+        "u:*poortrace_nonexistent_symbol* {}",
+    ]);
+    assert!(!out.status.success());
+    assert!(
+        errors(&out).contains("matched no symbols"),
+        "{}",
+        errors(&out)
+    );
+    assert!(target.0.try_wait().unwrap().is_none());
+    drop(target);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn probe_budget_counts_bindings_across_clauses() {
+    for args in [vec![], vec!["--max-probes", "0"], vec!["--max-probes", "2"]] {
+        let mut invocation = args;
+        invocation.extend(["-q", "-e", "i:ms:1 { exit(); } END {}"]);
+        let out = trace(&invocation);
+        assert!(out.status.success(), "{}", errors(&out));
+    }
+    let out = trace(&["--max-probes", "1", "-e", "i:ms:1 { exit(); } END {}"]);
+    assert!(!out.status.success());
+    assert!(
+        errors(&out).contains("expanded probe limit (1)"),
+        "{}",
+        errors(&out)
+    );
+    for option in ["--max-probes", "--max-breakpoints"] {
+        let out = trace(&[option, "-1", "-e", "BEGIN {}"]);
+        assert!(!out.status.success());
+    }
+}
+
+#[test]
+#[ignore = "requires ptrace access and a native C compiler"]
+fn live_uprobes_large_probe_sets_and_resource_limits() {
+    use std::io::{BufRead, BufReader};
+    let directory =
+        std::env::temp_dir().join(format!("poortrace-large-probes-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let source = directory.join("large.c");
+    let binary = directory.join("large");
+    let mut code =
+        String::from("#include <stdio.h>\n#include <unistd.h>\n#include <sys/prctl.h>\n");
+    for index in 0..1536 {
+        code.push_str(&format!("__attribute__((noinline)) int poortrace_large_{index}(int x) {{ return x + {index}; }}\n"));
+    }
+    code.push_str("int main(void) { prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY); puts(\"ready\"); fflush(stdout); volatile int sink; for (;;) { sink = poortrace_large_1535(1); (void)sink; usleep(1000); } }\n");
+    std::fs::write(&source, code).unwrap();
+    let compiled = Command::new("cc")
+        .args(["-O0", "-g", "-fno-omit-frame-pointer"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .unwrap();
+    assert!(compiled.status.success(), "{}", errors(&compiled));
+    struct Target(std::process::Child);
+    impl Drop for Target {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut target = Target(
+        Command::new(&binary)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut ready = String::new();
+    BufReader::new(target.0.stdout.take().unwrap())
+        .read_line(&mut ready)
+        .unwrap();
+    assert_eq!(ready.trim(), "ready");
+    let pid = target.0.id().to_string();
+    let script = "u:poortrace_large_*,u:poortrace_large_* { @hits=count(); }";
+    for (options, success, diagnostic) in [
+        (
+            vec!["--max-probes", "1024"],
+            false,
+            "expanded probe limit (1024)",
+        ),
+        (
+            vec!["--max-breakpoints", "1024"],
+            false,
+            "breakpoint limit (1024)",
+        ),
+        (vec![], true, ""),
+        (
+            vec!["--max-probes", "1536", "--max-breakpoints", "1536"],
+            true,
+            "",
+        ),
+        (
+            vec![
+                "--reliable",
+                "--max-probes",
+                "1536",
+                "--max-breakpoints",
+                "1536",
+            ],
+            true,
+            "",
+        ),
+        (
+            vec!["--max-probes", "0", "--max-breakpoints", "0"],
+            true,
+            "",
+        ),
+    ] {
+        let mut arguments = vec!["-q", "-p", &pid, "-d", "0.04", "-e", script];
+        arguments.extend(options);
+        let out = trace(&arguments);
+        assert_eq!(
+            out.status.success(),
+            success,
+            "{arguments:?}: {}",
+            errors(&out)
+        );
+        if success {
+            assert!(output(&out).contains("@hits:"), "{}", output(&out));
+        } else {
+            assert!(errors(&out).contains(diagnostic), "{}", errors(&out));
+        }
+        assert!(target.0.try_wait().unwrap().is_none());
+    }
+    // Entry and return bindings share one entry address, but the dynamic return
+    // trap requires a second slot. Failure must restore text before detaching.
+    let returns = "u:poortrace_large_1535 {} ur:poortrace_large_1535 { @returns=count(); }";
+    let out = trace(&[
+        "-q",
+        "-p",
+        &pid,
+        "-d",
+        "0.04",
+        "--max-breakpoints",
+        "1",
+        "-e",
+        returns,
+    ]);
+    assert!(!out.status.success());
+    assert!(
+        errors(&out).contains("breakpoint limit (1)"),
+        "{}",
+        errors(&out)
+    );
+    let out = trace(&[
+        "-q",
+        "-p",
+        &pid,
+        "-d",
+        "0.04",
+        "--max-breakpoints",
+        "2",
+        "-e",
+        returns,
+    ]);
+    assert!(out.status.success(), "{}", errors(&out));
+    assert!(output(&out).contains("@returns:"), "{}", output(&out));
+    assert!(target.0.try_wait().unwrap().is_none());
+    drop(target);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+#[ignore = "requires ptrace access and a native C compiler"]
+fn live_uprobes_hot_loop_counts_and_timer_progress() {
+    let directory = std::env::temp_dir().join(format!("poortrace-hot-loop-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let binary = directory.join("hot-loop");
+    let compiled = Command::new("cc")
+        .args(["-O2", "-g", "-pthread", "-fno-omit-frame-pointer"])
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/function_throughput.c"
+        ))
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .unwrap();
+    assert!(compiled.status.success(), "{}", errors(&compiled));
+    let script = format!(
+        "u:{0:?}:throughput_hit {{ @entries=count(); }} ur:{0:?}:throughput_hit {{ @returns=count(); @values=sum(retval); }} interval:ms:1 {{ @ticks=count(); }}",
+        binary.to_str().unwrap()
+    );
+    for threads in ["1", "12"] {
+        for reliable in [false, true] {
+            let mut args = vec!["-q", "-d", "10", "-e", &script];
+            if reliable {
+                args.push("--reliable");
+            }
+            args.extend(["--", binary.to_str().unwrap(), "1000", threads]);
+            let out = trace(&args);
+            assert!(
+                out.status.success(),
+                "threads={threads}, reliable={reliable}: {}",
+                errors(&out)
+            );
+            let text = output(&out);
+            for expected in [
+                "@entries: 1000",
+                "@returns: 1000",
+                "@values: 500500",
+                "@ticks:",
+                "total=500500",
+            ] {
+                assert!(
+                    text.lines().any(|line| if expected == "@ticks:" {
+                        line.starts_with(expected)
+                    } else {
+                        line == expected
+                    }),
+                    "threads={threads}, reliable={reliable}: {text}"
+                );
+            }
+        }
+    }
+    std::fs::remove_dir_all(directory).unwrap();
+}

@@ -1,7 +1,11 @@
 //! Resolve user function symbols to executable ELF file offsets for the perf uprobe PMU.
 use crate::Result;
 use object::{Object, ObjectSegment, ObjectSymbol, SegmentFlags, SymbolKind};
-use std::{collections::BTreeSet, ffi::CString, io::Read};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    ffi::CString,
+    io::Read,
+};
 
 pub struct Resolved {
     pub path: CString,
@@ -10,21 +14,78 @@ pub struct Resolved {
     pub config: u64,
 }
 pub fn locate(tid: i32, path: &str, function: &str, ret: bool) -> Result<Resolved> {
-    let target = if path.starts_with('/') {
-        format!("/proc/{tid}/root{path}")
-    } else {
-        path.to_string()
-    };
-    let file = std::fs::File::open(&target).map_err(|e| format!("uprobe {path}: {e}"))?;
-    if file.metadata().map_err(|e| e.to_string())?.len() > 128 * 1024 * 1024 {
-        return Err("uprobe ELF file exceeds 128 MiB".into());
+    locate_many(tid, &[(path, function, ret)])?
+        .pop()
+        .ok_or_else(|| "missing resolved probe".into())
+}
+
+/// Resolve a batch with one ELF read/parse and one symbol index per image.
+/// Results retain the input order, including duplicate bindings.
+pub fn locate_many(tid: i32, specs: &[(&str, &str, bool)]) -> Result<Vec<Resolved>> {
+    let mut images = BTreeMap::<&str, Vec<usize>>::new();
+    for (index, (path, _, _)) in specs.iter().enumerate() {
+        images.entry(path).or_default().push(index);
     }
-    let mut bytes = Vec::new();
-    file.take(128 * 1024 * 1024 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|e| e.to_string())?;
-    let object =
-        object::File::parse(bytes.as_slice()).map_err(|e| format!("uprobe ELF {path}: {e}"))?;
+    let mut results: Vec<Option<Resolved>> = (0..specs.len()).map(|_| None).collect();
+    for (path, indices) in images {
+        let target = if path.starts_with('/') {
+            format!("/proc/{tid}/root{path}")
+        } else {
+            path.to_string()
+        };
+        let file = std::fs::File::open(&target).map_err(|e| format!("uprobe {path}: {e}"))?;
+        if file.metadata().map_err(|e| e.to_string())?.len() > 128 * 1024 * 1024 {
+            return Err("uprobe ELF file exceeds 128 MiB".into());
+        }
+        let mut bytes = Vec::new();
+        file.take(128 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| e.to_string())?;
+        if bytes.len() > 128 * 1024 * 1024 {
+            return Err("uprobe ELF file exceeds 128 MiB".into());
+        }
+        let object =
+            object::File::parse(bytes.as_slice()).map_err(|e| format!("uprobe ELF {path}: {e}"))?;
+        let mut symbols = BTreeMap::<String, BTreeSet<(u64, u64)>>::new();
+        if indices.iter().any(|&index| {
+            let function = specs[index].1;
+            !function.starts_with("0x") && !function.starts_with("__sdt__")
+        }) {
+            for symbol in object.symbols().chain(object.dynamic_symbols()) {
+                if symbol.kind() != SymbolKind::Text || symbol.is_undefined() {
+                    continue;
+                }
+                if let Ok(name) = symbol.name() {
+                    let value = (symbol.address(), symbol.size());
+                    symbols.entry(name.into()).or_default().insert(value);
+                    let demangled = crate::symbols::demangle(name);
+                    if demangled != name {
+                        symbols.entry(demangled).or_default().insert(value);
+                    }
+                }
+            }
+        }
+        for index in indices {
+            let (_, function, ret) = specs[index];
+            results[index] = Some(locate_object(
+                &object, &symbols, &target, path, function, ret,
+            )?);
+        }
+    }
+    results
+        .into_iter()
+        .map(|r| r.ok_or_else(|| "missing resolved probe".into()))
+        .collect()
+}
+
+fn locate_object(
+    object: &object::File<'_>,
+    symbols: &BTreeMap<String, BTreeSet<(u64, u64)>>,
+    target: &str,
+    path: &str,
+    function: &str,
+    ret: bool,
+) -> Result<Resolved> {
     if !object.is_64() {
         return Err("uprobes require a native 64-bit ELF target".into());
     }
@@ -50,17 +111,7 @@ pub fn locate(tid: i32, path: &str, function: &str, ret: bool) -> Result<Resolve
             .and_then(|value| value.checked_add(delta))
             .ok_or("invalid uprobe file offset")?
     } else {
-        let candidates: BTreeSet<_> = object
-            .symbols()
-            .chain(object.dynamic_symbols())
-            .filter(|symbol| symbol.kind() == SymbolKind::Text && !symbol.is_undefined())
-            .filter(|symbol| {
-                symbol
-                    .name()
-                    .is_ok_and(|raw| raw == name || crate::symbols::demangle(raw) == name)
-            })
-            .map(|symbol| (symbol.address(), symbol.size()))
-            .collect();
+        let candidates = symbols.get(name).cloned().unwrap_or_default();
         let addresses: BTreeSet<_> = candidates.iter().map(|(address, _)| *address).collect();
         if addresses.len() != 1 {
             return Err(format!(
@@ -114,13 +165,22 @@ pub fn locate(tid: i32, path: &str, function: &str, ret: bool) -> Result<Resolve
     })
 }
 pub fn resolve(tid: i32, path: &str, function: &str, ret: bool) -> Result<Resolved> {
-    let mut resolved = locate(tid, path, function, ret)?;
+    resolve_many(tid, &[(path, function, ret)])?
+        .pop()
+        .ok_or_else(|| "missing resolved probe".into())
+}
+/// Batch ELF and PMU metadata resolution for perf function probes.
+pub fn resolve_many(tid: i32, specs: &[(&str, &str, bool)]) -> Result<Vec<Resolved>> {
+    if specs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut resolved = locate_many(tid, specs)?;
     let kind = std::fs::read_to_string("/sys/bus/event_source/devices/uprobe/type")
         .map_err(|e| format!("uprobe PMU unavailable: {e}"))?
         .trim()
         .parse::<u32>()
         .map_err(|e| e.to_string())?;
-    let config = if ret {
+    let ret_config = if specs.iter().any(|(_, _, ret)| *ret) {
         let format =
             std::fs::read_to_string("/sys/bus/event_source/devices/uprobe/format/retprobe")
                 .map_err(|e| e.to_string())?;
@@ -134,8 +194,10 @@ pub fn resolve(tid: i32, path: &str, function: &str, ret: bool) -> Result<Resolv
     } else {
         0
     };
-    resolved.kind = kind;
-    resolved.config = config;
+    for (probe, (_, _, ret)) in resolved.iter_mut().zip(specs) {
+        probe.kind = kind;
+        probe.config = if *ret { ret_config } else { 0 };
+    }
     Ok(resolved)
 }
 fn number(text: &str) -> Option<u64> {
@@ -178,6 +240,11 @@ pub fn matches(pattern: &str, name: &str) -> bool {
     }
     i == p.len()
 }
+/// Deterministic matching of native raw/demangled names, also usable offline.
+pub fn matches_function(pattern: &str, name: &str) -> bool {
+    matches(pattern, name) || matches(pattern, &crate::symbols::demangle(name))
+}
+
 pub fn functions(tid: i32, path: &str, pattern: &str) -> Result<Vec<Function>> {
     let target = if path.starts_with('/') {
         format!("/proc/{tid}/root{path}")
@@ -225,9 +292,6 @@ pub(crate) fn functions_from_bytes(bytes: &[u8], pattern: &str) -> Result<Vec<Fu
                 name: name.into(),
                 demangled,
             });
-            if found.len() > 250_000 {
-                return Err("function symbol limit exceeded".into());
-            }
         }
     }
     Ok(found.into_iter().collect())

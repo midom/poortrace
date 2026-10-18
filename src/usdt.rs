@@ -130,9 +130,6 @@ pub(crate) fn sites_from_bytes(data: &[u8]) -> Result<Vec<Site>> {
             },
             arguments,
         });
-        if out.len() > 4096 {
-            return Err("SDT site limit exceeded".into());
-        }
     }
     Ok(out)
 }

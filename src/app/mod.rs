@@ -4,6 +4,7 @@ mod cli;
 mod events;
 mod functions;
 mod perf;
+mod probes;
 mod process;
 mod reliable;
 mod replay;
@@ -22,7 +23,7 @@ use poortrace::{
 };
 use replay::run_replay;
 use stat::run_stat;
-use std::{collections::BTreeSet, io};
+use std::io;
 use syscalls::run_syscalls;
 
 pub(super) fn run() -> Result<i32> {
@@ -30,6 +31,9 @@ pub(super) fn run() -> Result<i32> {
 }
 
 fn run_with_args(mut args: Args) -> Result<i32> {
+    for event in &mut args.stat_events {
+        *event = poortrace::language::canonical_probe_name(event).into_owned();
+    }
     if let Some(sidecar) = &args.report_metadata {
         use std::os::unix::fs::MetadataExt;
         for other in [&args.output, &args.record, &args.replay, &args.script]
@@ -173,84 +177,13 @@ fn run_with_args(mut args: Args) -> Result<i32> {
         );
         return Ok(0);
     }
-    for clause in &mut program.clauses {
-        let mut probes = Vec::new();
-        for (name, probe) in &clause.probes {
-            if let Probe::Uprobe {
-                path,
-                function,
-                ret,
-            } = probe
-            {
-                if let Some(selector) = function.strip_prefix("__usdt__") {
-                    if args.uprobe_backend != "ptrace" {
-                        return Err("SDT probes require --uprobe-backend ptrace".into());
-                    }
-                    let (provider, marker) = selector
-                        .split_once(':')
-                        .ok_or("SDT requires PROVIDER:NAME")?;
-                    for site in
-                        poortrace::usdt::sites(args.pid.unwrap_or(std::process::id() as i32), path)?
-                    {
-                        if poortrace::uprobe::matches(provider, &site.provider)
-                            && poortrace::uprobe::matches(marker, &site.name)
-                        {
-                            probes.push((
-                                format!("usdt:{path}:{}:{}", site.provider, site.name),
-                                Probe::Uprobe {
-                                    path: path.clone(),
-                                    function: format!(
-                                        "__sdt__{}",
-                                        serde_json::to_string(&site).map_err(|e| e.to_string())?
-                                    ),
-                                    ret: false,
-                                },
-                            ));
-                        }
-                    }
-                    if probes.is_empty() {
-                        return Err(format!("no SDT probes matched {selector} in {path}"));
-                    }
-                } else if function.contains(['*', '?']) {
-                    let matches = poortrace::uprobe::functions(
-                        args.pid.unwrap_or(std::process::id() as i32),
-                        path,
-                        function,
-                    )?;
-                    if matches.is_empty() {
-                        return Err(format!(
-                            "function pattern {function:?} matched no symbols in {path}"
-                        ));
-                    }
-                    let mut offsets = BTreeSet::new();
-                    for found in matches {
-                        if offsets.insert(found.offset) {
-                            probes.push((
-                                format!(
-                                    "{}:{path}:{}",
-                                    if *ret { "uretprobe" } else { "uprobe" },
-                                    found.name
-                                ),
-                                Probe::Uprobe {
-                                    path: path.clone(),
-                                    function: format!("0x{:x}", found.offset),
-                                    ret: *ret,
-                                },
-                            ));
-                        }
-                    }
-                } else {
-                    probes.push((name.clone(), probe.clone()));
-                }
-            } else {
-                probes.push((name.clone(), probe.clone()));
-            }
-            if probes.len() > 256 {
-                return Err("expanded probe limit (256) exceeded".into());
-            }
-        }
-        clause.probes = probes;
+    if args.max_breakpoints.is_some_and(|limit| limit != 0)
+        && args.uprobe_backend == "perf"
+        && !args.reliable
+    {
+        return Err("--max-breakpoints requires the ptrace function backend; it does not limit perf descriptors".into());
     }
+    probes::expand(&mut program, &args)?;
     if args.system_wide
         && program.clauses.iter().any(|c| {
             c.probes.iter().any(|(_, p)| {

@@ -160,7 +160,19 @@ impl PerfEvent {
         probe: &Probe,
         pages: usize,
         on_exec: bool,
+        capture: Capture,
+    ) -> Result<Option<Self>> {
+        Self::try_open_prepared(tid, probe, pages, on_exec, capture, None)
+    }
+    /// Reuse batch-resolved uprobe metadata for the supplied probe. Other probe
+    /// families use the ordinary configuration path.
+    pub fn try_open_prepared(
+        tid: i32,
+        probe: &Probe,
+        pages: usize,
+        on_exec: bool,
         mut capture: Capture,
+        prepared: Option<&crate::uprobe::Resolved>,
     ) -> Result<Option<Self>> {
         if tid <= 0 && !(tid == -1 && capture.cpu.is_some()) {
             return Err("perf target TID must be positive".into());
@@ -168,16 +180,21 @@ impl PerfEvent {
         if !pages.is_power_of_two() || pages > 1024 {
             return Err("mmap pages must be a power of two from 1 to 1024".into());
         }
-        let uprobe = if let Probe::Uprobe {
+        let resolved_uprobe = if let Probe::Uprobe {
             path,
             function,
             ret,
         } = probe
         {
-            Some(crate::uprobe::resolve(tid, path, function, *ret)?)
+            if prepared.is_none() {
+                Some(crate::uprobe::resolve(tid, path, function, *ret)?)
+            } else {
+                None
+            }
         } else {
             None
         };
+        let uprobe = prepared.or(resolved_uprobe.as_ref());
         let trace_format = match probe {
             Probe::Tracepoint { category, event } => {
                 Some(crate::kernel::Format::load(category, event)?)

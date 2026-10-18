@@ -758,3 +758,30 @@ fn raw_offcpu_pairs_are_cleared_by_throttle_and_recorded_discontinuities() {
             .is_empty()
     );
 }
+
+#[test]
+fn alternate_replay_matches_aliases_and_process_scoped_function_patterns_offline() {
+    let mut entry = saved(10, 1, &[]);
+    entry.probe = r#"uprobe:"/removed/an image.so":http_work"#.into();
+    let mut ret = entry.clone();
+    ret.probe = r#"uretprobe:"/removed/an image.so":http_work"#.into();
+    ret.nsecs = 20;
+    ret.retval = 17;
+    let text = replay_script(
+        &[entry, ret],
+        "uprobe:/removed/app:work {}",
+        r#"
+        u:*http* { printf("entry\n"); }
+        ur:http_work { printf("return=%d\n",retval); }
+        u:"/removed/*":*work { printf("image\n"); }
+        ur:*.so:http_work { printf("library\n"); }
+    "#,
+    );
+    assert_eq!(text, "entry\nimage\nreturn=17\nlibrary\n");
+    let text = replay_script(
+        &[saved(10, 1, &[])],
+        "profile:hz:99 {}",
+        r#"p:hz:99 { printf("sample\n"); }"#,
+    );
+    assert_eq!(text, "sample\n");
+}

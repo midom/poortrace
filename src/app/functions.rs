@@ -56,13 +56,17 @@ pub(super) fn run_functions(args: &Args, program: &Program) -> Result<i32> {
             }
         }
     }
-    let mut tracer = poortrace::functions::Tracer::seize_group(
+    let mut tracer = poortrace::functions::Tracer::seize_group_with_limits(
         pid,
         threads(pid)?,
         &specs,
         child.is_some(),
         args.attach_descendants,
         &args.shared_mm_pids,
+        poortrace::functions::Limits {
+            probes: args.max_probes,
+            breakpoints: args.max_breakpoints,
+        },
     )?;
     for specification in &args.stack_range {
         let components: Vec<_> = specification.split(':').collect();
@@ -110,6 +114,11 @@ pub(super) fn run_functions(args: &Args, program: &Program) -> Result<i32> {
         capture,
     )?;
     let mut lost = 0;
+    let has_perf_streams = program
+        .clauses
+        .iter()
+        .flat_map(|clause| &clause.probes)
+        .any(|(_, probe)| probe.is_perf() && !matches!(probe, Probe::Uprobe { .. }));
     let mut refresh = Instant::now();
     let stdout = io::stdout();
     let mut state = program.state(io::BufWriter::new(stdout.lock()));
@@ -143,12 +152,14 @@ pub(super) fn run_functions(args: &Args, program: &Program) -> Result<i32> {
             if let Some(child) = &mut child {
                 child.poll_output(state.recorder.as_mut())?;
             }
-            dispatch_waits(program, &mut state, &mut waits, tracer.targets())?;
+            if waits.delay().is_zero() {
+                dispatch_waits(program, &mut state, &mut waits, tracer.targets())?;
+            }
             drain(program, &mut state, &mut streams, &mut lost)?;
             if state.stopped {
                 break;
             }
-            if refresh.elapsed() >= Duration::from_millis(10) {
+            if has_perf_streams && refresh.elapsed() >= Duration::from_millis(10) {
                 for target in tracer.targets() {
                     attach(
                         program,
@@ -163,7 +174,9 @@ pub(super) fn run_functions(args: &Args, program: &Program) -> Result<i32> {
                 refresh = Instant::now();
             }
             let events = tracer.poll()?;
-            track_owned_descendants(&mut child, args.follow_forks, tracer.targets())?;
+            if args.follow_forks {
+                track_owned_descendants(&mut child, true, tracer.targets())?;
+            }
             for tid in tracer.take_discovered() {
                 attach(
                     program,
@@ -188,7 +201,7 @@ pub(super) fn run_functions(args: &Args, program: &Program) -> Result<i32> {
                 tracer.resume_hit()?;
             }
             if let Some(child) = &mut child {
-                if let Some(code) = (!tracer.targets().contains(&child.pid))
+                if let Some(code) = (!tracer.has_target(child.pid))
                     .then(|| tracer.exits.remove(&child.pid))
                     .flatten()
                 {
@@ -201,7 +214,7 @@ pub(super) fn run_functions(args: &Args, program: &Program) -> Result<i32> {
                     }
                 }
             }
-            if tracer.is_empty() || (!args.follow_forks && !tracer.targets().contains(&pid)) {
+            if tracer.is_empty() || (!args.follow_forks && !tracer.has_target(pid)) {
                 break;
             }
             for (id, name, period, deadline) in &mut timers {
@@ -210,12 +223,13 @@ pub(super) fn run_functions(args: &Args, program: &Program) -> Result<i32> {
                     *deadline = Instant::now() + *period;
                 }
             }
+            if !state.stopped {
+                tracer.release_snapshot()?;
+            }
             reports.refresh(&mut state, args);
             state.flush()?;
-            if idle {
-                unsafe {
-                    libc::poll(std::ptr::null_mut(), 0, 1);
-                }
+            if idle && !state.stopped {
+                tracer.wait_ready(Duration::from_millis(1))?;
             }
         }
         Ok(())
@@ -233,7 +247,7 @@ pub(super) fn run_functions(args: &Args, program: &Program) -> Result<i32> {
     tracer.detach();
     if let Some(child) = &mut child {
         if child.status.is_none() {
-            if let Some(code) = (!tracer.targets().contains(&child.pid))
+            if let Some(code) = (!tracer.has_target(child.pid))
                 .then(|| tracer.exits.remove(&child.pid))
                 .flatten()
             {

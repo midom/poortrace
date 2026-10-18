@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Wake ptrace function loops on child-status notifications, resume targets immediately after safe breakpoint rearming, and avoid redundant per-hit thread scans. Add exact-count hot-loop regressions and a reproducible function throughput benchmark.
+
+- Unlimited probe/breakpoint counts by default, optional `--max-probes` and `--max-breakpoints` budgets, and batched/indexed native function attachment for large wildcard matches.
+
+- Accept short provider names (`u`, `ur`, `U`, `k`, `kr`, `t`, `i`, `p`, `s`, `h`, `w`) with canonical names in events and recordings.
+- Resolve process-scoped function globs such as `u:*http*` and mapped-image globs with `-p PID`; support matching them during offline replay.
+
 - Discover concrete native entry/return and USDT probes in an existing process with `-l -p PID`, including mapped libraries and function/marker filtering.
 
 - Honor the selected native stack unwinder independently of recording and managed stack capture.

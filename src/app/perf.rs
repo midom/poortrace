@@ -275,6 +275,11 @@ pub(super) fn attach(
             Err(e) => return Err(e),
         }
     };
+    let mut existing: BTreeSet<_> = streams
+        .iter()
+        .map(|s| (s.clause, s.name.clone(), s.tid))
+        .collect();
+    let mut pending = Vec::new();
     for (clause, c) in program.clauses.iter().enumerate() {
         for (name, probe) in &c.probes {
             if !probe.is_perf() || capture.ptrace_functions && matches!(probe, Probe::Uprobe { .. })
@@ -282,42 +287,73 @@ pub(super) fn attach(
                 continue;
             }
             for tid in &tids {
-                if streams
-                    .iter()
-                    .any(|s| s.clause == clause && s.name == *name && s.tid == *tid)
-                {
-                    continue;
-                }
-                let actual_tid = if pid == -1 { -1 } else { *tid };
-                let event_capture = Capture {
-                    cpu: if pid == -1 { Some(*tid) } else { None },
-                    ..capture
-                };
-                let event =
-                    PerfEvent::try_open_config(actual_tid, probe, pages, on_exec, event_capture);
-                match event {
-                    Ok(Some(event)) => {
-                        if enabled {
-                            event.enable()?;
-                        }
-                        streams.push(Stream {
-                            clause,
-                            name: name.clone(),
-                            tid: *tid,
-                            event,
-                            hup: false,
-                            comm: task_comm(pid, *tid),
-                            on_exec,
-                            switched_out: None,
-                            generation: monotonic_ns(),
-                            discontinuous: false,
-                        });
-                    }
-                    Ok(None) => {}
-                    Err(_) if pid != -1 && !alive(*tid) => {}
-                    Err(e) => return Err(format!("{name}: {e}")),
+                if existing.insert((clause, name.clone(), *tid)) {
+                    pending.push((clause, name, probe, *tid));
                 }
             }
+        }
+    }
+    let requests: Vec<_> = pending
+        .iter()
+        .filter_map(|(_, _, probe, _)| {
+            if let Probe::Uprobe {
+                path,
+                function,
+                ret,
+            } = probe
+            {
+                Some((path.as_str(), function.as_str(), *ret))
+            } else {
+                None
+            }
+        })
+        .collect();
+    let prepared = match poortrace::uprobe::resolve_many(pid, &requests) {
+        Ok(prepared) => prepared,
+        Err(_) if pid != -1 && !alive(pid) => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let mut prepared = prepared.iter();
+    for (clause, name, probe, tid) in pending {
+        let actual_tid = if pid == -1 { -1 } else { tid };
+        let event_capture = Capture {
+            cpu: if pid == -1 { Some(tid) } else { None },
+            ..capture
+        };
+        let resolved = if matches!(probe, Probe::Uprobe { .. }) {
+            prepared.next()
+        } else {
+            None
+        };
+        let event = PerfEvent::try_open_prepared(
+            actual_tid,
+            probe,
+            pages,
+            on_exec,
+            event_capture,
+            resolved,
+        );
+        match event {
+            Ok(Some(event)) => {
+                if enabled {
+                    event.enable()?;
+                }
+                streams.push(Stream {
+                    clause,
+                    name: name.clone(),
+                    tid,
+                    event,
+                    hup: false,
+                    comm: task_comm(pid, tid),
+                    on_exec,
+                    switched_out: None,
+                    generation: monotonic_ns(),
+                    discontinuous: false,
+                });
+            }
+            Ok(None) => {}
+            Err(_) if pid != -1 && !alive(tid) => {}
+            Err(e) => return Err(format!("{name}: {e}")),
         }
     }
     Ok(())

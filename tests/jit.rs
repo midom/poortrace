@@ -783,3 +783,20 @@ fn process_managed_snapshots_are_strings_including_recursive_function_returns() 
     }
     assert!(Program::compile("BEGIN {printf(\"%s\",managedstacks(0));}").is_err());
 }
+
+#[test]
+fn short_probe_providers_compile_with_normalized_handler_names() {
+    let source = r#"i:ms:10 / pid == 42 / { printf("%s\n",probe); @n=count(); } u:*http* { @calls=count(); } ur:"ns::work()" { @returns=sum(retval); }"#;
+    let program = Program::compile(source).unwrap();
+    assert_eq!(program.clauses[0].probes[0].0, "interval:ms:10");
+    assert_eq!(program.clauses[1].probes[0].0, "uprobe:*http*");
+    let mut bytes = Vec::new();
+    {
+        let mut state = program.state(&mut bytes);
+        let mut event = Event::new(c"test", c"interval:ms:10");
+        event.pid = 42;
+        program.invoke(0, &mut state, &event);
+        state.flush().unwrap();
+    }
+    assert_eq!(String::from_utf8(bytes).unwrap(), "interval:ms:10\n");
+}

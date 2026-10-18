@@ -125,6 +125,26 @@ Above-limit errors report the requested frequency and the host ceiling.
 | `offcpu` | Completed switch-out/switch-in intervals for target threads |
 | `syscall:enter:NAME`, `syscall:exit:NAME` | Native syscall stops using ptrace; names, numbers, or `*` |
 
+Supported provider aliases (case-sensitive) follow the corresponding
+[bpftrace short names](https://bpftrace.org/docs/release_024/language):
+
+| Short | Provider |
+| --- | --- |
+| `u` | `uprobe` |
+| `ur` | `uretprobe` |
+| `U` | `usdt` |
+| `k` | `kprobe` |
+| `kr` | `kretprobe` |
+| `t` | `tracepoint` |
+| `i` | `interval` |
+| `p` | `profile` |
+| `s` | `software` |
+| `h` | `hardware` |
+| `w` | `watchpoint` |
+
+Aliases use the same arguments and backends as their full provider names.
+The `probe` builtin and new recordings use canonical full provider names.
+
 Periods and rates must be positive decimal integers. Use `--list` for names,
 including `cpu-clock`, `task-clock`, `page-faults`, `minor-faults`, `major-faults`,
 `context-switches`, `cpu-migrations`, `cycles`, `instructions`, `cache-misses`,
@@ -432,7 +452,13 @@ are restored on normal/error/interrupt cleanup before detach. Executable mapping
 must be private. This backend is intrusive and can substantially change timing;
 it is for native function tracing, not transparent high-rate profiling. Abruptly
 killing the tracer with SIGKILL prevents its cleanup. Do not probe an instruction
-that already contains a software breakpoint. Existing debuggers and ptracers
+that already contains a software breakpoint. Stop, single-step, and idle waits
+use child-status notifications, and threads resume immediately once pending
+stops have been handled and breakpoints are rearmed. Service deadlines remain
+bounded; embedded callers with custom SIGCHLD handlers or other signal-consuming
+threads use a bounded readiness fallback without replacing their handlers or
+leaving their signal masks changed. See the [function throughput benchmark](docs/validation.md)
+for a repeatable fixed-hit comparison. Existing debuggers and ptracers
 cannot share the target. Pre-existing processes sharing the address space can be
 attached together with `--shared-mm-pids PID1,PID2 -p ROOT_PID`. All declared
 groups stop before patching; `kcmp(KCMP_VM)` must prove their shared address
@@ -453,8 +479,8 @@ separate. For coroutines allocating stacks in one mapping, declare each range
 with repeatable `--stack-range TID:LOW:HIGH` (hex addresses accepted). Return
 traps are restored after temporary execute-permission loss only when the original
 image identity still matches. Unregistered same-mapping stacks and genuinely
-unobservable nonlocal exits can still prevent matching returns; at most 4096 pending returns,
-1024 active breakpoints, and 256 probe bindings are allowed. `ustack` uses a
+unobservable nonlocal exits can still prevent matching returns; at most 4096 pending returns
+are allowed. Probe bindings and active breakpoints are unlimited by default. `ustack` uses a
 bounded snapshot of the stopped thread's stack and native CFI, controlled by
 `--stack-bytes`.
 
@@ -637,6 +663,27 @@ poortrace -e 'usdt:/path/app:provider:request* { @[probe, arg0] = count(); }' --
 poortrace -f -e 'syscall:enter:write { @[pid, ustack] = count(); }' -- /path/app
 ```
 
+With `-p PID`, omit the image to search the executable and mapped libraries by
+raw or demangled function name:
+
+```sh
+poortrace -p "$(pidof webtop)" -e 'u:*http* { @[probe] = count(); }'
+poortrace -p 1234 -e 'ur:*http* { @[probe] = sum(retval); }'
+poortrace -p 1234 -e 'u:libc.so*:malloc { @allocations = count(); }'
+poortrace -p 1234 -e 'u:"/usr/lib/*.so*":*http* { @calls = count(); }'
+```
+
+Both aliases and full names accept `uprobe:FUNCTION` / `uretprobe:FUNCTION`,
+including exact names. Image wildcards match target mapping paths (or library
+basenames when the image pattern has no slash). Quote image patterns containing
+`/*` so they are not interpreted as comments. Names containing namespace colons
+or other punctuation can also be quoted. Process-scoped selectors and image
+wildcards require `-p`; use a concrete `uprobe:PATH:FUNCTION` when launching a
+command. Expansion occurs before attachment and matches the current mapping
+snapshot, with no silent truncation: empty matches fail. Wildcard aliases at the same image offset are attached once per clause;
+separate clauses retain separate handlers. Replay matches these selectors against
+archived names entirely offline.
+
 `-l -p PID` inspects a bounded snapshot of the running executable and its
 file-backed executable library mappings. It prints sorted, deduplicated concrete
 `uprobe:PATH:FUNCTION`, `uretprobe:PATH:FUNCTION`, and `usdt:PATH:PROVIDER:NAME`
@@ -651,11 +698,29 @@ JIT code is not enumerated. Deleted, replaced, unreadable, or unsupported librar
 images produce diagnostics; an inaccessible executable or PID fails explicitly.
 Files are checked against mapping device/inode identities. Newly loaded libraries
 after the snapshot are not included. Limits are 1024 images, 128 MiB per image,
-512 MiB total ELF data, and 250,000 matching functions. Plain `-l` without a PID
+512 MiB total ELF data. There is no matching-function count cap. Plain `-l` without a PID
 continues to list the supported probe families.
 
 Function globs match raw or demangled names, deduplicate aliases by file offset,
-and expand to at most 256 probes per clause. Quote paths containing spaces.
+and have no default expansion count cap. Quote paths containing spaces.
+
+Use `--max-probes N` to limit the total expanded probe bindings across all
+clauses, including non-function providers and BEGIN/END. Deduplicated wildcard
+aliases in one clause count once; separate handlers count separately. Expansion
+fails before attachment if the limit is exceeded. `--check` only compiles and
+does not expand selectors or enforce attachment budgets.
+Use `--max-breakpoints N` to limit active ptrace breakpoint addresses per traced
+address space, shared by entry and dynamic return traps. Shared addresses count
+once. This applies to both normal and `--reliable` function tracing; it does not
+limit perf descriptors. Hitting either limit fails explicitly, without truncation;
+ptrace errors restore patched text and detach the target. Omit either option or
+set it to `0` for unlimited. Existing input byte, mapping, and pending-return
+safety bounds remain in effect. ELF resolution is batched by image, and attachment
+reuses one mapping snapshot with indexed image/address lookups.
+
+```sh
+poortrace -p "$PID" --max-probes 10000 --max-breakpoints 20000 -e 'u:*http* {}'
+```
 SDT supports native 64-bit SystemTap `.note.stapsdt` markers. Provider and marker
 selectors accept `*`/`?`; all matching locations are attached. Up to six scalar
 1/2/4/8-byte arguments are decoded from native registers, constants, or supported

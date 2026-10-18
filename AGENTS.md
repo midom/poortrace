@@ -63,6 +63,8 @@ Serde for profile/report formats; LLVM is accessed through direct C API bindings
 - `src/app/process.rs`: signal handling, process launch gate, owned-child output
   and cleanup, and thread discovery.
 - `src/app/events.rs`: shared event construction and handler dispatch.
+- `src/app/probes.rs`: bounded native/USDT selector expansion before backend
+  attachment, including process-scoped function and mapped-image wildcards.
 - `src/app/session.rs`: shared capture plans and periodic report refresh.
 - `src/app/{perf,syscalls,functions,stat}.rs`: CLI backend loops for sampling,
   syscall/lifecycle tracing, function tracing, and grouped counters respectively.

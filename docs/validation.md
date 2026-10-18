@@ -39,6 +39,22 @@ for syscall stops, and 19.36x for recorded syscall stops. These short-workload
 figures include startup/JIT costs; use the raw artifact and rerun on your own
 workload rather than treating these ratios as steady-state overhead estimates.
 
+The function-probe harness compiles a small native workload and checks a fixed
+number of delivered entry events, with one active thread and optional sleeping
+siblings. It needs a C compiler and ptrace access, without perf privileges:
+
+```sh
+python3 scripts/benchmark-functions.py --runs 3 --hits 500 --threads 1 12 > functions.json
+```
+
+An illustrative [AArch64/LLVM 18 comparison](baselines/aarch64-ptrace-throughput.json)
+measured approximately 707 to 10,535 events/second with one thread, and 330 to
+4,918 events/second with 12 threads, after replacing the sleep-based waits and
+removing redundant process scans. These are medians of three release runs,
+including startup/JIT/cleanup, with every run delivering exactly 500 events.
+The workload measures tracer overhead; application calls, stacks, recording,
+sibling activity, and scheduling can change the result substantially.
+
 ## Fuzzing and generated invariants
 
 ```sh

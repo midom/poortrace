@@ -1,5 +1,5 @@
 use crate::Result;
-use std::time::Duration;
+use std::{borrow::Cow, time::Duration};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Probe {
@@ -18,6 +18,7 @@ pub enum Probe {
         ret: bool,
     },
     Uprobe {
+        /// Empty for a process-scoped function selector resolved by the CLI.
         path: String,
         function: String,
         ret: bool,
@@ -67,8 +68,34 @@ pub const HARDWARE: &[(&str, u64)] = &[
     ("ref-cycles", 9),
 ];
 
+/// Short names for supported probe families, normalized before compilation/replay.
+pub const PROBE_ALIASES: &[(&str, &str)] = &[
+    ("u", "uprobe"),
+    ("ur", "uretprobe"),
+    ("U", "usdt"),
+    ("k", "kprobe"),
+    ("kr", "kretprobe"),
+    ("t", "tracepoint"),
+    ("i", "interval"),
+    ("p", "profile"),
+    ("s", "software"),
+    ("h", "hardware"),
+    ("w", "watchpoint"),
+];
+
+pub fn canonical_probe_name(text: &str) -> Cow<'_, str> {
+    if let Some((provider, rest)) = text.split_once(':') {
+        if let Some((_, full)) = PROBE_ALIASES.iter().find(|(short, _)| *short == provider) {
+            return Cow::Owned(format!("{full}:{rest}"));
+        }
+    }
+    Cow::Borrowed(text)
+}
+
 impl Probe {
     pub fn parse(text: &str) -> Result<Self> {
+        let canonical = canonical_probe_name(text);
+        let text = canonical.as_ref();
         let identifier = |name: &str| {
             !name.is_empty()
                 && name
@@ -105,7 +132,7 @@ impl Probe {
             else {
                 unreachable!()
             };
-            if !function.contains(':') {
+            if path.is_empty() || !function.contains(':') {
                 return Err("usdt requires PATH:PROVIDER:NAME".into());
             }
             return Ok(Self::Uprobe {
@@ -138,7 +165,6 @@ impl Probe {
                     break;
                 }
             }
-            let split = split.ok_or("uprobe requires PATH:SYMBOL or PATH:0xFILE_OFFSET")?;
             let component = |raw: &str| -> Result<String> {
                 if raw.starts_with('"') {
                     let tokens = lex(raw)?;
@@ -151,12 +177,24 @@ impl Probe {
                 }
                 Ok(raw.to_string())
             };
-            let path = component(&rest[..split])?;
-            let function = component(&rest[split + 1..])?;
+            let (path, function) = if let Some(split) = split {
+                let path = component(&rest[..split])?;
+                if path.is_empty() {
+                    return Err("uprobe needs a nonempty path".into());
+                }
+                (path, component(&rest[split + 1..])?)
+            } else {
+                if rest.starts_with('/') {
+                    return Err(
+                        "uprobe requires PATH:SYMBOL or a process-scoped FUNCTION selector".into(),
+                    );
+                }
+                (String::new(), component(rest)?)
+            };
             if function.starts_with("__sdt__") || function.starts_with("__usdt__") {
                 return Err("reserved internal probe encoding; use usdt:PATH:PROVIDER:NAME".into());
             }
-            if path.is_empty() || function.is_empty() {
+            if function.is_empty() {
                 return Err("uprobe needs a nonempty path and function".into());
             }
             return Ok(Self::Uprobe {
@@ -664,10 +702,27 @@ pub fn parse(src: &str) -> Result<Vec<Clause>> {
         let mut probes = Vec::new();
         loop {
             let start = p.token().start;
-            let is_uprobe = matches!(&p.token().kind,TokenKind::Word(name) if name=="uprobe"||name=="uretprobe"||name=="usdt");
+            let provider = if let TokenKind::Word(name) = &p.token().kind {
+                name.as_str()
+            } else {
+                ""
+            };
+            let is_uprobe = matches!(provider, "uprobe" | "uretprobe" | "usdt" | "u" | "ur" | "U");
+            // Quoted components are single tokens, so their internal colons do not
+            // confuse pathless selectors with explicit PATH:FUNCTION selectors.
+            let pathless = matches!(provider, "uprobe" | "uretprobe" | "u" | "ur")
+                && p.tokens[p.at..]
+                    .iter()
+                    .take_while(|token| {
+                        !matches!(&token.kind, TokenKind::Symbol(s) if s=="{" || s==",")
+                            && !matches!(token.kind, TokenKind::Eof)
+                    })
+                    .filter(|token| matches!(&token.kind, TokenKind::Symbol(s) if s==":" ))
+                    .count()
+                    == 1;
             let mut colons = 0;
             while !p.is("{")
-                && !(p.is("/") && (!is_uprobe || colons >= 2))
+                && !(p.is("/") && (!is_uprobe || pathless || colons >= 2))
                 && !p.is(",")
                 && !matches!(p.token().kind, TokenKind::Eof)
             {
@@ -701,6 +756,7 @@ pub fn parse(src: &str) -> Result<Vec<Clause>> {
                     quoted || !c.is_whitespace()
                 })
                 .collect();
+            let name = canonical_probe_name(&name).into_owned();
             probes.push((
                 name.clone(),
                 Probe::parse(&name).map_err(|e| diagnostic(src, start, &e))?,
@@ -1038,5 +1094,50 @@ mod new_probe_tests {
         );
         assert!(Probe::parse("uprobe:/path").is_err());
         assert!(Probe::parse("uprobe::foo").is_err());
+    }
+}
+
+#[cfg(test)]
+mod alias_tests {
+    use super::*;
+    #[test]
+    fn aliases_produce_the_same_probe_types_and_canonical_names() {
+        for (short, long, suffix) in [
+            ("u", "uprobe", "/tmp/app:work"),
+            ("ur", "uretprobe", "/tmp/app:work"),
+            ("U", "usdt", "/tmp/app:provider:request"),
+            ("k", "kprobe", "vfs_read"),
+            ("kr", "kretprobe", "vfs_read"),
+            ("t", "tracepoint", "sched:sched_switch"),
+            ("i", "interval", "ms:10"),
+            ("p", "profile", "hz:99"),
+            ("s", "software", "page-faults:1"),
+            ("h", "hardware", "cycles:1000"),
+            ("w", "watchpoint", "0x1000:8:w"),
+        ] {
+            let alias = format!("{short}:{suffix}");
+            let full = format!("{long}:{suffix}");
+            assert_eq!(Probe::parse(&alias).unwrap(), Probe::parse(&full).unwrap());
+            let clauses = parse(&format!("{alias} {{}}")).unwrap();
+            assert_eq!(clauses[0].probes[0].0, full);
+        }
+    }
+    #[test]
+    fn implicit_function_selectors_keep_predicates_and_quoted_components() {
+        let clauses=parse(r#"u:*http* / pid > 0 && period / 2 >= 0 / {} ur:"ns::work(int)" / arg0 != 0 / {} u:"/tmp/a path.so":work / pid > 0 / {}"#).unwrap();
+        assert_eq!(clauses.len(), 3);
+        assert!(clauses.iter().all(|c| c.predicate.is_some()));
+        assert!(
+            matches!(&clauses[0].probes[0].1,Probe::Uprobe{path,function,ret:false} if path.is_empty() && function=="*http*")
+        );
+        assert!(
+            matches!(&clauses[1].probes[0].1,Probe::Uprobe{path,function,ret:true} if path.is_empty() && function=="ns::work(int)")
+        );
+        assert!(
+            matches!(&clauses[2].probes[0].1,Probe::Uprobe{path,function,ret:false} if path=="/tmp/a path.so" && function=="work")
+        );
+        for source in ["u: {}", "ur::work {}", "U:marker {}", "u:/tmp/app {}"] {
+            assert!(parse(source).is_err(), "{source}");
+        }
     }
 }

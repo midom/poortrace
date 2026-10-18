@@ -10,7 +10,7 @@ use std::{path::PathBuf, time::Duration};
     after_help = "Examples:\n  poortrace -e 'interval:ms:100 { @ticks = count(); }' --duration 1\n  poortrace -e 'profile:hz:99 { @[comm, ip] = count(); }' -- ./workload\n  poortrace -p 1234 -e 'profile:hz:99 { @[ustack] = count(); }'\n  poortrace -p 1234 -e 'software:page-faults:1 { @[tid] = count(); }'\n\nPerf/ptrace policy and PMU support are enforced by the host. No BPF programs are loaded."
 )]
 pub(super) struct Args {
-    /// Inline script (otherwise supply a script file)
+    /// Inline script (provider aliases include u/ur; u:FUNCTION searches -p PID images)
     #[arg(short = 'e', long, conflicts_with = "script")]
     pub(super) expression: Option<String>,
     /// Script file; '-' reads standard input
@@ -33,6 +33,12 @@ pub(super) struct Args {
     /// Refresh function bindings at mapping syscall stops (adds ptrace overhead)
     #[arg(long)]
     pub(super) track_loads: bool,
+    /// Maximum total expanded probe bindings (omitted or 0: unlimited)
+    #[arg(long, conflicts_with_all=["replay", "stat", "list", "list_functions", "list_usdt"])]
+    pub(super) max_probes: Option<usize>,
+    /// Maximum active ptrace breakpoint addresses per address space (omitted or 0: unlimited)
+    #[arg(long, conflicts_with_all=["replay", "stat", "list", "list_functions", "list_usdt"])]
+    pub(super) max_breakpoints: Option<usize>,
     /// Launch a command through /bin/sh -c
     #[arg(short = 'c', long = "command", conflicts_with = "command")]
     pub(super) shell_command: Option<String>,

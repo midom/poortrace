@@ -82,13 +82,17 @@ pub(super) fn run(args: &Args, program: &Program) -> Result<i32> {
             }
         }
     }
-    let mut tracer = poortrace::functions::Tracer::seize_group(
+    let mut tracer = poortrace::functions::Tracer::seize_group_with_limits(
         pid,
         threads(pid)?,
         &specs,
         child.is_some(),
         args.attach_descendants,
         &args.shared_mm_pids,
+        poortrace::functions::Limits {
+            probes: args.max_probes,
+            breakpoints: args.max_breakpoints,
+        },
     )?;
     tracer.trace_syscalls(program.has_syscalls());
     tracer.track_loads(args.track_loads);
@@ -162,7 +166,9 @@ pub(super) fn run(args: &Args, program: &Program) -> Result<i32> {
                 child.poll_output(state.recorder.as_mut())?;
             }
             let events = tracer.poll()?;
-            track_owned_descendants(&mut child, args.follow_forks, tracer.targets())?;
+            if args.follow_forks {
+                track_owned_descendants(&mut child, true, tracer.targets())?;
+            }
             if !events.is_empty() {
                 tracer.pause_for_snapshot()?;
                 state.target_paused = true;
@@ -179,13 +185,13 @@ pub(super) fn run(args: &Args, program: &Program) -> Result<i32> {
                 tracer.resume_hit()?;
             }
             if let Some(child) = &mut child {
-                if !tracer.targets().contains(&child.pid) {
+                if !tracer.has_target(child.pid) {
                     if let Some(status) = tracer.exits.remove(&child.pid) {
                         child.status = Some(status);
                     }
                 }
             }
-            if tracer.is_empty() || (!args.follow_forks && !tracer.targets().contains(&pid)) {
+            if tracer.is_empty() || (!args.follow_forks && !tracer.has_target(pid)) {
                 break;
             }
             if !state.stopped && timers.iter().any(|timer| Instant::now() >= timer.3) {
@@ -257,8 +263,8 @@ pub(super) fn run(args: &Args, program: &Program) -> Result<i32> {
             }
             reports.refresh(&mut state, args);
             state.flush()?;
-            unsafe {
-                libc::poll(std::ptr::null_mut(), 0, 1);
+            if !state.stopped {
+                tracer.wait_ready(Duration::from_millis(1))?;
             }
         }
         Ok(())

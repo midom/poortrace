@@ -10,9 +10,16 @@ use std::{
 
 const MAX_IMAGE: u64 = 128 * 1024 * 1024;
 const MAX_TOTAL: usize = 512 * 1024 * 1024;
-const MAX_FUNCTIONS: usize = 250_000;
+
+#[derive(Clone, Debug)]
+pub struct FunctionMatch {
+    pub path: String,
+    pub name: String,
+    pub offset: u64,
+}
 
 pub struct Listing {
+    pub functions: Vec<FunctionMatch>,
     pub probes: Vec<String>,
     /// Inaccessible, replaced, deleted, or unsupported mapped images are explicit.
     pub warnings: Vec<String>,
@@ -21,6 +28,16 @@ pub struct Listing {
 /// Discover one bounded mapping snapshot without perf descriptors or ptrace attachment.
 /// Absolute paths are interpreted in the target's filesystem namespace.
 pub fn process(pid: i32, pattern: &str) -> Result<Listing> {
+    process_inner(pid, pattern, true)
+}
+
+/// Native expansion snapshot, without constructing unused printable selectors
+/// or reading SDT markers. The returned `probes` list is empty.
+pub fn process_functions(pid: i32, pattern: &str) -> Result<Listing> {
+    process_inner(pid, pattern, false)
+}
+
+fn process_inner(pid: i32, pattern: &str, printable: bool) -> Result<Listing> {
     if pid <= 0 {
         return Err("probe discovery requires a positive PID".into());
     }
@@ -61,7 +78,7 @@ pub fn process(pid: i32, pattern: &str) -> Result<Listing> {
     });
     let mut probes = BTreeSet::new();
     let mut total = 0usize;
-    let mut functions = 0usize;
+    let mut candidates = Vec::new();
     let mut found_executable = false;
     for ((device, inode), (mapping, deleted)) in images {
         let main = device == executable.dev() && inode == executable.ino();
@@ -96,13 +113,11 @@ pub fn process(pid: i32, pattern: &str) -> Result<Listing> {
             }
             Err(error) => return Err(format!("cannot list functions in {path}: {error}")),
         };
-        functions += discovered.len();
-        if functions > MAX_FUNCTIONS {
-            return Err("probe discovery exceeds 250000 functions".into());
-        }
         let mut names = BTreeMap::<&str, usize>::new();
-        for function in &discovered {
-            *names.entry(&function.name).or_default() += 1;
+        if printable {
+            for function in &discovered {
+                *names.entry(&function.name).or_default() += 1;
+            }
         }
         let path = match component(path, true) {
             Ok(path) => path,
@@ -113,10 +128,20 @@ pub fn process(pid: i32, pattern: &str) -> Result<Listing> {
             Err(error) => return Err(error),
         };
         for function in &discovered {
-            let symbol = function_selector(function, names[function.name.as_str()] > 1)?;
-            for kind in ["uprobe", "uretprobe"] {
-                probes.insert(format!("{kind}:{path}:{symbol}"));
+            candidates.push(FunctionMatch {
+                path: mapping.path.clone(),
+                name: function.name.clone(),
+                offset: function.offset,
+            });
+            if printable {
+                let symbol = function_selector(function, names[function.name.as_str()] > 1)?;
+                for kind in ["uprobe", "uretprobe"] {
+                    probes.insert(format!("{kind}:{path}:{symbol}"));
+                }
             }
+        }
+        if !printable {
+            continue;
         }
         match crate::usdt::sites_from_bytes(&bytes) {
             Ok(sites) => {
@@ -135,9 +160,6 @@ pub fn process(pid: i32, pattern: &str) -> Result<Listing> {
                 mapping.path
             )),
         }
-        if probes.len() > 2 * MAX_FUNCTIONS + 65536 {
-            return Err("probe discovery probe limit exceeded".into());
-        }
     }
     if !found_executable {
         return Err(format!(
@@ -153,6 +175,7 @@ pub fn process(pid: i32, pattern: &str) -> Result<Listing> {
     }
     warnings.sort();
     Ok(Listing {
+        functions: candidates,
         probes: probes.into_iter().collect(),
         warnings,
     })
@@ -189,7 +212,7 @@ fn read_image(pid: i32, mapping: &Mapping) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn component(text: &str, path: bool) -> Result<String> {
+pub(crate) fn component(text: &str, path: bool) -> Result<String> {
     if text
         .chars()
         .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
@@ -222,6 +245,16 @@ fn function_selector(function: &crate::uprobe::Function, ambiguous: bool) -> Res
     } else {
         component(name, false)
     }
+}
+
+/// Render canonical concrete event names with safe path and symbol quoting.
+pub fn function_probe_name(path: &str, name: &str, ret: bool) -> Result<String> {
+    Ok(format!(
+        "{}:{}:{}",
+        if ret { "uretprobe" } else { "uprobe" },
+        component(path, true)?,
+        component(name, false)?
+    ))
 }
 
 #[cfg(test)]

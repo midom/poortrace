@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "platform": "Linux-6.17.0-1019-oracle-aarch64-with-glibc2.39",
+  "build": "release, LLVM 18",
+  "fixture": "tests/fixtures/function_throughput.c, cc -O2 -g -pthread -fno-omit-frame-pointer",
+  "hits_per_run": 500,
+  "runs": 3,
+  "notes": "Illustrative single-host measurements including process launch, JIT compilation, and cleanup. One thread calls the probed function; other threads sleep. Exact delivered counts are checked. Results are not performance guarantees or CI thresholds.",
+  "before": {
+    "implementation": "Sleep-based stop/step waits and deferred resume",
+    "threads": {
+      "1": {
+        "elapsed_s": [
+          0.7136932294815779,
+          0.7057245681062341,
+          0.7070926921442151
+        ],
+        "median_events_s": 707.1208705096085
+      },
+      "12": {
+        "elapsed_s": [
+          1.5279197469353676,
+          1.513379787094891,
+          1.5150487516075373
+        ],
+        "median_events_s": 330.02238341800995
+      }
+    }
+  },
+  "after": {
+    "implementation": "SIGCHLD notification waits, immediate safe resume, conditional proc scans",
+    "threads": {
+      "1": {
+        "elapsed_s": [
+          0.06152069754898548,
+          0.047462018206715584,
+          0.04518409073352814
+        ],
+        "median_events_s": 10534.73954315017
+      },
+      "12": {
+        "elapsed_s": [
+          0.10166637506335974,
+          0.1082798345014453,
+          0.09923536889255047
+        ],
+        "median_events_s": 4918.04689297119
+      }
+    }
+  }
+}

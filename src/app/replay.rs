@@ -210,9 +210,39 @@ pub(super) fn run_replay(args: &Args, path: &std::path::Path) -> Result<i32> {
                                     "syscall:exit:"
                                 }) && number.is_none_or(|number| number as u64 == saved.sysno)
                             }
+                            Probe::Uprobe {
+                                path,
+                                function,
+                                ret,
+                            } => {
+                                if let Ok(Probe::Uprobe {
+                                    path: actual_path,
+                                    function: actual_function,
+                                    ret: actual_ret,
+                                }) = Probe::parse(&actual_probe)
+                                {
+                                    *ret == actual_ret
+                                        && (path.is_empty()
+                                            || poortrace::uprobe::matches(path, &actual_path)
+                                            || !path.contains('/')
+                                                && std::path::Path::new(&actual_path)
+                                                    .file_name()
+                                                    .and_then(|p| p.to_str())
+                                                    .is_some_and(|base| {
+                                                        poortrace::uprobe::matches(path, base)
+                                                    }))
+                                        && poortrace::uprobe::matches_function(
+                                            function,
+                                            &actual_function,
+                                        )
+                                } else {
+                                    false
+                                }
+                            }
                             _ => {
-                                name == &actual_probe
-                                    || poortrace::uprobe::matches(name, &actual_probe)
+                                let actual =
+                                    poortrace::language::canonical_probe_name(&actual_probe);
+                                name == actual.as_ref() || poortrace::uprobe::matches(name, &actual)
                             }
                         })
                         .then_some(id)

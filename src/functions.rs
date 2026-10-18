@@ -6,6 +6,14 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Optional resource policies. Zero and None both mean unlimited.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Limits {
+    pub probes: Option<usize>,
+    /// Active breakpoint addresses in each traced address space, including return traps.
+    pub breakpoints: Option<usize>,
+}
+
 #[derive(Clone)]
 pub struct Spec {
     pub path: String,
@@ -186,6 +194,95 @@ fn control(request: libc::c_uint, tid: i32, address: usize, data: usize) -> Resu
     control_io(request, tid, address, data)
         .map_err(|error| format!("function ptrace request {request} TID {tid}: {error}"))
 }
+// Block before checking waitpid, so a stop between the readiness check and
+// sigtimedwait remains pending. This guard is local to the waiting thread and
+// never changes the SIGCHLD disposition or the launched child's signal mask.
+struct ChildNotification {
+    set: libc::sigset_t,
+    previous: Option<libc::sigset_t>,
+}
+impl ChildNotification {
+    fn new() -> std::io::Result<Self> {
+        unsafe {
+            let mut set = std::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, libc::SIGCHLD);
+            let mut action: libc::sigaction = std::mem::zeroed();
+            if libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut action) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // Embedded callers may own a SIGCHLD handler. Let it receive its
+            // notifications instead of consuming them with sigtimedwait.
+            let previous = if action.sa_sigaction == libc::SIG_DFL {
+                let mut previous = std::mem::zeroed();
+                let error = libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut previous);
+                if error != 0 {
+                    return Err(std::io::Error::from_raw_os_error(error));
+                }
+                Some(previous)
+            } else {
+                None
+            };
+            Ok(Self { set, previous })
+        }
+    }
+    fn wait(&self, deadline: Instant) -> std::io::Result<()> {
+        // SIGCHLD is process-directed; an embedding application's other thread
+        // may receive it. Recheck waitpid within 1 ms even without a notification.
+        let timeout = deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_millis(1));
+        let timeout = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: timeout.as_nanos() as libc::c_long,
+        };
+        let result = unsafe {
+            if self.previous.is_some() {
+                libc::sigtimedwait(&self.set, std::ptr::null_mut(), &timeout)
+            } else {
+                libc::ppoll(std::ptr::null_mut(), 0, &timeout, std::ptr::null())
+            }
+        };
+        if result < 0 {
+            let error = std::io::Error::last_os_error();
+            if !matches!(error.raw_os_error(), Some(libc::EAGAIN | libc::EINTR)) {
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+}
+impl Drop for ChildNotification {
+    fn drop(&mut self) {
+        if let Some(previous) = &self.previous {
+            unsafe {
+                libc::pthread_sigmask(libc::SIG_SETMASK, previous, std::ptr::null_mut());
+            }
+        }
+    }
+}
+fn wait_status(tid: i32, deadline: Instant) -> std::io::Result<Option<(i32, i32)>> {
+    let notification = ChildNotification::new()?;
+    loop {
+        let mut status = 0;
+        let result = unsafe { libc::waitpid(tid, &mut status, libc::__WALL | libc::WNOHANG) };
+        if result > 0 {
+            return Ok(Some((result, status)));
+        }
+        if result < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(error);
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        notification.wait(deadline)?;
+    }
+}
+
 fn maps(pid: i32) -> Result<Vec<Mapping>> {
     std::fs::read_to_string(format!("/proc/{pid}/maps"))
         .map(|text| text.lines().filter_map(Mapping::parse).collect())
@@ -275,6 +372,7 @@ pub struct Tracer {
     spaces: BTreeMap<i32, AddressSpace>,
     owners: BTreeMap<i32, i32>,
     bindings: Vec<Binding>,
+    limits: Limits,
     tids: BTreeSet<i32>,
     stopped: BTreeSet<i32>,
     initial: BTreeSet<i32>,
@@ -324,6 +422,32 @@ impl Tracer {
         include_descendants: bool,
         extra_pids: &[i32],
     ) -> Result<Self> {
+        Self::seize_group_with_limits(
+            pid,
+            tids,
+            specs,
+            launched,
+            include_descendants,
+            extra_pids,
+            Limits::default(),
+        )
+    }
+    pub fn seize_group_with_limits(
+        pid: i32,
+        tids: impl IntoIterator<Item = i32>,
+        specs: &[Spec],
+        launched: bool,
+        include_descendants: bool,
+        extra_pids: &[i32],
+        limits: Limits,
+    ) -> Result<Self> {
+        if let Some(limit) = limits.probes.filter(|limit| *limit != 0) {
+            if specs.len() > limit {
+                return Err(format!(
+                    "function probe binding limit ({limit}) exceeded (--max-probes)"
+                ));
+            }
+        }
         if extra_pids.len() > 1024 || extra_pids.iter().any(|pid| *pid <= 0) {
             return Err("shared-mm PID list requires at most 1024 positive PIDs".into());
         }
@@ -352,14 +476,22 @@ impl Tracer {
         if tasks.len() > 4096 {
             return Err("initial thread limit (4096) exceeded".into());
         }
-        if specs.len() > 256 {
-            return Err("function tracing supports at most 256 probe bindings".into());
-        }
-        let mut bindings = Vec::new();
-        for spec in specs {
-            let resolved = crate::uprobe::locate(pid, &spec.path, &spec.function, spec.ret)?;
+        let requests: Vec<_> = specs
+            .iter()
+            .map(|spec| (spec.path.as_str(), spec.function.as_str(), spec.ret))
+            .collect();
+        let resolved = crate::uprobe::locate_many(pid, &requests)?;
+        let mut metadata = BTreeMap::new();
+        let mut bindings = Vec::with_capacity(specs.len());
+        for (spec, resolved) in specs.iter().zip(resolved) {
             let path = resolved.path.to_str().map_err(|e| e.to_string())?;
-            let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
+            let meta = if let Some(meta) = metadata.get(path) {
+                meta
+            } else {
+                metadata
+                    .entry(path.to_owned())
+                    .or_insert(std::fs::metadata(path).map_err(|e| e.to_string())?)
+            };
             bindings.push(Binding {
                 usdt: crate::usdt::encoded(&spec.function)?,
                 offset: resolved.offset,
@@ -375,6 +507,7 @@ impl Tracer {
             spaces: BTreeMap::new(),
             owners: BTreeMap::from([(pid, pid)]),
             bindings,
+            limits,
             tids: BTreeSet::new(),
             stopped: BTreeSet::new(),
             initial: BTreeSet::new(),
@@ -538,6 +671,11 @@ impl Tracer {
     pub fn targets(&self) -> BTreeSet<i32> {
         self.tids.iter().filter_map(|tid| tgid(*tid)).collect()
     }
+    /// The common leader case needs no /proc scan; retain the group lookup for
+    /// a leader that has exited while traced sibling threads remain alive.
+    pub fn has_target(&self, pid: i32) -> bool {
+        self.tids.contains(&pid) || self.tids.iter().any(|tid| tgid(*tid) == Some(pid))
+    }
     pub fn is_empty(&self) -> bool {
         self.tids.is_empty()
     }
@@ -677,6 +815,7 @@ impl Tracer {
         self.decoder.clear(tid);
     }
     fn stop_world(&mut self) -> Result<()> {
+        let notification = ChildNotification::new().map_err(|e| e.to_string())?;
         for &tid in &self.tids {
             if !self.stopped.contains(&tid)
                 && !self.listening.contains(&tid)
@@ -691,22 +830,6 @@ impl Tracer {
                 && !self.listening.contains(tid)
                 && !self.vfork.contains_key(tid)
         }) {
-            let vanished: Vec<_> = self
-                .tids
-                .iter()
-                .filter(|tid| !std::path::Path::new(&format!("/proc/{tid}")).exists())
-                .copied()
-                .collect();
-            for tid in vanished {
-                self.forget(tid);
-            }
-            if self.tids.iter().all(|tid| {
-                self.stopped.contains(tid)
-                    || self.listening.contains(tid)
-                    || self.vfork.contains_key(tid)
-            }) {
-                break;
-            }
             let mut status = 0;
             let tid = unsafe { libc::waitpid(-1, &mut status, libc::__WALL | libc::WNOHANG) };
             if tid > 0 {
@@ -721,12 +844,30 @@ impl Tracer {
                     return Err(error.to_string());
                 }
             } else {
+                // Drain ready statuses before doing liveness I/O. Checking every
+                // task after every sibling stop costs O(threads^2) proc lookups.
+                let vanished: Vec<_> = self
+                    .tids
+                    .iter()
+                    .filter(|tid| !std::path::Path::new(&format!("/proc/{tid}")).exists())
+                    .copied()
+                    .collect();
+                for tid in vanished {
+                    self.forget(tid);
+                }
+                if self.tids.iter().all(|tid| {
+                    self.stopped.contains(tid)
+                        || self.listening.contains(tid)
+                        || self.vfork.contains_key(tid)
+                }) {
+                    break;
+                }
                 if Instant::now() >= deadline {
                     return Err(
                         "timed out stopping target threads for a function breakpoint".into(),
                     );
                 }
-                std::thread::sleep(Duration::from_millis(1));
+                notification.wait(deadline).map_err(|e| e.to_string())?;
             }
         }
         Ok(())
@@ -796,10 +937,15 @@ impl Tracer {
             .or_else(|| self.stopped.first().copied())
             .ok_or_else(|| "no stopped thread for breakpoint memory access".into())
     }
+    // /proc/PID/maps is ordered by address; avoid scanning all VMAs per probe.
+    fn mapping(address: u64, maps: &[Mapping]) -> Option<&Mapping> {
+        let index = maps
+            .partition_point(|map| map.start <= address)
+            .checked_sub(1)?;
+        maps.get(index).filter(|map| address < map.end)
+    }
     fn identity(address: u64, maps: &[Mapping]) -> Option<Identity> {
-        let map = maps
-            .iter()
-            .find(|map| address >= map.start && address < map.end)?;
+        let map = Self::mapping(address, maps)?;
         Some(Identity {
             inode: map.inode,
             device: map.device,
@@ -838,20 +984,27 @@ impl Tracer {
         if self.breakpoints.contains_key(&address) {
             return Ok(());
         }
-        if self.breakpoints.len() >= 1024 {
-            return Err("function breakpoint limit (1024) reached".into());
+        let current = self.current_maps()?;
+        self.ensure_mapped(address, &current)
+    }
+    fn ensure_mapped(&mut self, address: u64, current: &[Mapping]) -> Result<()> {
+        if self.breakpoints.contains_key(&address) {
+            return Ok(());
+        }
+        if let Some(limit) = self.limits.breakpoints.filter(|limit| *limit != 0) {
+            if self.breakpoints.len() >= limit {
+                return Err(format!(
+                    "function breakpoint limit ({limit}) reached (--max-breakpoints)"
+                ));
+            }
         }
         let word = address & !7;
         if !self.words.contains_key(&word) {
-            let current = self.current_maps()?;
-            if !current
-                .iter()
-                .any(|map| word >= map.start && word < map.end && map.private)
-            {
+            if !Self::mapping(word, current).is_some_and(|map| map.private) {
                 return Err("ptrace function probes require private executable mappings".into());
             }
             let identity =
-                Self::identity(word, &current).ok_or("breakpoint is outside executable memory")?;
+                Self::identity(word, current).ok_or("breakpoint is outside executable memory")?;
             let original =
                 control(libc::PTRACE_PEEKDATA, self.memory_tid()?, word as usize, 0)? as u64;
             // Validate before adopting a word. A pre-existing CLONE_VM group
@@ -939,21 +1092,26 @@ impl Tracer {
                 }
             }
             self.words.remove(&word);
-            self.breakpoints.retain(|address, _| *address & !7 != word);
         }
+        self.breakpoints
+            .retain(|address, _| self.words.contains_key(&(*address & !7)));
         for breakpoint in self.breakpoints.values_mut() {
             breakpoint.entries.clear();
             breakpoint.returns = 0;
         }
         self.unresolved = false;
+        let mut images = BTreeMap::<(u64, u64), Vec<&Mapping>>::new();
+        for map in &current {
+            images.entry((map.device, map.inode)).or_default().push(map);
+        }
         for index in 0..self.bindings.len() {
             let binding = &self.bindings[index];
-            let addresses: Vec<_> = current
-                .iter()
+            let addresses: Vec<_> = images
+                .get(&(binding.device, binding.inode))
+                .into_iter()
+                .flat_map(|maps| maps.iter())
                 .filter(|map| {
-                    map.inode == binding.inode
-                        && map.device == binding.device
-                        && binding.offset >= map.offset
+                    binding.offset >= map.offset
                         && binding.offset - map.offset < map.end - map.start
                 })
                 .map(|map| map.start + binding.offset - map.offset)
@@ -981,7 +1139,7 @@ impl Tracer {
                         );
                     }
                 }
-                self.ensure(address)?;
+                self.ensure_mapped(address, &current)?;
                 self.breakpoints
                     .get_mut(&address)
                     .unwrap()
@@ -1002,7 +1160,7 @@ impl Tracer {
             .collect();
         for (address, image) in pending {
             if Self::identity(address & !7, &current) == Some(image) {
-                self.ensure(address)?;
+                self.ensure_mapped(address, &current)?;
                 self.breakpoints.get_mut(&address).unwrap().returns += 1;
             }
         }
@@ -1090,6 +1248,22 @@ impl Tracer {
                 }
             }
             self.stopped.remove(&tid);
+        }
+        Ok(())
+    }
+    /// Sleep until a child status is ready or the caller's service deadline.
+    /// Queue the status and stop siblings before any subsequent handler or patch.
+    pub fn wait_ready(&mut self, timeout: Duration) -> Result<()> {
+        if self.pending.is_empty() && self.active_hit.is_none() && !self.tids.is_empty() {
+            match wait_status(-1, Instant::now() + timeout) {
+                Ok(Some((tid, status))) => {
+                    self.queue(tid, status)?;
+                    self.stop_world()?;
+                }
+                Ok(None) => {}
+                Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {}
+                Err(error) => return Err(error.to_string()),
+            }
         }
         Ok(())
     }
@@ -1445,46 +1619,38 @@ impl Tracer {
         self.stopped.remove(&tid);
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
-            let mut status = 0;
-            let result = unsafe { libc::waitpid(tid, &mut status, libc::__WALL | libc::WNOHANG) };
-            if result == tid {
-                // A queued PTRACE_INTERRUPT can stop SINGLESTEP before the
-                // original instruction executes. Complete the step before
-                // re-arming the breakpoint, otherwise this becomes a duplicate hit.
-                if libc::WIFSTOPPED(status)
-                    && status >> 16 == libc::PTRACE_EVENT_STOP
-                    && libc::WSTOPSIG(status) == libc::SIGTRAP
-                {
-                    control(libc::PTRACE_SINGLESTEP, tid, 0, 0)?;
-                    continue;
-                }
-                if libc::WIFSTOPPED(status)
-                    && libc::WSTOPSIG(status) == libc::SIGTRAP
-                    && status >> 16 == 0
-                    && step_trap(tid)
-                {
-                    self.stopped.insert(tid);
-                    break;
-                }
-                self.queue(tid, status)?;
-                if !self.tids.contains(&tid) {
-                    break;
-                }
-                if libc::WIFSTOPPED(status) && status >> 16 == 0 {
-                    self.signals.insert(tid, libc::WSTOPSIG(status));
-                    control(libc::PTRACE_SINGLESTEP, tid, 0, 0)?;
-                    self.stopped.remove(&tid);
-                    continue;
-                }
+            let Some((_, status)) = wait_status(tid, deadline).map_err(|e| e.to_string())? else {
+                return Err("timed out single-stepping a function probe instruction".into());
+            };
+            // A queued PTRACE_INTERRUPT can stop SINGLESTEP before the
+            // original instruction executes. Complete the step before
+            // re-arming the breakpoint, otherwise this becomes a duplicate hit.
+            if libc::WIFSTOPPED(status)
+                && status >> 16 == libc::PTRACE_EVENT_STOP
+                && libc::WSTOPSIG(status) == libc::SIGTRAP
+            {
+                control(libc::PTRACE_SINGLESTEP, tid, 0, 0)?;
+                continue;
+            }
+            if libc::WIFSTOPPED(status)
+                && libc::WSTOPSIG(status) == libc::SIGTRAP
+                && status >> 16 == 0
+                && step_trap(tid)
+            {
+                self.stopped.insert(tid);
                 break;
             }
-            if result < 0 {
-                return Err(std::io::Error::last_os_error().to_string());
+            self.queue(tid, status)?;
+            if !self.tids.contains(&tid) {
+                break;
             }
-            if Instant::now() >= deadline {
-                return Err("timed out single-stepping a function probe instruction".into());
+            if libc::WIFSTOPPED(status) && status >> 16 == 0 {
+                self.signals.insert(tid, libc::WSTOPSIG(status));
+                control(libc::PTRACE_SINGLESTEP, tid, 0, 0)?;
+                self.stopped.remove(&tid);
+                continue;
             }
-            std::thread::sleep(Duration::from_micros(50));
+            break;
         }
         if let Some(breakpoint) = self.breakpoints.get_mut(&address) {
             if breakpoint.entries.is_empty() && breakpoint.returns == 0 {
@@ -1958,4 +2124,108 @@ fn simd_register_low(tid: i32, index: usize) -> Result<u64> {
         .filter(|_| offset + 8 <= iov.iov_len)
         .ok_or("incomplete SIMD register set")?;
     Ok(u64::from_ne_bytes(raw.try_into().unwrap()))
+}
+
+#[cfg(test)]
+mod notification_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static NOTIFICATIONS: AtomicUsize = AtomicUsize::new(0);
+    extern "C" fn notify(_: libc::c_int) {
+        NOTIFICATIONS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn waits_preserve_masks_handlers_and_unrelated_child_statuses() {
+        const FIXTURE: &str = "POORTRACE_CHILD_NOTIFICATION_FIXTURE";
+        if std::env::var_os(FIXTURE).is_none() {
+            // Signal dispositions are process-wide: isolate this regression from
+            // the test harness's other threads and child processes.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "functions::notification_tests::waits_preserve_masks_handlers_and_unrelated_child_statuses", "--nocapture", "--test-threads=1"])
+                .env(FIXTURE, "1").output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        unsafe {
+            let mut original_action: libc::sigaction = std::mem::zeroed();
+            assert_eq!(
+                libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut original_action),
+                0
+            );
+            let mut blocked: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut blocked);
+            libc::sigaddset(&mut blocked, libc::SIGUSR1);
+            let mut original_mask = std::mem::zeroed();
+            assert_eq!(
+                libc::pthread_sigmask(libc::SIG_BLOCK, &blocked, &mut original_mask),
+                0
+            );
+            for handler in [libc::SIG_DFL, notify as *const () as usize] {
+                let mut action: libc::sigaction = std::mem::zeroed();
+                action.sa_sigaction = handler;
+                libc::sigemptyset(&mut action.sa_mask);
+                assert_eq!(
+                    libc::sigaction(libc::SIGCHLD, &action, std::ptr::null_mut()),
+                    0
+                );
+                let mut before = std::mem::zeroed();
+                libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &mut before);
+                let mut gate = [0; 2];
+                assert_eq!(libc::pipe2(gate.as_mut_ptr(), libc::O_CLOEXEC), 0);
+                let child = libc::fork();
+                assert!(child >= 0);
+                if child == 0 {
+                    libc::close(gate[1]);
+                    let mut byte = 0u8;
+                    libc::read(gate[0], (&mut byte as *mut u8).cast(), 1);
+                    libc::_exit(42);
+                }
+                libc::close(gate[0]);
+                let other = libc::fork();
+                assert!(other >= 0);
+                if other == 0 {
+                    libc::_exit(17);
+                }
+                // An unrelated exit must neither satisfy a TID-specific wait nor
+                // get reaped while waiting for the child blocked behind its gate.
+                assert!(
+                    wait_status(child, Instant::now() + Duration::from_millis(3))
+                        .unwrap()
+                        .is_none()
+                );
+                let (_, status) = wait_status(other, Instant::now() + Duration::from_secs(1))
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(libc::WEXITSTATUS(status), 17);
+                assert_eq!(libc::write(gate[1], (&1u8 as *const u8).cast(), 1), 1);
+                libc::close(gate[1]);
+                let (_, status) = wait_status(child, Instant::now() + Duration::from_secs(1))
+                    .unwrap()
+                    .unwrap();
+                assert!(libc::WIFEXITED(status));
+                assert_eq!(libc::WEXITSTATUS(status), 42);
+                let mut after = std::mem::zeroed();
+                libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &mut after);
+                for signal in 1..=64 {
+                    assert_eq!(
+                        libc::sigismember(&before, signal),
+                        libc::sigismember(&after, signal)
+                    );
+                }
+                let mut after_action: libc::sigaction = std::mem::zeroed();
+                libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut after_action);
+                assert_eq!(after_action.sa_sigaction, handler);
+            }
+            assert!(NOTIFICATIONS.load(Ordering::Relaxed) > 0);
+            libc::pthread_sigmask(libc::SIG_SETMASK, &original_mask, std::ptr::null_mut());
+            libc::sigaction(libc::SIGCHLD, &original_action, std::ptr::null_mut());
+        }
+    }
 }
