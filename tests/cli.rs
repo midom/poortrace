@@ -1462,3 +1462,55 @@ fn live_uprobes_hot_loop_counts_and_timer_progress() {
     }
     std::fs::remove_dir_all(directory).unwrap();
 }
+
+#[test]
+fn scalar_print_and_time_cli_record_and_replay() {
+    let journal = std::env::temp_dir().join(format!(
+        "poortrace-time-output-{}.jsonl",
+        std::process::id()
+    ));
+    let source = r#"BEGIN { time("%s "); print(probe); print(1.5); }"#;
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let out = Command::new(env!("CARGO_BIN_EXE_poortrace"))
+        .args(["-q", "--record"])
+        .arg(&journal)
+        .args(["-e", source])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", errors(&out));
+    let after = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let text = output(&out);
+    let (epoch, suffix) = text.split_once(' ').unwrap();
+    assert!(
+        (before..=after).contains(&epoch.parse::<u64>().unwrap()),
+        "{text}"
+    );
+    assert_eq!(suffix, "BEGIN\n1.5\n");
+    let archive = poortrace::recording::read_full(&journal).unwrap();
+    assert!(
+        archive
+            .events
+            .iter()
+            .flat_map(|event| &event.helpers)
+            .any(|helper| helper.op == 160
+                && helper.descriptor.as_deref() == Some("%s ")
+                && helper.text.as_ref().is_some_and(|time| time.ends_with(' ')))
+    );
+    for alternate in [false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_poortrace"));
+        command.args(["-q", "--replay"]).arg(&journal);
+        if alternate {
+            command.args(["-e", source]);
+        }
+        let replayed = command.output().unwrap();
+        assert!(replayed.status.success(), "{}", errors(&replayed));
+        assert_eq!(output(&replayed), text);
+    }
+    std::fs::remove_file(journal).unwrap();
+}

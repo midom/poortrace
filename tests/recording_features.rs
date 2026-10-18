@@ -785,3 +785,49 @@ fn alternate_replay_matches_aliases_and_process_scoped_function_patterns_offline
     );
     assert_eq!(text, "sample\n");
 }
+
+#[test]
+fn time_replay_uses_captured_text_and_validates_formats_and_result_types() {
+    let program = Program::compile(r#"BEGIN { time("%H:%M:%S "); print(probe); }"#).unwrap();
+    for alternate in [false, true] {
+        for (descriptor, text, success) in [
+            ("%H:%M:%S ", Some("01:02:03 "), true),
+            ("%Y ", Some("2001 "), false),
+            ("%H:%M:%S ", None, false),
+        ] {
+            let mut output = Vec::new();
+            {
+                let mut state = program.state(&mut output);
+                let helpers = vec![Helper {
+                    op: 160,
+                    value: 0,
+                    length: 0xdeadbeef,
+                    number: 42,
+                    text: text.map(str::to_string),
+                    descriptor: Some(descriptor.into()),
+                    error: None,
+                }];
+                if alternate {
+                    state.replay_captured_helpers(helpers);
+                } else {
+                    state.replay_helpers(helpers);
+                }
+                program.invoke(0, &mut state, &Event::new(c"gone", c"BEGIN"));
+                assert_eq!(state.flush().is_ok(), success, "{:?}", state.error);
+            }
+            if success {
+                assert_eq!(output, b"01:02:03 BEGIN\n");
+            } else {
+                assert!(output.is_empty());
+            }
+        }
+        let mut state = program.state(Vec::new());
+        if alternate {
+            state.replay_captured_helpers(vec![]);
+        } else {
+            state.replay_helpers(vec![]);
+        }
+        program.invoke(0, &mut state, &Event::new(c"gone", c"BEGIN"));
+        assert!(state.flush().is_err());
+    }
+}

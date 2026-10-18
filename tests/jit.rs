@@ -800,3 +800,63 @@ fn short_probe_providers_compile_with_normalized_handler_names() {
     }
     assert_eq!(String::from_utf8(bytes).unwrap(), "interval:ms:10\n");
 }
+
+#[test]
+fn print_scalar_values_expressions_and_map_entries() {
+    let out = execute(
+        r#"BEGIN {
+        print(probe); print(comm); print(-42); print(1.25); print(2 + 3);
+        $value = "hello"; print($value); print(pid == 42);
+        @values[3] = 7; print(@values[3]); print(@values); clear(@values);
+        @scalar = 9; print(@scalar); clear(@scalar);
+    }"#,
+        &[0],
+    );
+    assert_eq!(
+        out,
+        "synthetic\nworker\n-42\n1.25\n5\nhello\n1\n7\n@values[3]: 7\n@scalar: 9\n"
+    );
+    for source in [
+        "BEGIN { print(); }",
+        "BEGIN { print(1, 2); }",
+        "BEGIN { clear(1); }",
+        "BEGIN { @x[1]=2; clear(@x[1]); }",
+    ] {
+        assert!(Program::compile(source).is_err(), "{source}");
+    }
+}
+
+#[test]
+fn time_formats_wall_clock_and_default_output() {
+    let out = execute(r#"BEGIN { time("literal %%\n"); time(""); time(); }"#, &[0]);
+    let lines: Vec<_> = out.lines().collect();
+    assert_eq!(lines.len(), 2, "{out}");
+    assert_eq!(lines[0], "literal %");
+    let clock = lines[1].as_bytes();
+    assert_eq!(clock.len(), 8, "{out}");
+    assert_eq!(clock[2], b':');
+    assert_eq!(clock[5], b':');
+    assert!(
+        clock
+            .iter()
+            .enumerate()
+            .all(|(i, b)| i == 2 || i == 5 || b.is_ascii_digit())
+    );
+    for source in [
+        "BEGIN { time(1); }",
+        "BEGIN { $fmt=\"%H\"; time($fmt); }",
+        "BEGIN { time(\"%H\", 1); }",
+        "BEGIN { $value=time(); }",
+    ] {
+        assert!(Program::compile(source).is_err(), "{source}");
+    }
+    assert!(Program::compile(&format!("BEGIN {{ time({:?}); }}", "x".repeat(1025))).is_err());
+    let program = Program::compile(r#"BEGIN { time("%5000Y"); print("unreachable"); }"#).unwrap();
+    let mut output = Vec::new();
+    {
+        let mut state = program.state(&mut output);
+        program.invoke(0, &mut state, &Event::new(c"worker", c"BEGIN"));
+        assert!(state.flush().is_err());
+    }
+    assert!(output.is_empty());
+}

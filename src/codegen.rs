@@ -1923,12 +1923,43 @@ impl Generator {
                             "call void @pt_printf(ptr %state, i64 {id}, ptr {array})"
                         ));
                     }
+                    "time" => {
+                        let format = match args.as_slice() {
+                            [] => "%H:%M:%S\n",
+                            [Expr::String(format)] => format,
+                            _ => {
+                                return Err(
+                                    "time requires no arguments or one literal format string"
+                                        .into(),
+                                );
+                            }
+                        };
+                        if format.len() > 1024 || format.contains('\0') {
+                            return Err("time format must be at most 1024 bytes without NUL".into());
+                        }
+                        let descriptor = self.expr(&Expr::String(format.into()))?.reg;
+                        let value = self.value(format!("call i64 @pt_helper(ptr %state, ptr %event, i64 160, i64 0, i64 {descriptor})"), Type::String);
+                        self.output_value("%s", value)?;
+                    }
                     "delete" => {
                         let [Expr::Map(name, keys)] = args.as_slice() else {
                             return Err("delete requires one map entry".into());
                         };
                         let (id, array) = self.keys(name, keys)?;
                         self.emit(format!("call void @pt_map_update(ptr %state, i64 {id}, ptr {array}, i64 {}, i64 0, i64 8)",keys.len()));
+                    }
+                    "print" if !matches!(args.as_slice(), [Expr::Map(_, keys)] if keys.is_empty()) =>
+                    {
+                        let [expr] = args.as_slice() else {
+                            return Err("print requires one value or whole map".into());
+                        };
+                        let value = self.expr(expr)?;
+                        let format = match value.ty {
+                            Type::Number => "%d\n",
+                            Type::Float => "%g\n",
+                            Type::String | Type::Stack => "%s\n",
+                        };
+                        self.output_value(format, value)?;
                     }
                     "print" | "clear" => {
                         let [Expr::Map(map, keys)] = args.as_slice() else {
@@ -1958,6 +1989,17 @@ impl Generator {
             self.emit(format!("br i1 {c}, label %return, label %{next}"));
             self.label(&next);
         }
+        Ok(())
+    }
+    fn output_value(&mut self, format: &str, value: Value) -> Result<()> {
+        let format = Format::parse(format)?;
+        let id = self.formats.len();
+        self.formats.push(format);
+        let array = self.value("alloca i64", Type::Number).reg;
+        self.emit(format!("store i64 {}, ptr {array}", value.reg));
+        self.emit(format!(
+            "call void @pt_printf(ptr %state, i64 {id}, ptr {array})"
+        ));
         Ok(())
     }
     fn helper(&mut self, op: u64, address: String, length: i64, ty: Type) -> Result<Value> {

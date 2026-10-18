@@ -1,0 +1,5 @@
+// Print a wall-clock prefix and the current probe name once per second.
+interval:s:1 {
+    time("%H:%M:%S ");
+    print(probe);
+}

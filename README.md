@@ -225,7 +225,19 @@ END { printf("finished\n"); }
   symbols. Using it, or `--branch-stack`, requests branch history. The PMU must
   support it; `examples/branches.pt` uses a hardware branch event. The most
   recent 128 branch entries are retained. This is history, not a call stack.
-* `print(@map)`, `clear(@map)`, `exit()`. Maps are also printed automatically
+* `print(value)` prints a string, integer, float, stack, or scalar expression
+  followed by a newline: `print(probe)`, `print(pid)`, `print(1.5)`, or
+  `print(@counts[tid])`. `print(@map)` retains whole-map rendering, including
+  a keyless scalar map; use `printf` for explicit formatting or no newline.
+* `time()` prints the local wall-clock time as `HH:MM:SS` followed by a newline.
+  `time("%Y-%m-%d %H:%M:%S ")` accepts a literal `strftime` format and adds no
+  automatic newline. It is an output statement, using the time the handler
+  executes, while `nsecs` remains the monotonic event timestamp. Formats are
+  limited to 1024 bytes and rendered output to 4095 bytes. Recorded invocations
+  capture the formatted text; replay reuses it without consulting the current
+  clock or timezone. Alternate replay requires a captured result for the same
+  format. See `examples/time.pt`.
+* `clear(@map)`, `exit()`. Maps are also printed automatically
   at shutdown unless `--no-print-maps` is given. Clear a map after an explicit
   final print if duplicate output is undesirable.
 

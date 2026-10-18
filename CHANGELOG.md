@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Allow `print()` on scalar values, expressions, and map entries; add formatted wall-clock output with `time()` and capture its text for deterministic replay.
+
 - Wake ptrace function loops on child-status notifications, resume targets immediately after safe breakpoint rearming, and avoid redundant per-hit thread scans. Add exact-count hot-loop regressions and a reproducible function throughput benchmark.
 
 - Unlimited probe/breakpoint counts by default, optional `--max-probes` and `--max-breakpoints` budgets, and batched/indexed native function attachment for large wildcard matches.

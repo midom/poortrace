@@ -7,7 +7,7 @@ use std::{path::PathBuf, time::Duration};
 #[command(
     version,
     about = "LLVM JIT scripts over user-mode perf and ptrace tracing",
-    after_help = "Examples:\n  poortrace -e 'interval:ms:100 { @ticks = count(); }' --duration 1\n  poortrace -e 'profile:hz:99 { @[comm, ip] = count(); }' -- ./workload\n  poortrace -p 1234 -e 'profile:hz:99 { @[ustack] = count(); }'\n  poortrace -p 1234 -e 'software:page-faults:1 { @[tid] = count(); }'\n\nPerf/ptrace policy and PMU support are enforced by the host. No BPF programs are loaded."
+    after_help = "Examples:\n  poortrace -e 'interval:ms:100 { @ticks = count(); }' --duration 1\n  poortrace -e 'profile:hz:99 { @[comm, ip] = count(); }' -- ./workload\n  poortrace -p 1234 -e 'profile:hz:99 { @[ustack] = count(); }'\n  poortrace -p 1234 -e 'software:page-faults:1 { @[tid] = count(); }'\n  poortrace -e 'interval:s:1 { time(); print(probe); }' --duration 3\n\nPerf/ptrace policy and PMU support are enforced by the host. No BPF programs are loaded."
 )]
 pub(super) struct Args {
     /// Inline script (provider aliases include u/ur; u:FUNCTION searches -p PID images)

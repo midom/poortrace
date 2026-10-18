@@ -925,6 +925,43 @@ unsafe fn helper_inner(
     let state = unsafe { &mut *state };
     let event = unsafe { &*event };
     let result: Result<String> = match op {
+        160 => {
+            let format = unsafe { CStr::from_ptr(length as *const c_char) };
+            (|| -> Result<String> {
+                if format.to_bytes().len() > 1024 {
+                    return Err("time format exceeds 1024 bytes".into());
+                }
+                if format.to_bytes().is_empty() {
+                    return Ok(String::new());
+                }
+                let mut now: libc::timespec = unsafe { std::mem::zeroed() };
+                if unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut now) } != 0 {
+                    return Err(format!("time: {}", std::io::Error::last_os_error()));
+                }
+                let mut local: libc::tm = unsafe { std::mem::zeroed() };
+                if unsafe { libc::localtime_r(&now.tv_sec, &mut local) }.is_null() {
+                    return Err("time: local calendar conversion failed".into());
+                }
+                // A literal prefix distinguishes valid empty output (e.g. a
+                // locale's empty zone name) from strftime's overflow result.
+                let mut prefixed = vec![b' '];
+                prefixed.extend_from_slice(format.to_bytes());
+                let prefixed = CString::new(prefixed).unwrap();
+                let mut output = [0u8; 4097];
+                let written = unsafe {
+                    libc::strftime(
+                        output.as_mut_ptr().cast(),
+                        output.len(),
+                        prefixed.as_ptr(),
+                        &local,
+                    )
+                };
+                if written == 0 {
+                    return Err("time formatting failed or output exceeds 4095 bytes".into());
+                }
+                Ok(String::from_utf8_lossy(&output[1..written]).into_owned())
+            })()
+        }
         115 => {
             let descriptor = unsafe { CStr::from_ptr(length as *const c_char) }.to_string_lossy();
             (|| -> Result<String> {
@@ -1521,29 +1558,30 @@ unsafe fn recorded_helper(
             | 120
             | 121
             | 125
-            | 150..=154
+            | 150..=154 | 160
     );
     let empty = if string_result {
         c"".as_ptr() as u64
     } else {
         0
     };
-    let descriptor =
-        if (40..=46).contains(&op) || ((122..=125).contains(&op) || matches!(op, 114 | 115)) {
-            Some(
-                unsafe { CStr::from_ptr(length as *const c_char) }
-                    .to_string_lossy()
-                    .into_owned(),
-            )
-        } else if matches!(op, 80 | 81) {
-            Some(
-                unsafe { CStr::from_ptr(value as *const c_char) }
-                    .to_string_lossy()
-                    .into_owned(),
-            )
-        } else {
-            None
-        };
+    let descriptor = if (40..=46).contains(&op)
+        || ((122..=125).contains(&op) || matches!(op, 114 | 115 | 160))
+    {
+        Some(
+            unsafe { CStr::from_ptr(length as *const c_char) }
+                .to_string_lossy()
+                .into_owned(),
+        )
+    } else if matches!(op, 80 | 81) {
+        Some(
+            unsafe { CStr::from_ptr(value as *const c_char) }
+                .to_string_lossy()
+                .into_owned(),
+        )
+    } else {
+        None
+    };
     if s.replay_lookup && matches!(op, 11..=16 | 20 | 30 | 31 | 80 | 81) {
         return unsafe { helper_inner(state, event, op, value, length) };
     }
@@ -1707,7 +1745,7 @@ unsafe fn recorded_helper(
                 .filter(|item| {
                     item.op == op
                         && if (40..=46).contains(&op)
-                            || ((122..=125).contains(&op) || matches!(op, 114 | 115))
+                            || ((122..=125).contains(&op) || matches!(op, 114 | 115 | 160))
                         {
                             item.value == value && item.descriptor == descriptor
                         } else if matches!(op, 80 | 81) {
@@ -1741,13 +1779,18 @@ unsafe fn recorded_helper(
             );
             return empty;
         };
+        if op == 160 && item.descriptor != descriptor {
+            s.fail("recording time format does not match script".into());
+            return empty;
+        }
         if item.op != op
             || (!(11..=16).contains(&op)
                 && !((40..=46).contains(&op)
-                    || ((122..=125).contains(&op) || matches!(op, 114 | 115)))
+                    || ((122..=125).contains(&op) || matches!(op, 114 | 115 | 160)))
                 && !matches!(op, 80 | 81)
                 && (item.value, item.length) != (value, length))
-            || ((40..=46).contains(&op) || ((122..=125).contains(&op) || matches!(op, 114 | 115)))
+            || ((40..=46).contains(&op)
+                || ((122..=125).contains(&op) || matches!(op, 114 | 115 | 160)))
                 && item.value != value
             || op == 16 && item.length != length
         {
@@ -1784,31 +1827,7 @@ unsafe fn recorded_helper(
     };
     let s = unsafe { &mut *state };
     if s.recorder.is_some() {
-        let text = if matches!(
-            op,
-            0 | 1
-                | 2
-                | 10
-                | 15
-                | 16
-                | 43
-                | 45
-                | 46
-                | 50
-                | 51
-                | 52
-                | 53
-                | 60
-                | 70
-                | 81
-                | 100
-                | 114
-                | 115
-                | 120
-                | 121
-                | 125
-                | 150..=154
-        ) {
+        let text = if string_result {
             Some(
                 unsafe { CStr::from_ptr(result as *const c_char) }
                     .to_string_lossy()
