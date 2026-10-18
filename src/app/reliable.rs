@@ -1,5 +1,21 @@
 //! Explicit synchronous snapshots: no perf descriptors or asynchronous handlers.
-use super::*;
+
+use super::events::dispatch_function_events;
+use super::{
+    cli::Args,
+    events::{invoke, invoke_kind, monotonic_ns},
+    process::{
+        Child, INTERRUPTED, command_for, finalize_recorded_child, install_signals,
+        kill_owned_descendants, threads, track_owned_descendants,
+    },
+    report::{configure_report, finish_report},
+};
+use poortrace::{Result, codegen::Program, language::Probe};
+use std::{
+    io,
+    sync::atomic::Ordering,
+    time::{Duration, Instant},
+};
 
 fn profile_period(probe: &Probe) -> Option<Duration> {
     match probe {

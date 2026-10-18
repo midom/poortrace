@@ -965,6 +965,14 @@ frames retain raw addresses.
 
 ## Development and validation
 
+The library modules in `src/` implement the tracing language, JIT, runtime,
+collectors, and recording formats. The binary entry point is `src/main.rs`;
+private CLI modules live in `src/app/`. Start with `app/mod.rs` for probe
+preparation and backend selection, `app/cli.rs` for options, and the `perf`,
+`syscalls`, `functions`, `reliable`, or `stat` module for a backend's event loop.
+Shared process ownership, event dispatch, replay, and reporting live in
+`app/process.rs`, `app/events.rs`, `app/replay.rs`, and `app/report.rs`.
+
 ```sh
 cargo fmt --check
 LLVM_CONFIG=llvm-config-18 cargo clippy --locked --all-targets -- -D warnings

@@ -53,10 +53,18 @@ Serde for profile/report formats; LLVM is accessed through direct C API bindings
   syscall-name tables live in `src/syscalls/{x86_64,aarch64}.txt`.
 - `src/perf.rs`: perf attributes, event descriptors, mmap ring consumption,
   record decoding, and perf access diagnostics.
-- `src/reliable.rs`: stopped-target CLI backend, wall-clock profile snapshots,
+- `src/app/reliable.rs`: stopped-target CLI backend, wall-clock profile snapshots,
   and verified pauses around handlers; it never opens perf descriptors.
-- `src/main.rs`: CLI, signal handling, process launch gate, thread discovery,
-  stream attachment, polling, timers, and shutdown.
+- `src/main.rs`: binary entry point and exit/error handling.
+- `src/app/mod.rs` and `src/app/cli.rs`: CLI orchestration, probe preparation,
+  backend selection, argument definitions, and value parsers.
+- `src/app/process.rs`: signal handling, process launch gate, owned-child output
+  and cleanup, and thread discovery.
+- `src/app/events.rs`: shared event construction and handler dispatch.
+- `src/app/{perf,syscalls,functions,stat}.rs`: CLI backend loops for sampling,
+  syscall/lifecycle tracing, function tracing, and grouped counters respectively.
+- `src/app/replay.rs` and `src/app/report.rs`: offline CLI replay, runtime and
+  recording configuration, and final report output.
 - `build.rs`: discovers LLVM through `llvm-config`, selects shared or static
   linking, and embeds its version and (for shared builds) runtime library path.
 - `tests/jit.rs`: native JIT integration tests using synthetic events.
