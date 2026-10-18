@@ -18,7 +18,13 @@ jobs:
       - run: cargo clippy --locked --all-targets --features '${{ matrix.features }}' -- -D warnings
         env:
           LLVM_CONFIG: llvm-config-18
-      - run: cargo test --locked --features '${{ matrix.features }}'
+      - name: Unit and integration tests
+        run: |
+          set -o pipefail
+          cargo test --locked --features '${{ matrix.features }}' 2>&1 | tee "$RUNNER_TEMP/poortrace-tests.log" || {
+            python3 -c 'import pathlib,sys; text=pathlib.Path(sys.argv[1]).read_text(errors="replace")[-12000:]; print("::error title=Cargo test failure::" + text.replace("%","%25").replace("\r","%0D").replace("\n","%0A"))' "$RUNNER_TEMP/poortrace-tests.log"
+            exit 1
+          }
         env:
           LLVM_CONFIG: llvm-config-18
       - uses: actions/setup-node@v4
