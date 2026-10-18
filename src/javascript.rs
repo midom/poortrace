@@ -16,6 +16,7 @@ struct Layout {
     values: BTreeMap<String, i32>,
     version: (i32, i32),
     interpreter_ranges: Vec<(u64, u64)>,
+    code_cache: std::sync::Mutex<Vec<(u64, u64, u64)>>,
 }
 fn word(pid: u32, address: u64) -> Result<u64> {
     Ok(u64::from_ne_bytes(
@@ -391,7 +392,7 @@ impl Layout {
         // Trusted byte-array layouts below are verified for noncompressed V8
         // 12.4. Require a known interpreter PC so optimized stack slots cannot
         // accidentally be interpreted as bytecode state.
-        if self.version != (12, 4)
+        if !matches!(self.version, (11, 3) | (12, 4) | (13, 6))
             || self.get("TaggedSize")? != 8
             || !self
                 .interpreter_ranges
@@ -407,41 +408,28 @@ impl Layout {
         let raw_offset = self.smi(stack_word(add(fp, self.get("off_fp_bytecode_offset")?)?)?)?;
         let offset = raw_offset - self.get("class_BytecodeArray__data__uintptr_t")? as i64
             + self.get("HeapObjectTag")? as i64;
-        let length = self.smi(self.field(pid, bytecode, "class_BytecodeArray__length__SMI")?)?;
+        let length = self.smi(if self.version == (11, 3) {
+            word(pid, add(self.object(bytecode)?, 8)?)?
+        } else {
+            self.field(pid, bytecode, "class_BytecodeArray__length__SMI")?
+        })?;
         if offset < 0 || offset >= length {
             return Err("invalid V8 bytecode position".into());
         }
-        let table = self.tagged(
-            pid,
-            add(
-                self.object(bytecode)?,
-                self.get("class_BytecodeArray__wrapper__Tagged_BytecodeWrapper_")?
-                    .checked_add(8)
-                    .ok_or("V8 bytecode offset overflow")?,
-            )?,
-            bytecode,
-        )?;
-        if self.kind(pid, table)? != self.get("type_TrustedByteArray__TRUSTED_BYTE_ARRAY_TYPE")? {
-            return Err(
-                "V8 source-position table is unavailable (use --no-enable-lazy-source-positions)"
-                    .into(),
-            );
-        }
-        let base = self.object(table)?;
-        let length = self.smi(word(pid, add(base, 8)?)?)?;
-        if !(1..=65536).contains(&length) {
-            return Err("invalid V8 source-position table length".into());
-        }
-        let mut bytes = Vec::new();
-        for offset in (0..length as usize).step_by(4096) {
-            bytes.extend(memory::read(
-                pid,
-                add(base, 16 + offset as i32)?,
-                (length as usize - offset).min(4096),
-                false,
-            )?);
-        }
-        source_position(&bytes, offset)
+        let table_offset = if self.version == (11, 3) {
+            32
+        } else {
+            self.get("class_BytecodeArray__wrapper__Tagged_BytecodeWrapper_")?
+                .checked_add(8)
+                .ok_or("V8 bytecode offset overflow")?
+        };
+        let table = word(pid, add(self.object(bytecode)?, table_offset)?)?;
+        let kind = if self.version == (11, 3) {
+            "type_ByteArray__BYTE_ARRAY_TYPE"
+        } else {
+            "type_TrustedByteArray__TRUSTED_BYTE_ARRAY_TYPE"
+        };
+        source_position(&self.byte_array(pid, table, kind)?, offset)
     }
     fn byte_array(&self, pid: u32, value: u64, kind: &str) -> Result<Vec<u8>> {
         if self.kind(pid, value)? != self.get(kind)? {
@@ -474,6 +462,115 @@ impl Layout {
         }
         word(pid, add(base, 16 + index * 8)?)
     }
+    fn code_bounds(&self, pid: u32, code: u64) -> Result<(u64, u64)> {
+        if self.kind(pid, code)? != self.get("type_Code__CODE_TYPE")? {
+            return Err("not V8 Code".into());
+        }
+        let base = self.object(code)?;
+        let (start, offset) = if self.version == (11, 3) {
+            // V8 11.3 CODE_DATA_FIELDS: position, stream, entrypoint,
+            // flags(4), builtinID(2), specificFlags(2), instruction_size.
+            let position = self.get("class_Code__source_position_table__ByteArray")?;
+            (
+                word(
+                    pid,
+                    add(
+                        base,
+                        position.checked_add(16).ok_or("V8 code offset overflow")?,
+                    )?,
+                )?,
+                position.checked_add(32).ok_or("V8 code offset overflow")?,
+            )
+        } else {
+            let entry = self.get("class_Code__instruction_start__Address")?;
+            let extra = if self.version == (13, 6) { 12 } else { 8 };
+            if self.get("class_Code__flags__uint32_t")?
+                != entry.checked_add(extra).ok_or("V8 code offset overflow")?
+            {
+                return Err("unsupported sandboxed Code entrypoint".into());
+            }
+            (
+                word(pid, add(base, entry)?)?,
+                self.get("class_Code__instruction_size__int")?,
+            )
+        };
+        let size = u32::from_ne_bytes(
+            memory::read(pid, add(base, offset)?, 4, false)?
+                .try_into()
+                .unwrap(),
+        ) as u64;
+        if size == 0 || size > 64 * 1024 * 1024 {
+            return Err("invalid V8 code size".into());
+        }
+        Ok((
+            start,
+            start.checked_add(size).ok_or("V8 code range overflow")?,
+        ))
+    }
+    fn code_for_pc(&self, pid: u32, pc: u64) -> Result<u64> {
+        if let Ok(cache) = self.code_cache.lock() {
+            for &(start, end, code) in cache.iter() {
+                if start <= pc && pc < end && self.code_bounds(pid, code).ok() == Some((start, end))
+                {
+                    return Ok(code);
+                }
+            }
+        }
+        // Leaptiering removes JSFunction.code in V8 13.6. Read bounded code
+        // pages backward for an InstructionStream header, and require both
+        // its Code back-pointer and Code's reverse pointer/range to agree.
+        let stream_kind = self.get("type_InstructionStream__INSTRUCTION_STREAM_TYPE")?;
+        let lower = pc.saturating_sub(65536) & !4095;
+        let mut page = pc & !4095;
+        loop {
+            if let Ok(bytes) = memory::read(pid, page, 4096, true) {
+                for offset in (0..bytes.len().saturating_sub(7)).step_by(8).rev() {
+                    let address = page + offset as u64;
+                    if address > pc {
+                        continue;
+                    }
+                    let map = u64::from_ne_bytes(bytes[offset..offset + 8].try_into().unwrap());
+                    if map < 65536 || map >> 56 != 0 || map & 7 != 1 {
+                        continue;
+                    }
+                    let candidate = address + 1;
+                    if self.kind(pid, candidate).ok() != Some(stream_kind) {
+                        continue;
+                    }
+                    let Ok(code) = word(pid, address + 8) else {
+                        continue;
+                    };
+                    let Ok((start, end)) = self.code_bounds(pid, code) else {
+                        continue;
+                    };
+                    if !(start <= pc && pc < end)
+                        || self
+                            .field(
+                                pid,
+                                code,
+                                "class_Code__instruction_stream__Tagged_InstructionStream_",
+                            )
+                            .ok()
+                            != Some(candidate)
+                    {
+                        continue;
+                    }
+                    if let Ok(mut cache) = self.code_cache.lock() {
+                        if cache.len() >= 256 {
+                            cache.clear();
+                        }
+                        cache.push((start, end, code));
+                    }
+                    return Ok(code);
+                }
+            }
+            if page <= lower {
+                break;
+            }
+            page = page.saturating_sub(4096);
+        }
+        Err("V8 instruction header unavailable within64KiB of sampled PC".into())
+    }
     fn optimized_frames(
         &self,
         pid: u32,
@@ -481,16 +578,8 @@ impl Layout {
         pc: u64,
         is_return: bool,
     ) -> Result<String> {
-        if self.version != (12, 4) || self.get("TaggedSize")? != 8 {
-            return Err("optimized positions require noncompressed V8 12.4".into());
-        }
-        if self.get("class_Code__flags__uint32_t")?
-            != self
-                .get("class_Code__instruction_start__Address")?
-                .checked_add(8)
-                .ok_or("V8 code offset overflow")?
-        {
-            return Err("V8 sandboxed instruction pointers are unsupported".into());
+        if !matches!(self.version, (11, 3) | (12, 4) | (13, 6)) || self.get("TaggedSize")? != 8 {
+            return Err("unsupported optimized V8 layout".into());
         }
         let function_kind = self.kind(pid, function)?;
         if function_kind < self.get("FirstJSFunctionType")?
@@ -498,46 +587,67 @@ impl Layout {
         {
             return Err("not a JavaScript function".into());
         }
-        let code = self.field(pid, function, "class_JSFunction__code__Tagged_Code_")?;
-        if self.kind(pid, code)? != self.get("type_Code__CODE_TYPE")? {
-            return Err("invalid V8 function code".into());
-        }
-        let start = self.field(pid, code, "class_Code__instruction_start__Address")?;
-        let length = u32::from_ne_bytes(
-            memory::read(
+        let code = match self.version {
+            (11, 3) => self.tagged(
                 pid,
                 add(
-                    self.object(code)?,
-                    self.get("class_Code__instruction_size__int")?,
+                    self.object(function)?,
+                    self.get("class_JSFunction__shared__SharedFunctionInfo")?
+                        .checked_add(24)
+                        .ok_or("V8 function offset overflow")?,
                 )?,
-                4,
-                false,
-            )?
-            .try_into()
-            .unwrap(),
-        ) as u64;
-        if length == 0 || length > 64 * 1024 * 1024 || pc < start || pc - start >= length {
+                function,
+            )?,
+            (13, 6) => self.code_for_pc(pid, pc)?,
+            _ => self.field(pid, function, "class_JSFunction__code__Tagged_Code_")?,
+        };
+        let (start, end) = self.code_bounds(pid, code)?;
+        if pc < start || pc >= end {
             return Err("PC is outside current V8 function code".into());
         }
         let offset = (pc - start).saturating_sub(u64::from(is_return));
-        // Code::CODE_DATA_FIELDS puts deopt and position pointers directly
-        // before the exported wrapper slot. Gate the private adjacency above.
-        let wrapper = self.get("class_Code__wrapper__Tagged_CodeWrapper_")?;
-        if !(16..=65536).contains(&wrapper) {
-            return Err("invalid V8 code wrapper offset".into());
-        }
-        let table = word(pid, add(self.object(code)?, wrapper - 8)?)?;
-        let raw = source_position_raw(
-            &self.byte_array(pid, table, "type_TrustedByteArray__TRUSTED_BYTE_ARRAY_TYPE")?,
-            offset as i64,
-        )?;
+        let (table, deopt) = if self.version == (11, 3) {
+            (
+                self.field(pid, code, "class_Code__source_position_table__ByteArray")?,
+                self.field(pid, code, "class_Code__deoptimization_data__FixedArray")?,
+            )
+        } else {
+            let wrapper = self.get("class_Code__wrapper__Tagged_CodeWrapper_")?;
+            if !(16..=65536).contains(&wrapper) {
+                return Err("invalid V8 code wrapper offset".into());
+            }
+            (
+                word(pid, add(self.object(code)?, wrapper - 8)?)?,
+                word(pid, add(self.object(code)?, wrapper - 16)?)?,
+            )
+        };
+        let byte_kind = if self.version == (11, 3) {
+            "type_ByteArray__BYTE_ARRAY_TYPE"
+        } else {
+            "type_TrustedByteArray__TRUSTED_BYTE_ARRAY_TYPE"
+        };
+        let deopt_kind = match self.version {
+            (11, 3) => "type_FixedArray__FIXED_ARRAY_TYPE",
+            (13, 6) => "type_ProtectedFixedArray__PROTECTED_FIXED_ARRAY_TYPE",
+            _ => "type_TrustedFixedArray__TRUSTED_FIXED_ARRAY_TYPE",
+        };
+        let inline_kind = if self.version == (13, 6) {
+            "type_TrustedByteArray__TRUSTED_BYTE_ARRAY_TYPE"
+        } else {
+            "type_ByteArray__BYTE_ARRAY_TYPE"
+        };
+        let literal_kind = if self.version == (13, 6) {
+            "type_TrustedWeakFixedArray__TRUSTED_WEAK_FIXED_ARRAY_TYPE"
+        } else {
+            "type_WeakFixedArray__WEAK_FIXED_ARRAY_TYPE"
+        };
+        let raw = source_position_raw(&self.byte_array(pid, table, byte_kind)?, offset as i64)?;
         let mut raw = raw;
         let shared = self.field(
             pid,
             function,
             "class_JSFunction__shared__SharedFunctionInfo",
         )?;
-        let deopt = word(pid, add(self.object(code)?, wrapper - 16)?)?;
         let mut output = String::new();
         let mut seen = BTreeSet::new();
         for _ in 0..64 {
@@ -560,9 +670,9 @@ impl Layout {
                 pid,
                 deopt,
                 self.get("DeoptimizationDataInliningPositionsIndex")?,
-                "type_TrustedFixedArray__TRUSTED_FIXED_ARRAY_TYPE",
+                deopt_kind,
             )?;
-            let data = self.byte_array(pid, positions, "type_ByteArray__BYTE_ARRAY_TYPE")?;
+            let data = self.byte_array(pid, positions, inline_kind)?;
             let slot = (inline as usize)
                 .checked_mul(16)
                 .ok_or("V8 inline position overflow")?;
@@ -575,15 +685,10 @@ impl Layout {
                 pid,
                 deopt,
                 self.get("DeoptimizationDataLiteralArrayIndex")?,
-                "type_TrustedFixedArray__TRUSTED_FIXED_ARRAY_TYPE",
+                deopt_kind,
             )?;
             // DeoptimizationLiteralArray stores weak references to SFIs.
-            let inner = self.fixed_element(
-                pid,
-                literals,
-                literal,
-                "type_WeakFixedArray__WEAK_FIXED_ARRAY_TYPE",
-            )? & !2;
+            let inner = self.fixed_element(pid, literals, literal, literal_kind)? & !2;
             output.push_str(&self.shared_frame(pid, inner, Some(source), "current; inlined")?);
             raw = parent;
         }
@@ -805,6 +910,7 @@ fn discover(pid: u32, maps: &str) -> Result<Layout> {
                 values,
                 version,
                 interpreter_ranges,
+                code_cache: Default::default(),
             };
             if ![4, 8].contains(&layout.get("TaggedSize")?) || layout.get("SystemPointerSize")? != 8
             {
@@ -919,6 +1025,7 @@ mod tests {
         Layout {
             version: (12, 4),
             interpreter_ranges: Vec::new(),
+            code_cache: Default::default(),
             values: [
                 ("TaggedSize", 8),
                 ("HeapObjectTag", 1),

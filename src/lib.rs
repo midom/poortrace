@@ -37,3 +37,10 @@ pub mod golang;
 pub mod kernel;
 
 pub mod arguments;
+
+pub mod btf;
+pub mod managed_bridge;
+
+pub mod capture;
+
+pub mod native_args;

@@ -1,0 +1,2 @@
+// Requires host permission to sample kernel execution and resolve symbols.
+profile:hz:99 { @[kstack(32)] = count(); }

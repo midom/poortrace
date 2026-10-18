@@ -40,6 +40,7 @@ struct Word {
 struct Call {
     binding: usize,
     address: u64,
+    image: Identity,
     sp: u64,
     args: [u64; 6],
     start: Instant,
@@ -158,7 +159,12 @@ impl Registers {
         self.data[0] as i64
     }
 }
-fn control(request: libc::c_uint, tid: i32, address: usize, data: usize) -> Result<libc::c_long> {
+fn control_io(
+    request: libc::c_uint,
+    tid: i32,
+    address: usize,
+    data: usize,
+) -> std::io::Result<libc::c_long> {
     unsafe {
         *libc::__errno_location() = 0;
     }
@@ -171,13 +177,14 @@ fn control(request: libc::c_uint, tid: i32, address: usize, data: usize) -> Resu
         )
     };
     if value == -1 && std::io::Error::last_os_error().raw_os_error() != Some(0) {
-        Err(format!(
-            "function ptrace TID {tid}: {}",
-            std::io::Error::last_os_error()
-        ))
+        Err(std::io::Error::last_os_error())
     } else {
         Ok(value)
     }
+}
+fn control(request: libc::c_uint, tid: i32, address: usize, data: usize) -> Result<libc::c_long> {
+    control_io(request, tid, address, data)
+        .map_err(|error| format!("function ptrace request {request} TID {tid}: {error}"))
 }
 fn maps(pid: i32) -> Result<Vec<Mapping>> {
     std::fs::read_to_string(format!("/proc/{pid}/maps"))
@@ -278,6 +285,7 @@ pub struct Tracer {
     words: BTreeMap<u64, Word>,
     breakpoints: BTreeMap<u64, Breakpoint>,
     calls: BTreeMap<i32, Vec<Call>>,
+    stack_ranges: BTreeMap<i32, Vec<(u64, u64)>>,
     active_hit: Option<(i32, u64)>,
     vfork: BTreeMap<i32, i32>,
     foreign: BTreeSet<i32>,
@@ -306,9 +314,43 @@ impl Tracer {
         launched: bool,
         include_descendants: bool,
     ) -> Result<Self> {
+        Self::seize_group(pid, tids, specs, launched, include_descendants, &[])
+    }
+    pub fn seize_group(
+        pid: i32,
+        tids: impl IntoIterator<Item = i32>,
+        specs: &[Spec],
+        launched: bool,
+        include_descendants: bool,
+        extra_pids: &[i32],
+    ) -> Result<Self> {
+        if extra_pids.len() > 1024 || extra_pids.iter().any(|pid| *pid <= 0) {
+            return Err("shared-mm PID list requires at most 1024 positive PIDs".into());
+        }
         let mut tasks: BTreeSet<i32> = tids.into_iter().collect();
+        for extra in extra_pids {
+            if tgid(*extra) != Some(*extra) {
+                return Err(format!(
+                    "shared-mm PID {extra} must name a live process leader"
+                ));
+            }
+            for task in std::fs::read_dir(format!("/proc/{extra}/task"))
+                .map_err(|e| format!("shared-mm PID {extra}: {e}"))?
+            {
+                let task = task.map_err(|e| e.to_string())?;
+                if let Ok(tid) = task.file_name().to_string_lossy().parse::<i32>() {
+                    tasks.insert(tid);
+                }
+            }
+        }
+        if tasks.len() > 4096 {
+            return Err("initial thread limit (4096) exceeded".into());
+        }
         if include_descendants {
             tasks.extend(crate::syscall::descendant_tasks(pid)?);
+        }
+        if tasks.len() > 4096 {
+            return Err("initial thread limit (4096) exceeded".into());
         }
         if specs.is_empty() || specs.len() > 256 {
             return Err("function tracing supports 1..256 probe bindings".into());
@@ -329,7 +371,7 @@ impl Tracer {
         let mut tracer = Self {
             pid,
             root: pid,
-            follow: include_descendants,
+            follow: include_descendants || !extra_pids.is_empty(),
             spaces: BTreeMap::new(),
             owners: BTreeMap::from([(pid, pid)]),
             bindings,
@@ -343,6 +385,7 @@ impl Tracer {
             words: BTreeMap::new(),
             breakpoints: BTreeMap::new(),
             calls: BTreeMap::new(),
+            stack_ranges: BTreeMap::new(),
             active_hit: None,
             vfork: BTreeMap::new(),
             foreign: BTreeSet::new(),
@@ -365,13 +408,32 @@ impl Tracer {
             control(libc::PTRACE_SEIZE, tid, 0, flags as usize)?;
             tracer.tids.insert(tid);
             tracer.initial.insert(tid);
-            if include_descendants {
+            if include_descendants || !extra_pids.is_empty() {
                 let group = tgid(tid).unwrap_or(tid);
                 tracer.owners.entry(group).or_insert(group);
             }
         }
         tracer.stop_world()?;
-        if include_descendants {
+        for extra in extra_pids {
+            if *extra == pid {
+                continue;
+            }
+            let result =
+                unsafe { libc::syscall(libc::SYS_kcmp, pid, *extra, 1usize, 0usize, 0usize) };
+            if result < 0 {
+                return Err(format!(
+                    "cannot prove shared address-space ownership for PID {extra}: kcmp(KCMP_VM): {} (host ptrace/kcmp policy applies)",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            if result != 0 {
+                return Err(format!(
+                    "PID {extra} does not share the address space of PID {pid}"
+                ));
+            }
+            tracer.owners.insert(*extra, pid);
+        }
+        if include_descendants || !extra_pids.is_empty() {
             // kcmp is a read-only identity check. Some hosts deny it even to a
             // ptracer; in that case existing trap validation still fails safely
             // rather than adopting another group's patched text as original.
@@ -391,7 +453,7 @@ impl Tracer {
         }
         if tracer.active {
             tracer.refresh()?;
-            if include_descendants {
+            if include_descendants || !extra_pids.is_empty() {
                 for tid in tracer.stopped.clone() {
                     let group = tgid(tid).unwrap_or(tid);
                     if group != tracer.pid {
@@ -415,7 +477,25 @@ impl Tracer {
         std::mem::take(&mut self.discovered)
     }
     pub fn follow_forks(&mut self, follow: bool) {
-        self.follow = follow;
+        self.follow = follow || self.owners.len() > 1;
+    }
+    /// Declare a coroutine/fiber stack region when several stacks occupy one VMA.
+    pub fn register_stack_range(&mut self, tid: i32, low: u64, high: u64) -> Result<()> {
+        if !self.tids.contains(&tid) || low >= high || high - low > 1024 * 1024 * 1024 {
+            return Err(
+                "stack range requires an attached TID and a valid region at most 1 GiB".into(),
+            );
+        }
+        let maps = memory_maps(tid)?;
+        if !maps.iter().any(|m| m.start <= low && high <= m.end) {
+            return Err("declared stack range is outside a single target memory mapping".into());
+        }
+        let ranges = self.stack_ranges.entry(tid).or_default();
+        if ranges.len() >= 256 || ranges.iter().any(|(a, b)| low < *b && *a < high) {
+            return Err("declared stack ranges overlap or exceed 256 ranges".into());
+        }
+        ranges.push((low, high));
+        Ok(())
     }
     fn snapshot(&self) -> AddressSpace {
         AddressSpace {
@@ -492,6 +572,7 @@ impl Tracer {
         self.listening.remove(&tid);
         let event = status >> 16;
         if event == libc::PTRACE_EVENT_EXEC {
+            self.stack_ranges.remove(&tid);
             let mut old = 0usize;
             control(
                 libc::PTRACE_GETEVENTMSG,
@@ -592,6 +673,7 @@ impl Tracer {
         self.listening.remove(&tid);
         self.signals.remove(&tid);
         self.calls.remove(&tid);
+        self.stack_ranges.remove(&tid);
         self.decoder.clear(tid);
     }
     fn stop_world(&mut self) -> Result<()> {
@@ -817,6 +899,7 @@ impl Tracer {
         }
         for breakpoint in self.breakpoints.values_mut() {
             breakpoint.entries.clear();
+            breakpoint.returns = 0;
         }
         self.unresolved = false;
         for index in 0..self.bindings.len() {
@@ -862,6 +945,23 @@ impl Tracer {
                     .push(index);
             }
         }
+        // A still-active frame can survive a temporary removal of execute
+        // permission. Reinstall its return trap only in the original image.
+        let pending: Vec<_> = self
+            .calls
+            .iter()
+            .filter(|(tid, _)| {
+                let group = tgid(**tid).unwrap_or(**tid);
+                self.owners.get(&group).copied().unwrap_or(group) == self.pid
+            })
+            .flat_map(|(_, calls)| calls.iter().map(|call| (call.address, call.image)))
+            .collect();
+        for (address, image) in pending {
+            if Self::identity(address & !7, &current) == Some(image) {
+                self.ensure(address)?;
+                self.breakpoints.get_mut(&address).unwrap().returns += 1;
+            }
+        }
         let unused: Vec<_> = self
             .breakpoints
             .iter()
@@ -886,15 +986,64 @@ impl Tracer {
     fn resume_all(&mut self) -> Result<()> {
         for tid in self.stopped.clone() {
             let signal = self.signals.remove(&tid).unwrap_or(0);
-            if self.listening.contains(&tid) {
-                control(libc::PTRACE_LISTEN, tid, 0, 0)?;
+            let (request, signal) = if self.listening.contains(&tid) {
+                (libc::PTRACE_LISTEN, 0)
             } else {
                 let op = if !self.active || self.unresolved || self.syscalls || self.track_loads {
                     libc::PTRACE_SYSCALL
                 } else {
                     libc::PTRACE_CONT
                 };
-                control(op, tid, 0, signal as usize)?;
+                (op, signal)
+            };
+            if let Err(error) = control_io(request, tid, 0, signal as usize) {
+                // Resuming one thread can execute exit_group before its siblings
+                // are resumed. A previously observed ptrace stop then ceases to
+                // be resumable. Accept ESRCH only with a terminal wait status or
+                // an explicitly dead/zombie task; retain unreaped tasks so poll
+                // still collects their actual exit status.
+                let mut terminal = false;
+                if error.raw_os_error() == Some(libc::ESRCH) {
+                    let deadline = Instant::now() + Duration::from_millis(20);
+                    loop {
+                        let mut status = 0;
+                        let waited = unsafe {
+                            libc::waitpid(tid, &mut status, libc::__WALL | libc::WNOHANG)
+                        };
+                        if waited == tid {
+                            terminal = libc::WIFEXITED(status) || libc::WIFSIGNALED(status);
+                            self.queue(tid, status)?;
+                            break;
+                        }
+                        let wait_error = std::io::Error::last_os_error().raw_os_error();
+                        match std::fs::read_to_string(format!("/proc/{tid}/stat")) {
+                            Ok(stat) => {
+                                terminal = stat.rsplit_once(')').is_some_and(|(_, tail)| {
+                                    matches!(tail.split_whitespace().next(), Some("Z" | "X" | "x"))
+                                });
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                terminal = true;
+                                // A non-leader may already have been reaped by
+                                // its exiting group. There is no remaining task
+                                // or address space to restore through this TID.
+                                if waited < 0 && wait_error == Some(libc::ECHILD) {
+                                    self.forget(tid);
+                                }
+                            }
+                            Err(_) => {}
+                        }
+                        if terminal || Instant::now() >= deadline {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_micros(50));
+                    }
+                }
+                if !terminal {
+                    return Err(format!(
+                        "function ptrace request {request} TID {tid}: {error}"
+                    ));
+                }
             }
             self.stopped.remove(&tid);
         }
@@ -1127,40 +1276,56 @@ impl Tracer {
                 let args = regs.args();
                 let mut output = Vec::new();
                 if self.follow || !self.foreign.contains(&tid) {
+                    let declared = self
+                        .stack_ranges
+                        .get(&tid)
+                        .and_then(|ranges| {
+                            ranges.iter().find(|(a, b)| *a <= user.sp && user.sp < *b)
+                        })
+                        .copied();
                     let calls = self.calls.entry(tid).or_default();
                     // Downward-growing stacks unwind past abandoned calls after
                     // longjmp/exception unwinding. Do not report these as returns.
                     // Limit pruning to the same observed mapping: switched stacks
                     // can have unrelated numerical SP order.
-                    if calls.last().is_some_and(|call| call.sp < user.sp) {
-                        let map = std::fs::read_to_string(format!("/proc/{tid}/maps"))
-                            .ok()
-                            .filter(|text| text.len() <= 1024 * 1024)
-                            .and_then(|text| {
-                                text.lines().find_map(|line| {
-                                    let (a, b) = line.split_whitespace().next()?.split_once('-')?;
-                                    let (a, b) = (
-                                        u64::from_str_radix(a, 16).ok()?,
-                                        u64::from_str_radix(b, 16).ok()?,
-                                    );
-                                    (a <= user.sp && user.sp < b).then_some((a, b))
+                    if calls.iter().any(|call| call.sp < user.sp) {
+                        let map = declared.or_else(|| {
+                            std::fs::read_to_string(format!("/proc/{tid}/maps"))
+                                .ok()
+                                .filter(|text| text.len() <= 1024 * 1024)
+                                .and_then(|text| {
+                                    text.lines().find_map(|line| {
+                                        let (a, b) =
+                                            line.split_whitespace().next()?.split_once('-')?;
+                                        let (a, b) = (
+                                            u64::from_str_radix(a, 16).ok()?,
+                                            u64::from_str_radix(b, 16).ok()?,
+                                        );
+                                        (a <= user.sp && user.sp < b).then_some((a, b))
+                                    })
                                 })
-                            });
-                        while calls.last().is_some_and(|call| {
-                            call.sp < user.sp
-                                && map.is_some_and(|(a, b)| a <= call.sp && call.sp < b)
-                        }) {
-                            let call = calls.pop().unwrap();
-                            if let Some(bp) = self.breakpoints.get_mut(&call.address) {
-                                bp.returns = bp.returns.saturating_sub(1);
+                        });
+                        let mut index = 0;
+                        while index < calls.len() {
+                            if calls[index].sp < user.sp
+                                && map.is_some_and(|(a, b)| {
+                                    a <= calls[index].sp && calls[index].sp < b
+                                })
+                            {
+                                let call = calls.remove(index);
+                                if let Some(bp) = self.breakpoints.get_mut(&call.address) {
+                                    bp.returns = bp.returns.saturating_sub(1);
+                                }
+                            } else {
+                                index += 1;
                             }
                         }
                     }
-                    while calls
-                        .last()
-                        .is_some_and(|call| call.address == address && call.sp == user.sp)
+                    while let Some(index) = calls
+                        .iter()
+                        .rposition(|call| call.address == address && call.sp == user.sp)
                     {
-                        let call = calls.pop().unwrap();
+                        let call = calls.remove(index);
                         if let Some(bp) = self.breakpoints.get_mut(&address) {
                             bp.returns = bp.returns.saturating_sub(1);
                         }
@@ -1193,6 +1358,7 @@ impl Tracer {
                                 self.calls.entry(tid).or_default().push(Call {
                                     binding: index,
                                     address: return_address,
+                                    image: self.words[&(return_address & !7)].identity,
                                     sp,
                                     args,
                                     start: Instant::now(),
@@ -1700,4 +1866,52 @@ pub fn floating_argument_bits(tid: i32, index: usize) -> Result<[u8; 16]> {
         return Err("incomplete FP register set".into());
     }
     Ok(bytes[offset..offset + 16].try_into().unwrap())
+}
+
+/// Read a native DWARF-numbered register at a ptrace stop. SIMD registers expose
+/// their low 64 bits; expressions requiring wider values must use pieces.
+pub fn dwarf_register(tid: i32, register: u16) -> Result<u64> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if let Some(index) =
+            [10, 12, 11, 5, 13, 14, 4, 19, 9, 8, 7, 6, 3, 2, 1, 0, 16].get(register as usize)
+        {
+            return Ok(Registers::read(tid)?.data[*index]);
+        }
+        if (17..=32).contains(&register) {
+            return simd_register_low(tid, (register - 17) as usize);
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if register <= 32 {
+            return Ok(Registers::read(tid)?.data[register as usize]);
+        }
+        if (64..=95).contains(&register) {
+            return simd_register_low(tid, (register - 64) as usize);
+        }
+    }
+    Err(format!("unsupported native DWARF register {register}"))
+}
+fn simd_register_low(tid: i32, index: usize) -> Result<u64> {
+    let mut bytes = [0u8; 528];
+    let mut iov = libc::iovec {
+        iov_base: bytes.as_mut_ptr().cast(),
+        iov_len: bytes.len(),
+    };
+    control(
+        libc::PTRACE_GETREGSET,
+        tid,
+        2,
+        (&mut iov as *mut libc::iovec) as usize,
+    )?;
+    #[cfg(target_arch = "x86_64")]
+    let offset = 160 + index * 16;
+    #[cfg(target_arch = "aarch64")]
+    let offset = index * 16;
+    let raw = bytes
+        .get(offset..offset + 8)
+        .filter(|_| offset + 8 <= iov.iov_len)
+        .ok_or("incomplete SIMD register set")?;
+    Ok(u64::from_ne_bytes(raw.try_into().unwrap()))
 }

@@ -393,7 +393,7 @@ impl Reader {
         Ok(raw)
     }
 }
-type R<'a> = EndianSlice<'a, RunTimeEndian>;
+pub(crate) type R<'a> = EndianSlice<'a, RunTimeEndian>;
 fn validate_c_language(language: Option<AttributeValue<R<'_>>>) -> Result<()> {
     match language {
         Some(AttributeValue::Language(gimli::DW_LANG_C89|gimli::DW_LANG_C|gimli::DW_LANG_C99|gimli::DW_LANG_C11|gimli::DW_LANG_C17|gimli::DW_LANG_C_plus_plus|gimli::DW_LANG_C_plus_plus_03|gimli::DW_LANG_C_plus_plus_11|gimli::DW_LANG_C_plus_plus_14|gimli::DW_LANG_C_plus_plus_17|gimli::DW_LANG_C_plus_plus_20)) => Ok(()),
@@ -406,7 +406,9 @@ fn validate_calling_convention(convention: Option<AttributeValue<R<'_>>>) -> Res
         _ => Err("unsupported DWARF function calling convention; automatic arguments require the native C ABI".into()),
     }
 }
-fn load_dwarf(file: std::fs::File) -> Result<(gimli::DwarfSections<Vec<u8>>, RunTimeEndian)> {
+pub(crate) fn load_dwarf(
+    file: std::fs::File,
+) -> Result<(gimli::DwarfSections<Vec<u8>>, RunTimeEndian)> {
     let mut data = Vec::new();
     file.take(128 * 1024 * 1024 + 1)
         .read_to_end(&mut data)
@@ -502,7 +504,7 @@ fn resolve(
             .ok_or("missing array element type")?;
         let element = resolve_reference(dwarf, unit, reference, "", depth + 1)?;
         let mut count = 1u64;
-        let mut dimensions = 0;
+        let mut dimensions = Vec::new();
         let mut tree = unit.entries_tree(Some(offset)).map_err(|e| e.to_string())?;
         let root = tree.root().map_err(|e| e.to_string())?;
         let mut children = root.children();
@@ -532,75 +534,33 @@ fn resolve(
                     .ok_or("array requires a constant bound")?
             };
             count = count.checked_mul(size).ok_or("array size overflow")?;
-            dimensions += 1;
+            dimensions.push(size);
+            if dimensions.len() > 8 || size > 128 || count > 4096 {
+                return Err("typed arrays support at most8dimensions,128elements per dimension,and4096elements total".into());
+            }
         }
-        if dimensions != 1 || count > 128 {
-            return Err("typed arrays require one dimension and at most 128 elements".into());
+        if dimensions.is_empty() {
+            return Err("typed array requires constant dimensions".into());
         }
-        let size = element
-            .size
-            .checked_mul(count)
-            .ok_or("array byte size overflow")?;
         let vector = entry
             .attr_value(gimli::DW_AT_GNU_vector)
             .map_err(|e| e.to_string())?
             == Some(AttributeValue::Flag(true));
-        if !field.is_empty() {
-            let end = field.find(']').ok_or("array member requires [index]")?;
-            let index = field
-                .strip_prefix('[')
-                .ok_or("array member requires [index]")?[..end - 1]
-                .parse::<u64>()
-                .map_err(|_| "invalid array index")?;
-            if index >= count {
-                return Err("typed array index out of bounds".into());
-            }
-            let tail = field[end + 1..]
-                .strip_prefix('.')
-                .unwrap_or(&field[end + 1..]);
-            let mut layout = resolve_reference(dwarf, unit, reference, tail, depth + 1)?;
-            let offset = index
-                .checked_mul(element.size)
-                .ok_or("array offset overflow")?;
-            if let Some(first) = layout.dereferences.first_mut() {
-                *first = first.checked_add(offset).ok_or("array offset overflow")?;
-            } else {
-                layout.offset = layout
-                    .offset
-                    .checked_add(offset)
-                    .ok_or("array offset overflow")?;
-            }
-            if vector {
-                layout.vector_size = size;
-                layout.vector_offset = 0;
-            } else if layout.vector_size > 0 {
-                layout.vector_offset = layout
-                    .vector_offset
-                    .checked_add(offset)
-                    .ok_or("vector offset overflow")?;
-            }
-            return Ok(layout);
-        }
-        return Ok(Layout {
-            offset: 0,
-            size,
-            signed: false,
-            float: false,
-            scalar: false,
-            pointer: false,
-            by_reference: false,
+        let alignment = entry
+            .attr_value(gimli::DW_AT_alignment)
+            .map_err(|e| e.to_string())?
+            .and_then(|v| v.udata_value())
+            .unwrap_or(element.alignment);
+        return resolve_dimensions(
+            dwarf,
+            unit,
+            reference,
+            &dimensions,
+            field,
+            depth + 1,
             vector,
-            vector_size: if vector { size } else { 0 },
-            vector_offset: 0,
-            alignment: entry
-                .attr_value(gimli::DW_AT_alignment)
-                .map_err(|e| e.to_string())?
-                .and_then(|v| v.udata_value())
-                .unwrap_or(element.alignment),
-            members: (0..count).map(|i| format!("[{i}]")).collect(),
-            dereferences: Vec::new(),
-            bits: None,
-        });
+            alignment,
+        );
     }
     if !field.is_empty() {
         let split = field
@@ -838,7 +798,96 @@ fn resolve(
     })
 }
 
-fn flatten(
+#[allow(clippy::too_many_arguments)]
+fn resolve_dimensions(
+    dwarf: &gimli::Dwarf<R<'_>>,
+    unit: &gimli::Unit<R<'_>>,
+    reference: AttributeValue<R<'_>>,
+    dimensions: &[u64],
+    field: &str,
+    depth: u32,
+    vector: bool,
+    alignment: u64,
+) -> Result<Layout> {
+    if depth >= 32 {
+        return Err("DWARF type nesting limit exceeded".into());
+    }
+    let element = resolve_reference(dwarf, unit, reference, "", depth + 1)?;
+    let count = dimensions.iter().try_fold(1u64, |count, n| {
+        count.checked_mul(*n).ok_or("array size overflow")
+    })?;
+    let size = element
+        .size
+        .checked_mul(count)
+        .ok_or("array size overflow")?;
+    if !field.is_empty() {
+        let end = field.find(']').ok_or("array member requires [index]")?;
+        let index = field
+            .strip_prefix('[')
+            .ok_or("array member requires [index]")?[..end - 1]
+            .parse::<u64>()
+            .map_err(|_| "invalid typed array index")?;
+        if index >= dimensions[0] {
+            return Err("typed array index out of bounds".into());
+        }
+        let tail = field[end + 1..]
+            .strip_prefix('.')
+            .unwrap_or(&field[end + 1..]);
+        let stride = size
+            .checked_div(dimensions[0])
+            .ok_or("invalid zero-sized array dimension")?;
+        let offset = index.checked_mul(stride).ok_or("array offset overflow")?;
+        let mut layout = if dimensions.len() > 1 {
+            resolve_dimensions(
+                dwarf,
+                unit,
+                reference,
+                &dimensions[1..],
+                tail,
+                depth + 1,
+                false,
+                alignment,
+            )?
+        } else {
+            resolve_reference(dwarf, unit, reference, tail, depth + 1)?
+        };
+        if let Some(first) = layout.dereferences.first_mut() {
+            *first = first.checked_add(offset).ok_or("array offset overflow")?;
+        } else {
+            layout.offset = layout
+                .offset
+                .checked_add(offset)
+                .ok_or("array offset overflow")?;
+        }
+        if vector {
+            layout.vector_size = size;
+            layout.vector_offset = 0;
+        } else if layout.vector_size > 0 {
+            layout.vector_offset = layout
+                .vector_offset
+                .checked_add(offset)
+                .ok_or("vector offset overflow")?;
+        }
+        return Ok(layout);
+    }
+    Ok(Layout {
+        offset: 0,
+        size,
+        signed: false,
+        float: false,
+        scalar: false,
+        pointer: false,
+        vector,
+        vector_size: if vector { size } else { 0 },
+        vector_offset: 0,
+        by_reference: false,
+        alignment,
+        members: (0..dimensions[0]).map(|i| format!("[{i}]")).collect(),
+        dereferences: Vec::new(),
+        bits: None,
+    })
+}
+pub(crate) fn flatten(
     dwarf: &gimli::Dwarf<R<'_>>,
     unit: &gimli::Unit<R<'_>>,
     reference: AttributeValue<R<'_>>,
@@ -867,7 +916,7 @@ fn flatten(
     }
     Ok(())
 }
-fn resolve_reference(
+pub(crate) fn resolve_reference(
     dwarf: &gimli::Dwarf<R<'_>>,
     unit: &gimli::Unit<R<'_>>,
     reference: AttributeValue<R<'_>>,
@@ -938,6 +987,7 @@ mod tests {
 struct Child { long value; };
 struct Payload { struct Child *child; unsigned first:3; signed negative:5; unsigned rest:13; };
 struct Payload payload;
+typedef long Matrix[2][3]; Matrix matrix;
 void complex_arg(float _Complex argument) { (void)argument; }
 int main(void) { return payload.first; }
 "#,
@@ -956,6 +1006,21 @@ int main(void) { return payload.first; }
             let pid = std::process::id();
             let path = image.to_str().unwrap();
             assert!(reader.signature(pid, path, "complex_arg").is_err());
+            let matrix_layout = reader.layout(pid, path, "Matrix", "[1][2]").unwrap();
+            assert_eq!(matrix_layout.offset, 40);
+            assert_eq!(matrix_layout.size, 8);
+            let values = [[1i64, 2, 3], [4, 5, 6]];
+            assert_eq!(
+                reader
+                    .scalar(pid, values.as_ptr() as u64, &matrix_layout)
+                    .unwrap(),
+                6
+            );
+            let matrix = reader
+                .describe(pid, path, "Matrix", values.as_ptr() as u64)
+                .unwrap();
+            assert!(matrix.contains("[1]: {[0]: 4, [1]: 5, [2]: 6}"), "{matrix}");
+            assert!(reader.layout(pid, path, "Matrix", "[2][0]").is_err());
             let child = reader.layout(pid, path, "Payload", "child->value").unwrap();
             assert_eq!(child.dereferences, vec![0]);
             assert_eq!(child.offset, 0);

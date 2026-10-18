@@ -72,3 +72,29 @@ fn floating_reports_reject_nonfinite_values_and_integer_profile_exports() {
         );
     }
 }
+
+#[test]
+fn histogram_comparisons_sort_fractional_and_scientific_bucket_bounds() {
+    let mut current = row(0.0);
+    current.float_value = None;
+    current.buckets = vec![
+        ("[1e-3, 2e-3)".into(), 2),
+        ("[-0.5, 0)".into(), 2),
+        ("[0, 1e-3)".into(), 2),
+    ];
+    let mut previous = current.clone();
+    previous.buckets = vec![("[1e-3, 2e-3)".into(), 1)];
+    let json = report::render(
+        &[current],
+        &Options {
+            format: "json".into(),
+            baseline: vec![previous],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let json: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(json[0]["buckets"][0][0], "[-0.5, 0)");
+    assert_eq!(json[0]["buckets"][1][0], "[0, 1e-3)");
+    assert_eq!(json[0]["buckets"][2][0], "[1e-3, 2e-3)");
+}

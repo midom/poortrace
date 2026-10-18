@@ -9,14 +9,138 @@ pub enum Value {
     String(String),
 }
 pub type Fields = BTreeMap<String, Value>;
-#[derive(Clone, Debug)]
+
+/// Kernel addresses are resolved only from host-visible kallsyms. Zeroed
+/// addresses under kptr_restrict are never treated as usable symbols.
+#[derive(Default)]
+pub struct Symbols {
+    entries: Vec<(u64, String)>,
+    loaded: bool,
+    restricted: bool,
+}
+impl Symbols {
+    fn load(&mut self) {
+        if self.loaded {
+            return;
+        }
+        self.loaded = true;
+        let Ok(file) = std::fs::File::open("/proc/kallsyms") else {
+            self.restricted = true;
+            return;
+        };
+        let mut text = String::new();
+        if file
+            .take(32 * 1024 * 1024 + 1)
+            .read_to_string(&mut text)
+            .is_err()
+            || text.len() > 32 * 1024 * 1024
+        {
+            self.restricted = true;
+            return;
+        }
+        self.entries = Self::parse(&text);
+        self.restricted = self.entries.is_empty();
+    }
+    fn parse(text: &str) -> Vec<(u64, String)> {
+        let mut entries = Vec::new();
+        for line in text.lines().take(1_000_000) {
+            let mut words = line.split_whitespace();
+            let Some(address) = words
+                .next()
+                .and_then(|s| u64::from_str_radix(s, 16).ok())
+                .filter(|v| *v != 0)
+            else {
+                continue;
+            };
+            if !words
+                .next()
+                .is_some_and(|kind| matches!(kind, "t" | "T" | "w" | "W"))
+            {
+                continue;
+            }
+            let Some(name) = words.next() else {
+                continue;
+            };
+            if name.len() > 4096 {
+                continue;
+            }
+            let module = words.next().unwrap_or("");
+            entries.push((address, format!("{name}{module}")));
+        }
+        entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        entries.dedup_by(|a, b| a.0 == b.0);
+        entries
+    }
+    pub fn symbol(&mut self, address: u64) -> String {
+        self.load();
+        let end = self.entries.partition_point(|entry| entry.0 <= address);
+        if end > 0 {
+            let (base, name) = &self.entries[end - 1];
+            // A distant address is not evidence that it belongs to the last
+            // text symbol, particularly across kernel/module address spaces.
+            if address - base <= 16 * 1024 * 1024 {
+                return format!("{name}+0x{:x}", address - base);
+            }
+        }
+        format!(
+            "0x{address:x}{}",
+            if self.restricted {
+                " <kernel symbols restricted>"
+            } else {
+                ""
+            }
+        )
+    }
+    pub fn stack(&mut self, frames: &[u64]) -> String {
+        if frames.is_empty() {
+            return "    <no kernel stack>\n".into();
+        }
+        frames
+            .iter()
+            .take(127)
+            .enumerate()
+            .map(|(index, address)| {
+                format!(
+                    "    {}\n",
+                    self.symbol(address.saturating_sub(u64::from(index != 0)))
+                )
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod symbol_tests {
+    use super::*;
+    #[test]
+    fn zeroed_kallsyms_and_module_boundaries_are_explicit() {
+        let entries = Symbols::parse(
+            "0000000000000000 T hidden\nffffffff81000000 T start\nffffffff81000100 t leaf [module]\nffffffff81000200 D data\n",
+        );
+        let mut symbols = Symbols {
+            entries,
+            loaded: true,
+            restricted: false,
+        };
+        assert_eq!(symbols.symbol(0xffffffff81000104), "leaf[module]+0x4");
+        assert!(symbols.symbol(0xffffffffa0000000).starts_with("0x"));
+        let mut symbols = Symbols {
+            loaded: true,
+            restricted: true,
+            ..Default::default()
+        };
+        assert!(symbols.stack(&[0xffffffff81000104]).contains("restricted"));
+        assert!(symbols.stack(&[]).contains("no kernel stack"));
+    }
+}
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 enum Kind {
     Integer,
     Text,
     Bytes,
     Dynamic { text: bool, relative: bool },
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct Field {
     name: String,
     offset: usize,
@@ -24,7 +148,7 @@ struct Field {
     signed: bool,
     kind: Kind,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Format {
     pub id: u64,
     fields: Vec<Field>,
@@ -146,6 +270,24 @@ impl Format {
         })
     }
     pub fn decode(&self, raw: &[u8]) -> Result<Fields> {
+        if self.fields.len() > 256
+            || self.fields.iter().any(|field| {
+                field.name.is_empty()
+                    || field.name.len() > 4096
+                    || field.size > 65536
+                    || field
+                        .offset
+                        .checked_add(field.size)
+                        .is_none_or(|end| end > 65536)
+                    || match field.kind {
+                        Kind::Integer => !matches!(field.size, 1 | 2 | 4 | 8),
+                        Kind::Dynamic { .. } => field.size != 4,
+                        _ => false,
+                    }
+            })
+        {
+            return Err("invalid archived tracepoint format bounds".into());
+        }
         if raw.len() > 65536 {
             return Err("tracepoint record exceeds 64 KiB".into());
         }

@@ -73,16 +73,20 @@ fn node_compatible_scope_layouts() {
 }
 
 #[test]
-#[ignore = "requires Node 22 (V8 12.4), exported builtin symbols, and ptrace"]
+#[ignore = "requires Node 20/22/24, exported builtin symbols, and ptrace"]
 fn node_interpreted_current_source_lines() {
     let node = std::env::var("POORTRACE_NODE_BIN").unwrap_or_else(|_| "node".into());
     let version = Command::new(&node)
         .args(["-p", "process.versions.v8"])
         .output()
         .unwrap();
-    if !version.status.success() || !String::from_utf8_lossy(&version.stdout).starts_with("12.4.") {
+    if !version.status.success()
+        || !["11.3.", "12.4.", "13.6."]
+            .iter()
+            .any(|prefix| String::from_utf8_lossy(&version.stdout).starts_with(prefix))
+    {
         eprintln!(
-            "skipping V8 12.4-specific check on {}",
+            "skipping unsupported V8 layout {}",
             String::from_utf8_lossy(&version.stdout).trim()
         );
         return;
@@ -114,11 +118,38 @@ fn node_interpreted_current_source_lines() {
 #[test]
 #[ignore = "requires Go compiler, retained DWARF, and ptrace"]
 fn go_running_goroutine_identity_and_frames() {
-    let directory = std::env::temp_dir().join(format!("poortrace-go-{}", std::process::id()));
+    go_stack_fixture(false, false);
+}
+
+#[test]
+#[ignore = "requires Go 1.22–1.25 compiler and ptrace; ELF and DWARF stripped"]
+fn go_stripped_pclntab_goroutines_and_replay() {
+    go_stack_fixture(true, false);
+}
+
+#[test]
+#[ignore = "requires Go 1.22–1.25 compiler, stripped PIE ELF, and ptrace"]
+fn go_stripped_pie_pclntab_and_replay() {
+    go_stack_fixture(true, true);
+}
+
+fn go_stack_fixture(stripped: bool, pie: bool) {
+    let directory = std::env::temp_dir().join(format!(
+        "poortrace-go-{stripped}-{pie}-{}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&directory).unwrap();
     let binary = directory.join("go-stacks");
-    let build = Command::new(std::env::var("GO").unwrap_or_else(|_| "go".into()))
-        .args(["build", "-o"])
+    let mut compiler = Command::new(std::env::var("GO").unwrap_or_else(|_| "go".into()));
+    compiler.arg("build");
+    if pie {
+        compiler.arg("-buildmode=pie");
+    }
+    if stripped {
+        compiler.args(["-ldflags", "-s -w"]);
+    }
+    let build = compiler
+        .arg("-o")
         .arg(&binary)
         .arg(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -228,16 +259,20 @@ fn go_perf_samples_keep_captured_goroutine() {
 }
 
 #[test]
-#[ignore = "requires Node 22 (V8 12.4), optimizer metadata, and ptrace"]
+#[ignore = "requires Node 20/22/24, optimizer metadata, and ptrace"]
 fn node_optimized_inline_frames_and_replay() {
     let node = std::env::var("POORTRACE_NODE_BIN").unwrap_or_else(|_| "node".into());
     let version = Command::new(&node)
         .args(["-p", "process.versions.v8"])
         .output()
         .unwrap();
-    if !version.status.success() || !String::from_utf8_lossy(&version.stdout).starts_with("12.4.") {
+    if !version.status.success()
+        || !["11.3.", "12.4.", "13.6."]
+            .iter()
+            .any(|prefix| String::from_utf8_lossy(&version.stdout).starts_with(prefix))
+    {
         eprintln!(
-            "skipping V8 12.4-specific check on {}",
+            "skipping unsupported V8 layout {}",
             String::from_utf8_lossy(&version.stdout).trim()
         );
         return;
@@ -297,4 +332,418 @@ fn node_optimized_inline_frames_and_replay() {
         String::from_utf8_lossy(&replay.stdout)
     );
     std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+#[ignore = "requires Python asyncio and cooperative snapshot adapter"]
+fn cooperative_python_suspended_tasks_and_replay() {
+    use std::{
+        process::Stdio,
+        thread,
+        time::{Duration, Instant},
+    };
+    let directory = std::env::temp_dir().join(format!("poortrace-async-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let snapshot = directory.join("snapshot.json");
+    let mut child = Command::new(tool("PYTHON", "python3"))
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/adapters/python_async.py"
+        ))
+        .arg("--output")
+        .arg(&snapshot)
+        .arg("--")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/async_stacks.py"
+        ))
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let start = Instant::now();
+        loop {
+            if let Ok(data) = std::fs::read_to_string(&snapshot) {
+                if data.contains("async_leaf") && data.contains("async_caller") {
+                    break;
+                }
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "Python adapter did not produce suspended frames"
+            );
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "Python adapter terminated early"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        let recording = directory.join("events.jsonl");
+        let output = Command::new(env!("CARGO_BIN_EXE_poortrace"))
+            .args(["-q", "--pid"])
+            .arg(child.id().to_string())
+            .arg("--managed-snapshot")
+            .arg(&snapshot)
+            .arg("--record")
+            .arg(&recording)
+            .args(["-d", "0.1", "-e", "BEGIN { printf(\"%s\",asyncstack); }"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            text.contains("async_leaf")
+                && text.contains("async_caller")
+                && text.contains("cooperative snapshot"),
+            "{text}"
+        );
+        let replay = Command::new(env!("CARGO_BIN_EXE_poortrace"))
+            .args(["-q", "--replay"])
+            .arg(&recording)
+            .output()
+            .unwrap();
+        assert!(
+            replay.status.success(),
+            "{}",
+            String::from_utf8_lossy(&replay.stderr)
+        );
+        assert_eq!(text, String::from_utf8_lossy(&replay.stdout));
+    }));
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(directory);
+    if let Err(error) = result {
+        std::panic::resume_unwind(error);
+    }
+}
+
+struct ManagedTarget(std::process::Child);
+impl Drop for ManagedTarget {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+fn tool(name: &str, fallback: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| fallback.into())
+}
+fn managed_directory(name: &str) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!("poortrace-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&path);
+    std::fs::create_dir_all(&path).unwrap();
+    path
+}
+fn managed_checked(command: &mut Command) {
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{:?}\n{}\n{}",
+        command,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+fn managed_line(reader: impl std::io::Read + Send + 'static) -> String {
+    use std::io::BufRead;
+    let (send, receive) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let result = std::io::BufReader::new(reader).read_line(&mut line);
+        let _ = send.send(result.map(|_| line));
+    });
+    receive
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .expect("runtime readiness timeout")
+        .unwrap()
+}
+fn managed_journal(
+    directory: &std::path::Path,
+    pid: u32,
+    runtime: &str,
+    helper: &str,
+    needles: &[&str],
+    native: bool,
+) {
+    use poortrace::{codegen::Program, recording::Recorder, runtime::Event};
+    let path = directory.join("snapshot.json");
+    let snapshot: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(snapshot["pid"].as_u64(), Some(pid as u64));
+    assert_eq!(snapshot["runtime"], runtime);
+    let threads = snapshot["threads"].as_array().unwrap();
+    let selected = threads
+        .iter()
+        .find(|thread| {
+            needles
+                .iter()
+                .all(|name| thread["frames"].to_string().contains(name))
+        })
+        .unwrap_or_else(|| panic!("missing {needles:?} in {snapshot}"));
+    let tid = selected["tid"].as_u64();
+    if native {
+        assert!(tid.is_some());
+        assert!(std::path::Path::new(&format!("/proc/{pid}/task/{}", tid.unwrap())).exists());
+    } else {
+        assert!(tid.is_none());
+    }
+    let source = format!("BEGIN {{ printf(\"%s\",{helper}); }}");
+    let program = Program::compile(&source).unwrap();
+    let mut output = Vec::new();
+    let record = directory.join("events.jsonl");
+    {
+        let mut state = program.state(&mut output);
+        state.managed.configure(path).unwrap();
+        state.recorder = Some(Recorder::create(&record, &source).unwrap());
+        let mut event = Event::new(c"managed", c"BEGIN");
+        event.pid = pid as u64;
+        event.tid = tid.unwrap_or(pid as u64);
+        program.invoke(0, &mut state, &event);
+        state.flush().unwrap();
+        state.recorder.as_mut().unwrap().flush().unwrap();
+    }
+    let text = String::from_utf8(output).unwrap();
+    for needle in needles {
+        assert!(text.contains(needle), "{text}");
+    }
+    assert!(
+        text.contains(if native {
+            "native TID"
+        } else {
+            "process-level"
+        }),
+        "{text}"
+    );
+    // Timers have no event thread: the explicit process-wide helper preserves
+    // each actual thread identity instead of attributing it to the PID.
+    let timer_record = directory.join("timer.jsonl");
+    let timer = Command::new(env!("CARGO_BIN_EXE_poortrace"))
+        .args(["-q", "--pid"])
+        .arg(pid.to_string())
+        .arg("--managed-snapshot")
+        .arg(directory.join("snapshot.json"))
+        .arg("--record")
+        .arg(&timer_record)
+        .args([
+            "-d",
+            "0.05",
+            "-e",
+            "interval:ms:10 { printf(\"%s\",managedstacks(8)); exit(); }",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        timer.status.success(),
+        "{}",
+        String::from_utf8_lossy(&timer.stderr)
+    );
+    let timer_text = String::from_utf8_lossy(&timer.stdout);
+    for needle in needles {
+        assert!(timer_text.contains(needle), "{timer_text}");
+    }
+    let timer_replay = Command::new(env!("CARGO_BIN_EXE_poortrace"))
+        .args(["-q", "--replay"])
+        .arg(&timer_record)
+        .output()
+        .unwrap();
+    assert!(
+        timer_replay.status.success(),
+        "{}",
+        String::from_utf8_lossy(&timer_replay.stderr)
+    );
+    assert_eq!(timer_text, String::from_utf8_lossy(&timer_replay.stdout));
+    // Replay after removing the live snapshot: results must come from the journal.
+    std::fs::remove_file(directory.join("snapshot.json")).unwrap();
+    let replay = Command::new(env!("CARGO_BIN_EXE_poortrace"))
+        .args(["-q", "--replay"])
+        .arg(record)
+        .output()
+        .unwrap();
+    assert!(
+        replay.status.success(),
+        "{}",
+        String::from_utf8_lossy(&replay.stderr)
+    );
+    assert_eq!(text, String::from_utf8_lossy(&replay.stdout));
+}
+#[test]
+#[ignore = "requires JDK 21 javac/java/jcmd and explicit cooperative JVM diagnostics"]
+fn cooperative_java_logical_stacks_and_replay() {
+    let directory = managed_directory("cooperative-java");
+    managed_checked(
+        Command::new(tool("JAVAC", "javac"))
+            .arg("-d")
+            .arg(&directory)
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/ManagedStacks.java"
+            )),
+    );
+    let mut target = ManagedTarget(
+        Command::new(tool("JAVA", "java"))
+            .arg("-cp")
+            .arg(&directory)
+            .arg("ManagedStacks")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    assert!(managed_line(target.0.stdout.take().unwrap()).contains("JAVA_READY"));
+    managed_checked(
+        Command::new(tool("PYTHON", "python3"))
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/adapters/vm_snapshot.py"
+            ))
+            .args(["java", "--pid"])
+            .arg(target.0.id().to_string())
+            .arg("--output")
+            .arg(directory.join("snapshot.json"))
+            .args(["--once", "--tool"])
+            .arg(tool("JCMD", "jcmd")),
+    );
+    managed_journal(
+        &directory,
+        target.0.id(),
+        "java",
+        "jstack",
+        &["ManagedStacks.leaf", "ManagedStacks.caller"],
+        true,
+    );
+    drop(target);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+#[test]
+#[ignore = "requires .NET 8 SDK and dotnet-stack diagnostic tool"]
+fn cooperative_dotnet_logical_stacks_and_replay() {
+    let directory = managed_directory("cooperative-dotnet");
+    let build = directory.join("build");
+    managed_checked(
+        Command::new(tool("DOTNET", "dotnet"))
+            .args(["build", "--nologo", "--output"])
+            .arg(&build)
+            .arg(format!(
+                "-p:BaseIntermediateOutputPath={}/obj/",
+                directory.display()
+            ))
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/dotnet_stacks/ManagedStacks.csproj"
+            )),
+    );
+    let mut target = ManagedTarget(
+        Command::new(tool("DOTNET", "dotnet"))
+            .arg(build.join("ManagedStacks.dll"))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    assert!(managed_line(target.0.stdout.take().unwrap()).contains("DOTNET_READY"));
+    managed_checked(
+        Command::new(tool("PYTHON", "python3"))
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/adapters/vm_snapshot.py"
+            ))
+            .args(["dotnet", "--pid"])
+            .arg(target.0.id().to_string())
+            .arg("--output")
+            .arg(directory.join("snapshot.json"))
+            .args(["--once", "--tool"])
+            .arg(tool("DOTNET_STACK", "dotnet-stack")),
+    );
+    managed_journal(
+        &directory,
+        target.0.id(),
+        "dotnet",
+        "dotnetstack",
+        &["ManagedStacks.Leaf", "ManagedStacks.Caller"],
+        true,
+    );
+    drop(target);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+fn cooperative_inspector(runtime: &str, fixture: &str, helper: &str, needles: &[&str]) {
+    let directory = managed_directory(&format!("cooperative-{runtime}"));
+    let node = tool("NODE", "node");
+    let node = std::env::var("POORTRACE_NODE_BIN").unwrap_or(node);
+    let mut target = ManagedTarget(
+        Command::new(&node)
+            .arg("--inspect-brk=127.0.0.1:0")
+            .arg(format!(
+                "{}/tests/fixtures/{fixture}",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let line = managed_line(target.0.stderr.take().unwrap());
+    let url = line
+        .split_whitespace()
+        .find(|word| word.starts_with("ws://"))
+        .expect("Inspector endpoint missing");
+    let mut adapter = Command::new(&node);
+    adapter
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/adapters/node_inspector.mjs"
+        ))
+        .arg("--pid")
+        .arg(target.0.id().to_string())
+        .args(["--url", url, "--output"])
+        .arg(directory.join("snapshot.json"))
+        .args(["--runtime", runtime, "--run", "--resume", "--once"]);
+    if runtime == "javascript" {
+        adapter.args(["--match", "asyncLeaf"]);
+    }
+    managed_checked(&mut adapter);
+    managed_journal(&directory, target.0.id(), runtime, helper, needles, false);
+    drop(target);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+#[test]
+#[ignore = "requires Node Inspector and explicit cooperative pause/resume"]
+fn cooperative_node_async_ancestry_and_replay() {
+    cooperative_inspector(
+        "javascript",
+        "async_stacks.js",
+        "asyncstack",
+        &["asyncLeaf", "asyncCaller", "--- async:"],
+    );
+}
+#[test]
+#[ignore = "requires Node WebAssembly Inspector and explicit cooperative pause/resume"]
+fn cooperative_wasm_logical_frames_and_replay() {
+    cooperative_inspector(
+        "wasm",
+        "wasm_stacks.js",
+        "wasmstack",
+        &["pauseFromWasm", "wasm:$run"],
+    );
+}
+#[test]
+#[ignore = "requires a Node20 pointer-compression build and ptrace (POORTRACE_NODE_BIN)"]
+fn compressed_scope_live_function_frames() {
+    let node = tool("POORTRACE_NODE_BIN", "node");
+    let config = Command::new(&node)
+        .args([
+            "-p",
+            "process.config.variables.v8_enable_pointer_compression",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&config.stdout).trim(),
+        "1",
+        "use an actual pointer-compressed Node build"
+    );
+    node_compatible_scope_layouts();
 }

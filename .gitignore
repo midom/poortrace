@@ -1,1 +1,3 @@
 /target
+/adapters/node_modules/
+__pycache__/

@@ -77,7 +77,7 @@ impl<'a> Event<'a> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u64)]
 pub enum Type {
     Number = 0,
@@ -103,6 +103,7 @@ pub struct MapSpec {
     pub keys: Vec<Type>,
     pub aggregate: Aggregate,
     pub linear: Option<(i64, i64, i64)>,
+    pub float_linear: Option<(u64, u64, u64)>,
     pub value_type: Type,
 }
 
@@ -304,16 +305,26 @@ pub struct State<'a> {
     pub max_entries: usize,
     pub(crate) stack_strings: Vec<CString>,
     pub(crate) fuel: u32,
-    pub(crate) iterations: Vec<Vec<(Key, i64)>>,
+    pub(crate) recursion_depth: u32,
+    pub(crate) recursion_cost: u64,
+    pub(crate) iterations: Vec<Vec<(Vec<Key>, i64)>>,
     pub(crate) scratch: BTreeMap<u32, Vec<u64>>,
     symbols: crate::symbols::Symbolizer,
     python: crate::python::Reader,
     javascript: crate::javascript::Reader,
     golang: crate::golang::Reader,
+    pub kernel_frames: Vec<u64>,
+    pub captured_memory: Vec<crate::recording::MemoryRegion>,
+    pub capture_requests: Vec<crate::capture::MemoryRequest>,
+    pub replay_memory: Vec<crate::recording::MemoryRegion>,
+    kernel_symbols: crate::kernel::Symbols,
+    btf: crate::btf::Reader,
+    pub managed: crate::managed_bridge::Reader,
     pub trace_fields: crate::kernel::Fields,
     pub(crate) replay_lookup: bool,
     pub js_snapshot: Option<(crate::perf::UserRegs, Vec<u8>)>,
     types: crate::types::Reader,
+    native_args: crate::native_args::Reader,
     pub report: crate::report::Options,
     pub wait_reason: Option<String>,
     pub recorder: Option<crate::recording::Recorder>,
@@ -338,16 +349,26 @@ impl<'a> State<'a> {
             max_entries: 65536,
             stack_strings: Vec::new(),
             fuel: 4096,
+            recursion_depth: 0,
+            recursion_cost: 0,
             scratch: BTreeMap::new(),
             iterations: Vec::new(),
             symbols: crate::symbols::Symbolizer::default(),
             python: crate::python::Reader::default(),
             javascript: crate::javascript::Reader::default(),
             golang: crate::golang::Reader::default(),
+            kernel_frames: Vec::new(),
+            captured_memory: Vec::new(),
+            capture_requests: Vec::new(),
+            replay_memory: Vec::new(),
+            kernel_symbols: crate::kernel::Symbols::default(),
+            btf: crate::btf::Reader::default(),
+            managed: crate::managed_bridge::Reader::default(),
             js_snapshot: None,
             trace_fields: Default::default(),
             replay_lookup: false,
             types: crate::types::Reader::default(),
+            native_args: crate::native_args::Reader::default(),
             report: crate::report::Options::default(),
             wait_reason: None,
             recorder: None,
@@ -375,6 +396,20 @@ impl<'a> State<'a> {
             Some(e) => Err(e.clone()),
             None => Ok(()),
         }
+    }
+    pub fn capture_event_memory(&mut self, event: &Event<'_>) {
+        self.captured_memory.clear();
+        match crate::capture::capture(
+            &self.capture_requests,
+            event,
+            self.js_snapshot.as_ref().map(|(regs, _)| regs.sp),
+        ) {
+            Ok(memory) => self.captured_memory = memory,
+            Err(error) => self.fail(error),
+        }
+    }
+    pub fn configure_btf(&mut self, path: std::path::PathBuf) {
+        self.btf.configure(path);
     }
     pub fn unwind_sample(&mut self, sample: &crate::perf::Sample) -> Vec<u64> {
         if self.recorder.is_some() {
@@ -445,8 +480,9 @@ impl<'a> State<'a> {
                     } else {
                         cell.number(spec.aggregate)
                     },
-                    float_value: (spec.value_type == Type::Float)
-                        .then(|| cell.floating(spec.aggregate)),
+                    float_value: (spec.value_type == Type::Float
+                        && !matches!(spec.aggregate, Aggregate::Hist | Aggregate::Lhist))
+                    .then(|| cell.floating(spec.aggregate)),
                     buckets,
                 });
             }
@@ -621,6 +657,50 @@ pub(crate) unsafe extern "C" fn map_update(
     let cell = map.entry(key).or_default();
     if state.specs[id as usize].value_type == Type::Float {
         let value = f64::from_bits(value as u64);
+        if !value.is_finite() {
+            state.fail("floating-point map value must remain finite".into());
+            return;
+        }
+        if matches!(op, 6 | 7) {
+            let bin = if op == 6 {
+                if value < 0.0 {
+                    -1
+                } else if value == 0.0 {
+                    0
+                } else {
+                    let bits = value.to_bits();
+                    let exponent = ((bits >> 52) & 0x7ff) as i32;
+                    let exponent = if exponent == 0 {
+                        63 - (bits & ((1u64 << 52) - 1)).leading_zeros() as i32 - 1074
+                    } else {
+                        exponent - 1023
+                    };
+                    exponent + 1076
+                }
+            } else {
+                let Some((min, max, step)) = state.specs[id as usize].float_linear else {
+                    state.fail("missing floating histogram bounds".into());
+                    return;
+                };
+                let (min, max, step) = (
+                    f64::from_bits(min),
+                    f64::from_bits(max),
+                    f64::from_bits(step),
+                );
+                if value < min {
+                    -1
+                } else if value >= max {
+                    ((max - min) / step).ceil().max(1.0) as i32
+                } else {
+                    (((value - min) / step).floor() as i32)
+                        .clamp(0, (((max - min) / step).ceil().max(1.0) as i32) - 1)
+                }
+            };
+            let count = cell.buckets.entry(bin).or_default();
+            *count = count.saturating_add(1);
+            cell.count = cell.count.saturating_add(1);
+            return;
+        }
         let result = match op {
             0 => value,
             2 | 5 => cell.floating + value,
@@ -754,6 +834,54 @@ unsafe fn ustack_inner(state: *mut State<'_>, event: *const Event<'_>, depth: u6
 }
 
 fn bucket_label(bucket: i32, spec: &MapSpec) -> String {
+    if let Some((min, max, step)) = spec.float_linear {
+        let (min, max, step) = (
+            f64::from_bits(min),
+            f64::from_bits(max),
+            f64::from_bits(step),
+        );
+        if bucket < 0 {
+            return format!("(-inf, {})", significant(min, 17));
+        }
+        let lower = min + bucket as f64 * step;
+        if lower >= max || bucket >= ((max - min) / step).ceil().max(1.0) as i32 {
+            return format!("[{}, +inf)", significant(max, 17));
+        }
+        return format!(
+            "[{}, {})",
+            significant(lower, 17),
+            significant((lower + step).min(max), 17)
+        );
+    }
+    if spec.value_type == Type::Float && spec.aggregate == Aggregate::Hist {
+        return match bucket {
+            -1 => "(-inf, 0)".into(),
+            0 => "[0, 0]".into(),
+            bucket => {
+                let exponent = bucket - 1076;
+                let power = |exp: i32| {
+                    if exp > 1023 {
+                        f64::INFINITY
+                    } else if exp >= -1022 {
+                        f64::from_bits(((exp + 1023) as u64) << 52)
+                    } else {
+                        f64::from_bits(1u64 << (exp + 1074))
+                    }
+                };
+                let lower = power(exponent);
+                let upper = power(exponent + 1);
+                format!(
+                    "[{}, {})",
+                    significant(lower, 15),
+                    if upper.is_finite() {
+                        significant(upper, 15)
+                    } else {
+                        "+inf".into()
+                    }
+                )
+            }
+        };
+    }
     if let Some((min, max, step)) = spec.linear {
         if bucket < 0 {
             return format!("(-inf, {min})");
@@ -781,6 +909,141 @@ unsafe fn helper_inner(
     let state = unsafe { &mut *state };
     let event = unsafe { &*event };
     let result: Result<String> = match op {
+        115 => {
+            let descriptor = unsafe { CStr::from_ptr(length as *const c_char) }.to_string_lossy();
+            (|| -> Result<String> {
+                let (path, signature): (String, String) =
+                    serde_json::from_str(&descriptor).map_err(|e| e.to_string())?;
+                let probe = unsafe { CStr::from_ptr(event.probe) }.to_string_lossy();
+                let crate::language::Probe::Uprobe {
+                    path: default_path,
+                    ret: false,
+                    ..
+                } = crate::language::Probe::parse(&probe)?
+                else {
+                    return Err("args_as requires a stopped user function entry probe".into());
+                };
+                crate::arguments::format_explicit(
+                    &mut state.types,
+                    event.pid as u32,
+                    event.tid as u32,
+                    if path.is_empty() {
+                        &default_path
+                    } else {
+                        &path
+                    },
+                    &signature,
+                )
+            })()
+        }
+        114 => {
+            let descriptor = unsafe { CStr::from_ptr(length as *const c_char) }.to_string_lossy();
+            (|| -> Result<String> {
+                let (path, function): (String, String) =
+                    serde_json::from_str(&descriptor).map_err(|e| e.to_string())?;
+                let probe = unsafe { CStr::from_ptr(event.probe) }.to_string_lossy();
+                let crate::language::Probe::Uprobe {
+                    path: default_path,
+                    function: default_function,
+                    ret: false,
+                } = crate::language::Probe::parse(&probe)?
+                else {
+                    return Err("args_native requires a stopped user function probe".into());
+                };
+                state.native_args.format(
+                    event.pid as u32,
+                    event.tid as u32,
+                    if path.is_empty() {
+                        &default_path
+                    } else {
+                        &path
+                    },
+                    if function.is_empty() {
+                        &default_function
+                    } else {
+                        &function
+                    },
+                )
+            })()
+        }
+        130 => {
+            if state.stopped {
+                return 0;
+            }
+            if state.recursion_depth >= 64
+                || state.fuel == 0
+                || state.recursion_cost.saturating_add(value) > 512 * 1024
+            {
+                state.fail(
+                    "expression function exceeded recursion depth64, shared invocation fuel4096, or native frame budget512KiB"
+                        .into(),
+                );
+                return 0;
+            }
+            state.recursion_depth += 1;
+            state.recursion_cost += value;
+            state.fuel -= 1;
+            return 1;
+        }
+        131 => {
+            state.recursion_depth = state.recursion_depth.saturating_sub(1);
+            state.recursion_cost = state.recursion_cost.saturating_sub(value);
+            return 0;
+        }
+        120 => Ok(state
+            .kernel_symbols
+            .stack(&state.kernel_frames[..state.kernel_frames.len().min(value as usize)])),
+        121 => Ok(state.kernel_symbols.symbol(value)),
+        122..=125 => {
+            let descriptor = unsafe { CStr::from_ptr(length as *const c_char) }.to_string_lossy();
+            let result = (|| -> Result<String> {
+                let (ty, field): (String, String) =
+                    serde_json::from_str(&descriptor).map_err(|e| e.to_string())?;
+                if op == 125 {
+                    return state.btf.field_string(value, &ty, &field);
+                }
+                let result = match op {
+                    122 => state.btf.size_of(&ty),
+                    123 => state.btf.offset_of(&ty, &field),
+                    _ => state.btf.field(value, &ty, &field),
+                }?;
+                Ok(result.to_string())
+            })();
+            if op == 125 {
+                result
+            } else {
+                return match result {
+                    Ok(value) => value.parse::<u64>().unwrap_or(0),
+                    Err(error) => {
+                        state.fail(error);
+                        0
+                    }
+                };
+            }
+        }
+        150..=154 => {
+            let runtime = match op {
+                150 => "async",
+                151 => "java",
+                152 => "dotnet",
+                153 => "wasm",
+                _ => "all",
+            };
+            Ok(state
+                .managed
+                .stack(
+                    event.pid as u32,
+                    if op == 154 { 0 } else { event.tid as u32 },
+                    runtime,
+                    length as usize,
+                )
+                .unwrap_or_else(|error| {
+                    format!(
+                        "    <{runtime} stack unavailable: {}>\n",
+                        error.replace(['\n', '\r'], "?")
+                    )
+                }))
+        }
         111 => return (f64::from_bits(value) % f64::from_bits(length)).to_bits(),
         110 => {
             return if length == 1 {
@@ -813,7 +1076,7 @@ unsafe fn helper_inner(
             let snapshot = map
                 .iter()
                 .take(4097)
-                .filter_map(|(keys, cell)| keys.first().cloned().map(|key| (key, cell.bits(spec))))
+                .map(|(keys, cell)| (keys.clone(), cell.bits(spec)))
                 .collect();
             let id = state.iterations.len();
             state.iterations.push(snapshot);
@@ -827,13 +1090,18 @@ unsafe fn helper_inner(
             if op == 93 {
                 return snapshot.len() as u64;
             }
-            let Some((key, number)) = snapshot.get(length as usize) else {
+            let row = if op == 91 { length >> 32 } else { length };
+            let Some((keys, number)) = snapshot.get(row as usize) else {
                 state.fail("invalid map iteration index".into());
                 return 0;
             };
             if op == 92 {
                 return *number as u64;
             }
+            let Some(key) = keys.get((length & 0xffff_ffff) as usize) else {
+                state.fail("invalid map iteration key index".into());
+                return 0;
+            };
             match key {
                 Key::Number(number) => return *number as u64,
                 Key::Float(value) => return float_key_value(*value).to_bits(),
@@ -1210,55 +1478,152 @@ unsafe fn recorded_helper(
     value: u64,
     length: u64,
 ) -> u64 {
-    if matches!(op, 110 | 111) || (90..=93).contains(&op) {
+    if matches!(op, 110 | 111 | 130 | 131) || (90..=93).contains(&op) {
         return unsafe { helper_inner(state, event, op, value, length) };
     }
     let s = unsafe { &mut *state };
     let string_result = matches!(
         op,
-        0 | 1 | 2 | 10 | 15 | 16 | 43 | 45 | 46 | 50 | 51 | 52 | 53 | 60 | 70 | 81 | 100
+        0 | 1
+            | 2
+            | 10
+            | 15
+            | 16
+            | 43
+            | 45
+            | 46
+            | 50
+            | 51
+            | 52
+            | 53
+            | 60
+            | 70
+            | 81
+            | 100
+            | 114
+            | 115
+            | 120
+            | 121
+            | 125
+            | 150..=154
     );
     let empty = if string_result {
         c"".as_ptr() as u64
     } else {
         0
     };
-    let descriptor = if (40..=46).contains(&op) {
-        Some(
-            unsafe { CStr::from_ptr(length as *const c_char) }
-                .to_string_lossy()
-                .into_owned(),
-        )
-    } else if matches!(op, 80 | 81) {
-        Some(
-            unsafe { CStr::from_ptr(value as *const c_char) }
-                .to_string_lossy()
-                .into_owned(),
-        )
-    } else {
-        None
-    };
+    let descriptor =
+        if (40..=46).contains(&op) || ((122..=125).contains(&op) || matches!(op, 114 | 115)) {
+            Some(
+                unsafe { CStr::from_ptr(length as *const c_char) }
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        } else if matches!(op, 80 | 81) {
+            Some(
+                unsafe { CStr::from_ptr(value as *const c_char) }
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        } else {
+            None
+        };
     if s.replay_lookup && matches!(op, 11..=16 | 20 | 30 | 31 | 80 | 81) {
         return unsafe { helper_inner(state, event, op, value, length) };
     }
-    if s.replay_lookup && matches!(op, 10 | 50 | 51 | 52 | 100) {
-        let requested = if op == 100 { value } else { length };
-        let captured = s
+    if s.replay_lookup
+        && (1..=6).contains(&op)
+        && !s.replay.as_ref().is_some_and(|queue| {
+            queue
+                .iter()
+                .any(|item| item.op == op && item.value == value && item.length == length)
+        })
+    {
+        let size = if op <= 2 {
+            length as usize
+        } else {
+            1usize << (op - 3)
+        };
+        let bytes = match crate::recording::read_memory(&s.replay_memory, value, size, op == 1) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                s.fail(error);
+                return empty;
+            }
+        };
+        if op >= 3 {
+            let mut raw = [0; 8];
+            raw[..bytes.len()].copy_from_slice(&bytes);
+            return match size {
+                1 => raw[0] as u64,
+                2 => u16::from_ne_bytes(raw[..2].try_into().unwrap()) as u64,
+                4 => u32::from_ne_bytes(raw[..4].try_into().unwrap()) as u64,
+                _ => u64::from_ne_bytes(raw),
+            };
+        }
+        let text = if op == 1 {
+            let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+            String::from_utf8_lossy(&bytes[..end]).into_owned()
+        } else {
+            bytes
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let text = CString::new(text.replace('\0', "\\0")).unwrap();
+        let ptr = text.as_ptr() as u64;
+        s.stack_strings.push(text);
+        return ptr;
+    }
+    if s.replay_lookup && matches!(op, 10 | 50 | 51 | 52 | 100 | 120) {
+        let requested = if matches!(op, 100 | 120) {
+            value
+        } else {
+            length
+        };
+        let candidates: Vec<_> = s
             .replay
             .as_ref()
-            .and_then(|queue| {
-                queue.iter().find(|item| {
-                    item.op == op
-                        && if op == 10 {
-                            true
-                        } else {
-                            let depth = if op == 100 { item.value } else { item.length };
-                            depth >= requested
-                        }
-                })
+            .map(|queue| {
+                queue
+                    .iter()
+                    .filter(|item| {
+                        item.op == op
+                            && if op == 10 {
+                                true
+                            } else {
+                                let depth = if matches!(op, 100 | 120) {
+                                    item.value
+                                } else {
+                                    item.length
+                                };
+                                depth >= requested
+                            }
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
             })
-            .cloned();
-        let text = if let Some(item) = captured {
+            .unwrap_or_default();
+        let prefix = |item: &crate::recording::Helper| {
+            item.text.as_ref().map(|text| {
+                if op == 10 {
+                    text.clone()
+                } else {
+                    text.split_inclusive('\n')
+                        .take(requested as usize + usize::from(op == 52))
+                        .collect::<String>()
+                }
+            })
+        };
+        if candidates
+            .windows(2)
+            .any(|pair| prefix(&pair[0]) != prefix(&pair[1]) || pair[0].error != pair[1].error)
+        {
+            s.fail("captured stack results conflict for this observation".into());
+            return empty;
+        }
+        let text = if let Some(item) = candidates.into_iter().next() {
             if let Some(error) = item.error {
                 s.fail(error);
                 return empty;
@@ -1276,6 +1641,16 @@ unsafe fn recorded_helper(
                         .collect::<String>(),
                 )
             }
+        } else if op == 120 {
+            Some(if s.kernel_frames.is_empty() {
+                "    <no kernel stack>\n".into()
+            } else {
+                s.kernel_frames
+                    .iter()
+                    .take(requested as usize)
+                    .map(|ip| format!("    0x{ip:x}\n"))
+                    .collect::<String>()
+            })
         } else if op == 100 {
             let event = unsafe { &*event };
             let frames = event.stack_frames();
@@ -1311,11 +1686,13 @@ unsafe fn recorded_helper(
     }
     if let Some(queue) = &mut s.replay {
         let item = if s.replay_lookup {
-            queue
+            let matches: Vec<_> = queue
                 .iter()
-                .find(|item| {
+                .filter(|item| {
                     item.op == op
-                        && if (40..=46).contains(&op) {
+                        && if (40..=46).contains(&op)
+                            || ((122..=125).contains(&op) || matches!(op, 114 | 115))
+                        {
                             item.value == value && item.descriptor == descriptor
                         } else if matches!(op, 80 | 81) {
                             item.descriptor == descriptor
@@ -1324,6 +1701,16 @@ unsafe fn recorded_helper(
                         }
                 })
                 .cloned()
+                .collect();
+            if matches.windows(2).any(|pair| {
+                pair[0].number != pair[1].number
+                    || pair[0].text != pair[1].text
+                    || pair[0].error != pair[1].error
+            }) {
+                s.fail("captured helper results conflict for this observation".into());
+                return empty;
+            }
+            matches.into_iter().next()
         } else {
             queue.pop_front()
         };
@@ -1340,10 +1727,12 @@ unsafe fn recorded_helper(
         };
         if item.op != op
             || (!(11..=16).contains(&op)
-                && !(40..=46).contains(&op)
+                && !((40..=46).contains(&op)
+                    || ((122..=125).contains(&op) || matches!(op, 114 | 115)))
                 && !matches!(op, 80 | 81)
                 && (item.value, item.length) != (value, length))
-            || (40..=46).contains(&op) && item.value != value
+            || ((40..=46).contains(&op) || ((122..=125).contains(&op) || matches!(op, 114 | 115)))
+                && item.value != value
             || op == 16 && item.length != length
         {
             s.fail("recording helper call does not match script".into());
@@ -1381,7 +1770,28 @@ unsafe fn recorded_helper(
     if s.recorder.is_some() {
         let text = if matches!(
             op,
-            0 | 1 | 2 | 10 | 15 | 16 | 43 | 45 | 46 | 50 | 51 | 52 | 53 | 60 | 70 | 81 | 100
+            0 | 1
+                | 2
+                | 10
+                | 15
+                | 16
+                | 43
+                | 45
+                | 46
+                | 50
+                | 51
+                | 52
+                | 53
+                | 60
+                | 70
+                | 81
+                | 100
+                | 114
+                | 115
+                | 120
+                | 121
+                | 125
+                | 150..=154
         ) {
             Some(
                 unsafe { CStr::from_ptr(result as *const c_char) }

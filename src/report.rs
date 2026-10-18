@@ -41,6 +41,24 @@ pub fn baseline(path: &std::path::Path) -> Result<Vec<Row>> {
     serde_json::from_slice(&bytes)
         .map_err(|e| format!("comparison requires a poortrace JSON report: {e}"))
 }
+fn bucket_order(a: &str, b: &str) -> std::cmp::Ordering {
+    let lower = |s: &str| {
+        s.trim_start_matches(['[', '('])
+            .split(',')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_owned()
+    };
+    let (a, b) = (lower(a), lower(b));
+    match (a.parse::<i128>(), b.parse::<i128>()) {
+        (Ok(a), Ok(b)) => a.cmp(&b),
+        _ => a
+            .parse::<f64>()
+            .unwrap_or(f64::NEG_INFINITY)
+            .total_cmp(&b.parse::<f64>().unwrap_or(f64::NEG_INFINITY)),
+    }
+}
 fn number(row: &Row) -> f64 {
     row.float_value.unwrap_or(row.value as f64)
 }
@@ -76,14 +94,7 @@ pub fn render(rows: &[Row], options: &Options) -> Result<String> {
                     *current = current.saturating_sub(count);
                 }
                 row.buckets = buckets.into_iter().collect();
-                row.buckets.sort_by_key(|(label, _)| {
-                    label
-                        .trim_start_matches('[')
-                        .split(',')
-                        .next()
-                        .and_then(|v| v.parse::<i128>().ok())
-                        .unwrap_or(i128::MIN)
-                });
+                row.buckets.sort_by(|(a, _), (b, _)| bucket_order(a, b));
             }
         }
         for row in &options.baseline {

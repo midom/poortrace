@@ -24,6 +24,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22.x"
+          cache: false
       - name: Native ptrace, SDT, typed argument, CPython, and Node tests
         run: |
           cargo test --locked --features '${{ matrix.features }}' --test cli live_uprobes -- --ignored
@@ -34,6 +38,7 @@ jobs:
           cargo test --locked --features '${{ matrix.features }}' --test cli live_node -- --ignored
           cargo test --locked --features '${{ matrix.features }}' --test process_coverage -- --ignored
           cargo test --locked --features '${{ matrix.features }}' --test arguments -- --ignored
+          cargo test --locked --features '${{ matrix.features }}' --test expansion -- --ignored
         env:
           LLVM_CONFIG: llvm-config-18
   fully-static:
@@ -89,15 +94,19 @@ jobs:
           - os: ubuntu-24.04
             node: "20"
             python: "3.11"
+            go: "1.22.x"
           - os: ubuntu-24.04-arm
             node: "22"
             python: "3.12"
+            go: "1.22.x"
           - os: ubuntu-24.04
             node: "24"
             python: "3.13"
+            go: "1.24.x"
           - os: ubuntu-24.04-arm
             node: "24"
             python: "3.14"
+            go: "1.24.x"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -108,10 +117,62 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache: false
       - name: Managed stack compatibility
         env:
           LLVM_CONFIG: llvm-config-18
         run: |
           cargo test --locked --test managed python_versions -- --ignored --nocapture
-          cargo test --locked --test managed node_ -- --ignored --nocapture
-          cargo test --locked --test managed go_running -- --ignored --nocapture
+          cargo test --locked --test managed node_ -- --ignored --skip cooperative_ --nocapture
+          cargo test --locked --test managed go_ -- --ignored --skip go_perf --nocapture
+
+  cooperative-runtimes:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y llvm-18-dev
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - run: dotnet tool install --tool-path /tmp/poortrace-dotnet-tools dotnet-stack --version 10.0.750501
+      - run: npm ci --prefix adapters --ignore-scripts
+      - name: Real JVM, .NET, Python async, JS async and WebAssembly adapters
+        run: cargo test --locked --test managed cooperative_ -- --ignored --nocapture
+        env:
+          LLVM_CONFIG: llvm-config-18
+          DOTNET_STACK: /tmp/poortrace-dotnet-tools/dotnet-stack
+
+  compressed-v8:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y llvm-18-dev
+      - name: Fetch checksum-pinned experimental compressed Node fixture
+        run: |
+          curl -fL --retry 3 -o /tmp/node-pointer-compression.tar.xz https://unofficial-builds.nodejs.org/download/release/v20.0.0/node-v20.0.0-linux-x64-pointer-compression.tar.xz
+          echo '5fe8c39a6536b28d5125be7adfb9da67e39ce7f165f58905a5cf5916f7670722  /tmp/node-pointer-compression.tar.xz' | sha256sum -c -
+          tar -xJf /tmp/node-pointer-compression.tar.xz -C /tmp
+      - name: Native compressed heap and frame resolution
+        run: cargo test --locked --test managed compressed_scope_live_function_frames -- --ignored --nocapture
+        env:
+          LLVM_CONFIG: llvm-config-18
+          POORTRACE_NODE_BIN: /tmp/node-v20.0.0-linux-x64-pointer-compression/bin/node

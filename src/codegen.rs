@@ -15,6 +15,7 @@ pub struct Program {
     pub ir: String,
     handlers: Vec<Handler>,
     ustack: bool,
+    kstack: bool,
     jsstack: bool,
     branches: bool,
     _engine: Engine,
@@ -25,7 +26,13 @@ impl Program {
             return Err("script exceeds 256 KiB".into());
         }
         let clauses = language::parse(source)?;
-        let mut generator = Generator::default();
+        let mut generator = Generator {
+            definitions: clauses
+                .first()
+                .map(|c| (*c.functions).clone())
+                .unwrap_or_default(),
+            ..Default::default()
+        };
         for clause in &clauses {
             generator.local_types(&clause.body)?;
             generator.declare_maps(&clause.body)?;
@@ -47,6 +54,7 @@ impl Program {
             ir,
             handlers,
             ustack: generator.ustack,
+            kstack: generator.kstack,
             jsstack: generator.jsstack,
             branches: generator.branches,
             _engine: engine,
@@ -65,10 +73,14 @@ impl Program {
         if let Some(saved) = &mut recorded {
             saved.capture_raw(state.js_snapshot.as_ref());
             saved.trace_fields = state.trace_fields.clone();
+            saved.memory = state.captured_memory.clone();
+            saved.kernel_stack = state.kernel_frames.clone();
         }
         state.journal.clear();
         state.stack_strings.clear();
         state.fuel = 4096;
+        state.recursion_depth = 0;
+        state.recursion_cost = 0;
         state.scratch.clear();
         state.iterations.clear();
         // Handler lifetime is bounded by the Engine held by this Program. Event
@@ -106,6 +118,9 @@ impl Program {
     pub fn needs_jsstack(&self) -> bool {
         self.jsstack
     }
+    pub fn needs_kstack(&self) -> bool {
+        self.kstack
+    }
     pub fn needs_ustack(&self) -> bool {
         self.ustack
     }
@@ -134,6 +149,8 @@ declare i64 @pt_helper(ptr, ptr, i64, i64, i64)
 
 #[derive(Default)]
 struct Generator {
+    definitions: BTreeMap<String, (Vec<String>, Expr)>,
+    native_functions: BTreeMap<(String, Vec<Type>), (String, Type)>,
     specs: Vec<MapSpec>,
     ids: BTreeMap<String, usize>,
     formats: Vec<Format>,
@@ -148,6 +165,7 @@ struct Generator {
     local_types: BTreeMap<String, Type>,
     arrays: BTreeMap<String, u32>,
     ustack: bool,
+    kstack: bool,
     jsstack: bool,
     branches: bool,
 }
@@ -210,6 +228,22 @@ impl Generator {
     fn infer_with(e: &Expr, types: &BTreeMap<String, Type>) -> Type {
         match e {
             Expr::String(_) => Type::String,
+            Expr::Conditional(_, yes, no) => {
+                let yes = Self::infer_with(yes, types);
+                let no = Self::infer_with(no, types);
+                if yes == Type::Float || no == Type::Float {
+                    Type::Float
+                } else if yes == Type::String || no == Type::String {
+                    Type::String
+                } else if yes == Type::Stack || no == Type::Stack {
+                    Type::Stack
+                } else {
+                    yes
+                }
+            }
+            Expr::Call(name, _) if types.contains_key(&format!("fn::{name}")) => {
+                types[&format!("fn::{name}")]
+            }
             Expr::Float(_) => Type::Float,
             Expr::Call(name, _) if matches!(name.as_str(), "f64" | "f32" | "fieldf") => Type::Float,
             Expr::Unary(op, value) if matches!(op.as_str(), "+" | "-") => {
@@ -232,12 +266,17 @@ impl Generator {
                 Self::infer_with(body, &scope)
             }
             Expr::Local(name) => types.get(name).copied().unwrap_or(Type::Number),
+            Expr::Array(name, _) => types
+                .get(&format!("[{name}]"))
+                .copied()
+                .unwrap_or(Type::Number),
             Expr::Map(name, _) => types
                 .get(&format!("@{name}"))
                 .copied()
                 .unwrap_or(Type::Number),
             Expr::Builtin(n)
                 if n == "goroutines"
+                    || n == "managedstacks"
                     || n == "comm"
                     || n == "probe"
                     || n == "syscall"
@@ -246,7 +285,10 @@ impl Generator {
                 Type::String
             }
             Expr::Builtin(n) | Expr::Call(n, _)
-                if n == "ustack"
+                if matches!(
+                    n.as_str(),
+                    "kstack" | "asyncstack" | "jstack" | "dotnetstack" | "wasmstack"
+                ) || n == "ustack"
                     || n == "branches"
                     || n == "pystack"
                     || n == "jsstack"
@@ -265,9 +307,14 @@ impl Generator {
                         | "fieldstr"
                         | "value"
                         | "args"
+                        | "args_native"
+                        | "args_as"
                         | "goroutines"
+                        | "managedstacks"
                         | "farg"
                         | "tpstr"
+                        | "ksym"
+                        | "kfieldstr"
                 ) =>
             {
                 Type::String
@@ -309,6 +356,7 @@ impl Generator {
         agg: Aggregate,
         linear: Option<(i64, i64, i64)>,
         value_type: Type,
+        float_linear: Option<(u64, u64, u64)>,
     ) -> Result<()> {
         if let Expr::Map(name, keys) = lhs {
             let types: Vec<_> = keys.iter().map(|key| self.infer(key)).collect();
@@ -318,6 +366,7 @@ impl Generator {
                     || old.aggregate != agg
                     || old.linear != linear
                     || old.value_type != value_type
+                    || old.float_linear != float_linear
                 {
                     return Err(format!("inconsistent key types or aggregation for @{name}"));
                 }
@@ -329,6 +378,7 @@ impl Generator {
                     aggregate: agg,
                     linear,
                     value_type,
+                    float_linear,
                 });
                 self.local_types.insert(format!("@{name}"), value_type);
             }
@@ -344,7 +394,42 @@ impl Generator {
                     } else {
                         Aggregate::Set
                     };
-                    let linear = if agg == Aggregate::Lhist {
+                    let mut float_linear = None;
+                    if agg == Aggregate::Lhist {
+                        let Expr::Call(_, args) = rhs else {
+                            unreachable!()
+                        };
+                        if self.infer(&args[0]) == Type::Float {
+                            fn constant(value: &Expr) -> Option<f64> {
+                                match value {
+                                    Expr::Number(n) => Some(*n as f64),
+                                    Expr::Float(n) => Some(*n),
+                                    Expr::Unary(op, n) if op == "-" => constant(n).map(|n| -n),
+                                    Expr::Unary(op, n) if op == "+" => constant(n),
+                                    _ => None,
+                                }
+                            }
+                            let bounds = args[1..].iter().map(constant).collect::<Vec<_>>();
+                            let [Some(min), Some(max), Some(step)] = bounds.as_slice() else {
+                                return Err("floating lhist bounds must be finite constants".into());
+                            };
+                            let buckets = ((*max - *min) / *step).ceil();
+                            if !min.is_finite()
+                                || !max.is_finite()
+                                || !step.is_finite()
+                                || min >= max
+                                || *step <= 0.0
+                                || !buckets.is_finite()
+                                || buckets > 1024.0
+                                || *min + *step <= *min
+                                || *max - *step >= *max
+                            {
+                                return Err("floating lhist requires finite min < max, positive step, and at most 1024 buckets".into());
+                            }
+                            float_linear = Some((min.to_bits(), max.to_bits(), step.to_bits()));
+                        }
+                    }
+                    let linear = if agg == Aggregate::Lhist && float_linear.is_none() {
                         let Expr::Call(_, args) = rhs else {
                             unreachable!()
                         };
@@ -390,14 +475,7 @@ impl Generator {
                     if !matches!(value_type, Type::Number | Type::Float) {
                         return Err("map values require numbers".into());
                     }
-                    if value_type == Type::Float
-                        && matches!(agg, Aggregate::Hist | Aggregate::Lhist | Aggregate::Count)
-                    {
-                        return Err(
-                            "floating-point histograms require an explicit integer cast".into()
-                        );
-                    }
-                    self.declare_map(lhs, agg, linear, value_type)?;
+                    self.declare_map(lhs, agg, linear, value_type, float_linear)?;
                 }
                 Stmt::Increment(lhs, _) => {
                     let ty = if let Expr::Map(name, _) = lhs {
@@ -408,13 +486,13 @@ impl Generator {
                     } else {
                         Type::Number
                     };
-                    self.declare_map(lhs, Aggregate::Set, None, ty)?;
+                    self.declare_map(lhs, Aggregate::Set, None, ty, None)?;
                 }
                 Stmt::Repeat(_, body) | Stmt::While(_, body) => self.declare_maps(body)?,
                 Stmt::For(key, value, map, body) => {
                     if let Some(spec) = self.ids.get(map).map(|id| &self.specs[*id]) {
-                        if let [ty] = spec.keys.as_slice() {
-                            self.local_types.insert(key.clone(), *ty);
+                        for (name, ty) in key.iter().zip(&spec.keys) {
+                            self.local_types.insert(name.clone(), *ty);
                         }
                     }
                     let value_type = self
@@ -450,8 +528,8 @@ impl Generator {
                 match stmt {
                     Stmt::For(key, value, map, body) => {
                         if let Some(spec) = ids.get(map).map(|id| &specs[*id]) {
-                            if let [ty] = spec.keys.as_slice() {
-                                types.insert(key.clone(), *ty);
+                            for (name, ty) in key.iter().zip(&spec.keys) {
+                                types.insert(name.clone(), *ty);
                             }
                         }
                         types.insert(
@@ -474,10 +552,11 @@ impl Generator {
             }
         }
         iterators(body, &self.ids, &self.specs, &mut self.local_types);
-        fn collect<'a>(body: &'a [Stmt], out: &mut Vec<(&'a str, &'a Expr)>) {
+        fn collect<'a>(body: &'a [Stmt], out: &mut Vec<(String, &'a Expr)>) {
             for stmt in body {
                 match stmt {
-                    Stmt::Assign(Expr::Local(n), rhs) => out.push((n, rhs)),
+                    Stmt::Assign(Expr::Local(n), rhs) => out.push((n.clone(), rhs)),
+                    Stmt::Assign(Expr::Array(n, _), rhs) => out.push((format!("[{n}]"), rhs)),
                     Stmt::If(_, y, n) => {
                         collect(y, out);
                         collect(n, out);
@@ -495,8 +574,8 @@ impl Generator {
             let mut changed = false;
             for (name, rhs) in &assignments {
                 let ty = self.infer(rhs);
-                if ty != Type::Number && self.local_types.get(*name) != Some(&ty) {
-                    self.local_types.insert((*name).into(), ty);
+                if ty != Type::Number && self.local_types.get(name) != Some(&ty) {
+                    self.local_types.insert(name.clone(), ty);
                     changed = true;
                 }
             }
@@ -505,7 +584,7 @@ impl Generator {
             }
         }
         for (name, rhs) in assignments {
-            if self.local_types.get(name).copied().unwrap_or(Type::Number) != self.infer(rhs) {
+            if self.local_types.get(&name).copied().unwrap_or(Type::Number) != self.infer(rhs) {
                 return Err(format!("inconsistent local type for ${name}"));
             }
         }
@@ -529,7 +608,7 @@ impl Generator {
                         out.insert(n.clone());
                     }
                     Stmt::For(key, value, _, body) => {
-                        out.insert(key.clone());
+                        out.extend(key.iter().cloned());
                         out.insert(value.clone());
                         collect(body, out);
                     }
@@ -631,8 +710,24 @@ impl Generator {
                 Ok(self.value(format!("ptrtoint ptr @str{id} to i64"), Type::String))
             }
             Expr::Builtin(name) => {
+                if name == "managedstacks" {
+                    return self.helper(154, "0".into(), 127, Type::String);
+                }
                 if name == "goroutines" {
                     return self.helper(53, "128".into(), 32, Type::String);
+                }
+                if name == "kstack" {
+                    self.kstack = true;
+                    return self.helper(120, "127".into(), 0, Type::Stack);
+                }
+                if let Some(op) = match name.as_str() {
+                    "asyncstack" => Some(150),
+                    "jstack" => Some(151),
+                    "dotnetstack" => Some(152),
+                    "wasmstack" => Some(153),
+                    _ => None,
+                } {
+                    return self.helper(op, "0".into(), 127, Type::Stack);
                 }
                 if name == "wait_reason" {
                     return self.helper(70, "0".into(), 0, Type::String);
@@ -720,7 +815,7 @@ impl Generator {
                     format!(
                         "call i64 @pt_helper(ptr %state, ptr %event, i64 30, i64 {encoded}, i64 0)"
                     ),
-                    Type::Number,
+                    self.infer(expr),
                 ))
             }
             Expr::Inline(arguments, body) => {
@@ -754,6 +849,41 @@ impl Generator {
                 }
                 result
             }
+            Expr::Conditional(condition, yes, no) => {
+                let test = self.truth(condition)?;
+                let test = self
+                    .value(format!("icmp ne i64 {test},0"), Type::Number)
+                    .reg;
+                let yes_label = self.label_name();
+                let no_label = self.label_name();
+                let done = self.label_name();
+                self.emit(format!("br i1 {test},label %{yes_label},label %{no_label}"));
+                let target = self.infer(expr);
+                self.label(&yes_label);
+                let mut yes = self.expr(yes)?;
+                if target == Type::Float && yes.ty == Type::Number {
+                    let raw = self.float_operand(yes)?;
+                    yes = self.value(format!("bitcast double {raw} to i64"), Type::Float);
+                }
+                let yes_end = self.current.clone();
+                self.emit(format!("br label %{done}"));
+                self.label(&no_label);
+                let mut no = self.expr(no)?;
+                if target == Type::Float && no.ty == Type::Number {
+                    let raw = self.float_operand(no)?;
+                    no = self.value(format!("bitcast double {raw} to i64"), Type::Float);
+                }
+                if yes.ty != no.ty {
+                    return Err("conditional branches must have compatible types".into());
+                }
+                let no_end = self.current.clone();
+                self.emit(format!("br label %{done}"));
+                self.label(&done);
+                Ok(self.value(
+                    format!("phi i64 [{},%{yes_end}],[{},%{no_end}]", yes.reg, no.reg),
+                    yes.ty,
+                ))
+            }
             Expr::Map(name, keys) => {
                 let (id, array) = self.keys(name, keys)?;
                 if matches!(self.specs[id].aggregate, Aggregate::Hist | Aggregate::Lhist) {
@@ -766,6 +896,9 @@ impl Generator {
                     ),
                     self.specs[id].value_type,
                 ))
+            }
+            Expr::Call(name, args) if self.definitions.contains_key(name) => {
+                self.native_call(name, args)
             }
             Expr::Call(name, args)
                 if matches!(
@@ -800,6 +933,74 @@ impl Generator {
                     if op >= 3 { Type::Number } else { Type::String },
                 )
             }
+            Expr::Call(name, args)
+                if name == "kstack"
+                    || matches!(
+                        name.as_str(),
+                        "asyncstack" | "jstack" | "dotnetstack" | "wasmstack" | "managedstacks"
+                    ) =>
+            {
+                let depth = match args.as_slice() {
+                    [] => 127,
+                    [Expr::Number(n)] if (1..=127).contains(n) => *n,
+                    _ => return Err("stack helper depth must be a constant from1to127".into()),
+                };
+                if name == "kstack" {
+                    self.kstack = true;
+                    self.helper(120, depth.to_string(), 0, Type::Stack)
+                } else {
+                    let op = match name.as_str() {
+                        "asyncstack" => 150,
+                        "jstack" => 151,
+                        "dotnetstack" => 152,
+                        "wasmstack" => 153,
+                        _ => 154,
+                    };
+                    self.helper(
+                        op,
+                        "0".into(),
+                        depth,
+                        if op == 154 { Type::String } else { Type::Stack },
+                    )
+                }
+            }
+            Expr::Call(name, args) if name == "ksym" => {
+                let [address] = args.as_slice() else {
+                    return Err("ksym requires one address".into());
+                };
+                let address = self.numeric(address)?;
+                self.helper(121, address, 0, Type::String)
+            }
+            Expr::Call(name, args)
+                if matches!(
+                    name.as_str(),
+                    "btf_sizeof" | "btf_offsetof" | "kfield" | "kfieldstr"
+                ) =>
+            {
+                let read = matches!(name.as_str(), "kfield" | "kfieldstr");
+                let start = usize::from(read);
+                let address = if read {
+                    self.numeric(args.first().ok_or("kernel field requires address")?)?
+                } else {
+                    "0".into()
+                };
+                let (ty, field) = match &args[start..] {
+                    [Expr::String(ty)] if name == "btf_sizeof" => (ty.as_str(), ""),
+                    [Expr::String(ty), Expr::String(field)] if name != "btf_sizeof" => {
+                        (ty.as_str(), field.as_str())
+                    }
+                    _ => return Err("BTF helpers require literal type and field names".into()),
+                };
+                let descriptor = serde_json::to_string(&(ty, field)).map_err(|e| e.to_string())?;
+                let pointer = self.expr(&Expr::String(descriptor))?.reg;
+                let op = match name.as_str() {
+                    "btf_sizeof" => 122,
+                    "btf_offsetof" => 123,
+                    "kfield" => 124,
+                    _ => 125,
+                };
+                Ok(self.value(format!("call i64 @pt_helper(ptr %state, ptr %event, i64 {op}, i64 {address}, i64 {pointer})"),if name=="kfieldstr"{Type::String}else{Type::Number}))
+            }
             Expr::Call(name, args) if name == "goroutines" => {
                 let (depth, limit) = match args.as_slice() {
                     [] => (32, 128),
@@ -815,6 +1016,51 @@ impl Generator {
                     }
                 };
                 self.helper(53, limit.to_string(), depth, Type::String)
+            }
+            Expr::Call(name, args) if name == "args_as" => {
+                let (path, signature) = match args.as_slice() {
+                    [Expr::String(signature)] => ("", signature.as_str()),
+                    [Expr::String(path), Expr::String(signature)] => {
+                        (path.as_str(), signature.as_str())
+                    }
+                    _ => {
+                        return Err(
+                            "args_as requires a literal C ABI signature and optional ELF path"
+                                .into(),
+                        );
+                    }
+                };
+                let descriptor =
+                    serde_json::to_string(&(path, signature)).map_err(|e| e.to_string())?;
+                let pointer = self.expr(&Expr::String(descriptor))?.reg;
+                Ok(self.value(
+                    format!(
+                        "call i64 @pt_helper(ptr %state,ptr %event,i64 115,i64 0,i64 {pointer})"
+                    ),
+                    Type::String,
+                ))
+            }
+            Expr::Call(name, args) if name == "args_native" => {
+                let (path, function) = match args.as_slice() {
+                    [] => ("", ""),
+                    [Expr::String(path), Expr::String(function)] => {
+                        (path.as_str(), function.as_str())
+                    }
+                    _ => {
+                        return Err(
+                            "args_native() accepts optional literal ELF path/function".into()
+                        );
+                    }
+                };
+                let descriptor =
+                    serde_json::to_string(&(path, function)).map_err(|e| e.to_string())?;
+                let pointer = self.expr(&Expr::String(descriptor))?.reg;
+                Ok(self.value(
+                    format!(
+                        "call i64 @pt_helper(ptr %state,ptr %event,i64 114,i64 0,i64 {pointer})"
+                    ),
+                    Type::String,
+                ))
             }
             Expr::Call(name, args) if name == "args" => {
                 let (path, function) = match args.as_slice() {
@@ -1269,6 +1515,119 @@ impl Generator {
             }
         }
     }
+    fn native_call(&mut self, name: &str, args: &[Expr]) -> Result<Value> {
+        let (parameters, expression) = self
+            .definitions
+            .get(name)
+            .cloned()
+            .ok_or("unknown expression function")?;
+        if parameters.len() != args.len() {
+            return Err("expression function argument count mismatch".into());
+        }
+        let values = args
+            .iter()
+            .map(|arg| self.expr(arg))
+            .collect::<Result<Vec<_>>>()?;
+        let key = (
+            name.to_owned(),
+            values.iter().map(|v| v.ty).collect::<Vec<_>>(),
+        );
+        let (symbol, result) = if let Some(instance) = self.native_functions.get(&key) {
+            instance.clone()
+        } else {
+            if self.native_functions.len() >= 256 {
+                return Err("native expression function specialization limit exceeded".into());
+            }
+            let symbol = format!("expr_fn_{}", self.native_functions.len());
+            let saved = (
+                std::mem::take(&mut self.body),
+                std::mem::take(&mut self.allocations),
+                self.next,
+                std::mem::take(&mut self.current),
+                std::mem::take(&mut self.locals),
+                std::mem::take(&mut self.local_types),
+            );
+            for spec in &self.specs {
+                self.local_types
+                    .insert(format!("@{}", spec.name), spec.value_type);
+            }
+            for (parameter, value) in parameters.iter().zip(&values) {
+                self.local_types.insert(parameter.clone(), value.ty);
+            }
+            let result = self.infer(&expression);
+            self.local_types.insert(format!("fn::{name}"), result);
+            self.native_functions
+                .insert(key.clone(), (symbol.clone(), result));
+            self.next = 0;
+            let signature = (0..parameters.len())
+                .map(|n| format!(",i64 %arg{n}"))
+                .collect::<String>();
+            self.body = format!("define i64 @{symbol}(ptr %state,ptr %event{signature}) {{\n");
+            self.label("entry");
+            for (n, parameter) in parameters.iter().enumerate() {
+                let pointer = self.value("alloca i64", Type::Number).reg;
+                self.emit(format!("store i64 %arg{n},ptr {pointer}"));
+                self.locals.insert(parameter.clone(), pointer);
+            }
+            let frame_cost = format!("FRAME_COST_{symbol}");
+            let entered = self.helper(130, frame_cost.clone(), 0, Type::Number)?.reg;
+            let entered = self
+                .value(format!("icmp ne i64 {entered},0"), Type::Number)
+                .reg;
+            let valid = self.label_name();
+            let denied = self.label_name();
+            self.emit(format!("br i1 {entered},label %{valid},label %{denied}"));
+            self.label(&denied);
+            let fallback = if matches!(result, Type::String | Type::Stack) {
+                self.expr(&Expr::String(String::new()))?.reg
+            } else {
+                "0".into()
+            };
+            self.emit(format!("ret i64 {fallback}"));
+            self.label(&valid);
+            let output = self.expr(&expression)?;
+            if output.ty != result {
+                return Err("recursive function return type must be consistent".into());
+            }
+            self.helper(131, frame_cost.clone(), 0, Type::Number)?;
+            self.emit(format!("ret i64 {}", output.reg));
+            self.body.push_str("}\n");
+            // Conservative native-frame accounting bounds recursion even when an
+            // expression creates many hoisted allocas or LLVM spills SSA values.
+            let cost = 4096usize
+                .saturating_add(self.allocations.len().saturating_mul(8))
+                .saturating_add(self.next.saturating_mul(32));
+            if cost > 128 * 1024 {
+                return Err(
+                    "recursive expression function exceeds native frame complexity budget".into(),
+                );
+            }
+            self.body = self.body.replace(&frame_cost, &cost.to_string());
+            if self.functions.len().saturating_add(self.body.len()) > 8 * 1024 * 1024 {
+                return Err("native expression function IR exceeds8MiB".into());
+            }
+            self.functions.push_str(&self.body.replacen(
+                "entry:\n",
+                &format!("entry:\n{}", self.allocations),
+                1,
+            ));
+            self.body = saved.0;
+            self.allocations = saved.1;
+            self.next = saved.2;
+            self.current = saved.3;
+            self.locals = saved.4;
+            self.local_types = saved.5;
+            (symbol, result)
+        };
+        let arguments = values
+            .iter()
+            .map(|v| format!(",i64 {}", v.reg))
+            .collect::<String>();
+        Ok(self.value(
+            format!("call i64 @{symbol}(ptr %state,ptr %event{arguments})"),
+            result,
+        ))
+    }
     fn float_operand(&mut self, value: Value) -> Result<String> {
         match value.ty {
             Type::Float => Ok(self
@@ -1324,7 +1683,18 @@ impl Generator {
                     self.emit(format!("call void @pt_map_update(ptr %state, i64 {id}, ptr {array}, i64 {}, i64 {value}, i64 {})", keys.len(), agg as u64));
                 }
                 Stmt::Assign(Expr::Array(name, index), rhs) => {
-                    let value = self.numeric(rhs)?;
+                    let value = self.expr(rhs)?;
+                    if !matches!(value.ty, Type::Number | Type::Float)
+                        || value.ty
+                            != self
+                                .local_types
+                                .get(&format!("[{name}]"))
+                                .copied()
+                                .unwrap_or(Type::Number)
+                    {
+                        return Err("local arrays require consistent numeric element types".into());
+                    }
+                    let value = value.reg;
                     let encoded = self.array_index(name, index)?;
                     self.emit(format!("call i64 @pt_helper(ptr %state, ptr %event, i64 31, i64 {encoded}, i64 {value})"));
                 }
@@ -1353,9 +1723,23 @@ impl Generator {
                 Stmt::Increment(Expr::Array(name, index), amount) => {
                     let encoded = self.array_index(name, index)?;
                     let old=self.value(format!("call i64 @pt_helper(ptr %state, ptr %event, i64 30, i64 {encoded}, i64 0)"),Type::Number).reg;
-                    let next = self
-                        .value(format!("add i64 {old}, {amount}"), Type::Number)
-                        .reg;
+                    let next =
+                        if self.infer(&Expr::Array(name.clone(), index.clone())) == Type::Float {
+                            let number = self
+                                .value(format!("bitcast i64 {old} to double"), Type::Float)
+                                .reg;
+                            let constant = self
+                                .value(format!("sitofp i64 {amount} to double"), Type::Float)
+                                .reg;
+                            let sum = self
+                                .value(format!("fadd double {number}, {constant}"), Type::Float)
+                                .reg;
+                            self.value(format!("bitcast double {sum} to i64"), Type::Float)
+                                .reg
+                        } else {
+                            self.value(format!("add i64 {old}, {amount}"), Type::Number)
+                                .reg
+                        };
                     self.emit(format!("call i64 @pt_helper(ptr %state, ptr %event, i64 31, i64 {encoded}, i64 {next})"));
                 }
                 Stmt::Increment(Expr::Local(name), amount) => {
@@ -1383,18 +1767,15 @@ impl Generator {
                         .get(map)
                         .ok_or_else(|| format!("map @{map} is never assigned"))?;
                     let spec = &self.specs[id];
-                    if spec.keys.len() != 1
+                    if spec.keys.len() != key.len()
                         || matches!(spec.aggregate, Aggregate::Hist | Aggregate::Lhist)
                     {
-                        return Err(
-                            "map iteration requires one key and a scalar aggregation".into()
-                        );
+                        return Err("map iteration requires matching key destructuring and a scalar aggregation".into());
                     }
-                    let key_type = spec.keys[0];
-                    let value_type = spec.value_type;
-                    if self.local_types.get(key).copied().unwrap_or(Type::Number) != key_type
-                        || self.local_types.get(value).copied().unwrap_or(Type::Number)
-                            != value_type
+                    if key.iter().zip(&spec.keys).any(|(name, ty)| {
+                        self.local_types.get(name).copied().unwrap_or(Type::Number) != *ty
+                    }) || self.local_types.get(value).copied().unwrap_or(Type::Number)
+                        != spec.value_type
                     {
                         return Err("map iteration local type mismatch".into());
                     }
@@ -1422,11 +1803,18 @@ impl Generator {
                     let valid = self.label_name();
                     self.emit(format!("br i1 {allowed}, label %{valid}, label %return"));
                     self.label(&valid);
-                    for (name, op) in [(key, 91), (value, 92)] {
-                        let item = self.value(format!("call i64 @pt_helper(ptr %state, ptr %event, i64 {op}, i64 {snapshot}, i64 {n})"), Type::Number).reg;
+                    let row = self.value(format!("shl i64 {n}, 32"), Type::Number).reg;
+                    for (index, name) in key.iter().enumerate() {
+                        let encoded = self
+                            .value(format!("or i64 {row}, {index}"), Type::Number)
+                            .reg;
+                        let item=self.value(format!("call i64 @pt_helper(ptr %state, ptr %event, i64 91, i64 {snapshot}, i64 {encoded})"),Type::Number).reg;
                         let pointer = self.locals[name].clone();
                         self.emit(format!("store i64 {item}, ptr {pointer}"));
                     }
+                    let item=self.value(format!("call i64 @pt_helper(ptr %state, ptr %event, i64 92, i64 {snapshot}, i64 {n})"),Type::Number).reg;
+                    let pointer = self.locals[value].clone();
+                    self.emit(format!("store i64 {item}, ptr {pointer}"));
                     self.stmts(body)?;
                     let next = self.value(format!("add i64 {n}, 1"), Type::Number).reg;
                     self.emit(format!("store i64 {next}, ptr {index}"));

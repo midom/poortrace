@@ -179,8 +179,10 @@ END { printf("finished\n"); }
   Average rounds toward zero. Histograms use power-of-two buckets, a zero bucket,
   and one negative bucket; use `print` to inspect a histogram. Finite float keys
   and scalar float values support assignment, `sum`, `min`, `max`, and `avg`;
-  histogram inputs and local arrays remain integer-valued. Cast float histogram
-  inputs explicitly. Nonfinite map keys/values fail through State.
+  local arrays, and float `hist`/`lhist` inputs are supported. Float histograms
+  include subnormal power-of-two buckets; linear bounds/steps must be finite
+  constants and fit the 1024-bucket limit. Nonfinite map keys/values and float
+  histogram inputs fail through State.
 * `printf("literal format", ...)`: `%d`, `%i`, `%u`, `%x`, `%X`, `%o`, `%s`,
   `%c`, `%p`, `%f`, `%e`, `%g`, `%%`, optional `l`/`ll`, width up to 200, `-` and zero padding.
   Argument counts and types are checked before execution. Escapes: `\n`, `\r`,
@@ -369,8 +371,11 @@ must be private. This backend is intrusive and can substantially change timing;
 it is for native function tracing, not transparent high-rate profiling. Abruptly
 killing the tracer with SIGKILL prevents its cleanup. Do not probe an instruction
 that already contains a software breakpoint. Existing debuggers and ptracers
-cannot share the target. Pre-existing processes sharing its address space outside
-the target thread group are not supported.
+cannot share the target. Pre-existing processes sharing the address space can be
+attached together with `--shared-mm-pids PID1,PID2 -p ROOT_PID`. All declared
+groups stop before patching; `kcmp(KCMP_VM)` must prove their shared address
+space. A denied comparison or undeclared/unknown trap fails explicitly before
+unsafe adoption.
 
 Entry probes expose the first six integer/pointer arguments in `arg0..arg5` under
 the native calling convention. At ptrace stops, `farg` reads scalar FP registers
@@ -379,9 +384,14 @@ aggregate calling conventions are available through bounded DWARF-backed
 `args()` decoding below. Return probes preserve entry argument
 register values and provide raw signed `retval` plus `latency` including debugger
 overhead; only normal matched returns generate events. Recursion and threads are
-tracked separately. Observable stack-pointer unwinding prunes abandoned return
-probes after operations such as `longjmp`. Tail-call transformations and unusual
-stack switching can still prevent matching returns; at most 4096 pending returns,
+tracked separately. Tail-call chains sharing a return site emit their matched
+returns from inner to outer. Observable stack-pointer unwinding prunes abandoned
+returns after operations such as `longjmp`; disjoint stack mappings remain
+separate. For coroutines allocating stacks in one mapping, declare each range
+with repeatable `--stack-range TID:LOW:HIGH` (hex addresses accepted). Return
+traps are restored after temporary execute-permission loss only when the original
+image identity still matches. Unregistered same-mapping stacks and genuinely
+unobservable nonlocal exits can still prevent matching returns; at most 4096 pending returns,
 1024 active breakpoints, and 256 probe bindings are allowed. `ustack` uses a
 bounded snapshot of the stopped thread's stack and native CFI, controlled by
 `--stack-bytes`.
@@ -436,6 +446,25 @@ pairs. Lost events, prior-to-attach events, and missing boundaries limit causal
 claims and totals; the waking task context is not a higher-level blocking cause.
 Live kernel capture requires a host granting the necessary permissions. Decoder
 and offline replay tests do not require those permissions.
+
+Kernel callchains are available as `kstack` or `kstack(DEPTH)` (1..127),
+including alongside DWARF user stacks. `ksym(address)` resolves a kernel address
+through `/proc/kallsyms`; restricted or missing symbols retain raw addresses.
+Requesting kernel frames also requests kernel execution in the perf event, so
+host permissions still apply.
+
+```sh
+poortrace --system-wide -d 5 -e 'profile:hz:99 { @[kstack(32)] = count(); }'
+poortrace -e 'BEGIN { printf("task_struct=%d pid_offset=%d\n", btf_sizeof("task_struct"), btf_offsetof("task_struct","pid")); }'
+```
+
+BTF metadata defaults to `/sys/kernel/btf/vmlinux`; `--btf FILE` selects another
+BTF file. `btf_sizeof("TYPE")` and `btf_offsetof("TYPE","FIELD")` inspect types
+without reading kernel memory. `kfield(address,"TYPE","FIELD")` reads a numeric
+field, and `kfieldstr(...)` renders a character array or scalar. Field paths
+support nested members and array indices; pointer traversal requires a separate
+explicit read. Memory reads use `/proc/kcore` and fail when the host denies access.
+BTF metadata access alone does not grant kernel memory or tracing access.
 
 ## Off-CPU and syscall tracing
 
@@ -519,8 +548,8 @@ Offline replay can optionally sort recorded invocations by timestamp. `ip`
 remains a raw user address; user callchains and ELF/DWARF symbols are available
 through `ustack`. Bounded
 read-only memory helpers and optional perf-backed kernel probes are available.
-BTF and complete bpftrace language compatibility remain outside this
-implementation. Bounded loops and selected DWARF structure reads are available
+BTF-backed kernel type lookup and bounded field reads are available; complete
+bpftrace language compatibility remains outside this implementation. Bounded loops and selected DWARF structure reads are available
 as described below. Counter samples are not exact counter totals: `count()`
 counts delivered samples, while `sum(period)` sums their recorded periods; neither includes lost samples or PMU multiplexing
 corrections.
@@ -578,7 +607,9 @@ Layout lookup requires DWARF in the selected image. Typedefs, qualifiers, and
 cross-unit `debug_info` type references are followed; scalar reads are limited to
 1/2/4/8 bytes, with 1..8-byte storage for bitfields. Signed/unsigned DWARF 4/5
 bitfields and pointer member paths such
-as `child->value` are supported. `offsetof` rejects paths requiring pointer
+as `child->value` are supported. Multidimensional array paths such as
+`matrix[1][2]` support up to eight dimensions and 4096 total elements; individual
+dimensions are limited to 128 and formatted/argument output remains bounded. `offsetof` rejects paths requiring pointer
 dereferences or bitfield selection. Nonconstant member-location expressions and
 ambiguous layouts remain rejected. `fieldf` returns a floating-point field for
 arithmetic; `value(address, "Type")` renders a bounded structured value. ELF input is bounded to 128 MiB,
@@ -596,10 +627,26 @@ A C/C++ DWARF compilation unit must describe the entry signature; other language
 ABIs and explicit non-native calling conventions are rejected. Supported classification includes mixed
 integer/FP aggregates, AArch64 homogeneous FP aggregates, and supported vector
 registers. At most 32 arguments, 128 flattened members, and 4096-byte objects are
-accepted. Variadic functions, unsupported calling conventions, and layouts that
-cannot be classified safely fail explicitly. `args()` is for entry stops; it
+accepted. Automatic C signature decoding rejects variadic functions and layouts
+that cannot be classified safely. Explicit varargs and other languages use the
+interfaces below. `args()` is for entry stops; it
 does not infer arguments at arbitrary instruction offsets or reconstruct a
 signature from stripped machine code.
+
+`args_as("fixed=i32,...,small=i32,ratio=f64,large=i64")` supplies an explicit
+native C ABI signature, including variadic argument types. Apply C default
+promotions (`i32` for small integers and `f64` for floats after `...`). Supported
+shapes include pointers, scalar integers/floats, 64/128-bit vectors such as
+`v4f32`, and named DWARF types. An optional `->ReturnType` describes hidden large
+return storage. An optional first ELF path selects the named types' image. The
+caller is responsible for supplying the real signature.
+
+`args_native()` and `args_native("ELF", "function")` decode parameters from
+current-PC DWARF locations, including actual register mappings, pieces, stack
+values, and frame-base/CFA information. This supports tested Rust and Go
+signatures without assuming their calling convention is C. Optimized-away
+parameters, unsupported expressions, and not-yet-initialized entry spills are
+labeled unavailable; stripped functions need an explicit supported signature.
 
 ## Extended language
 
@@ -616,17 +663,22 @@ BEGIN {
 }
 ```
 
-Expression functions must be defined before use, take at most sixteen parameters,
-and evaluate each argument once. Recursion and forward references are unsupported;
-expansion is resource-limited. `repeat(N)` accepts a constant 1..1024, with a shared
+Expression functions take at most sixteen parameters and evaluate arguments
+once. Recursive calls compile to native LLVM functions; `condition ? yes : no`
+short-circuits and supports recursive base cases. Each invocation has a shared
+4096-iteration/call budget, recursion depth 64, and a conservative 512 KiB native
+frame budget. Compilation limits each function to 128 KiB estimated frame cost,
+256 typed function instances, and 8 MiB generated native-function IR. `repeat(N)` accepts a constant 1..1024, with a shared
 4096-iteration budget per handler invocation, including nested repeats. Local
-numeric arrays have 256 zero-initialized elements each, reset on invocation;
+numeric arrays hold consistently integer or float elements, with 256 zero-initialized
+elements each, reset on invocation;
 out-of-bounds access ends the trace. At most 128 local array names are allowed.
 `delete(@map[key,...])` removes an individual entry.
 
 `while (condition) { ... }` supports variable conditions under the same shared
 4096-iteration budget. `for ($key, $value in @map) { ... }` visits a sorted
-snapshot of a single-key scalar map; mutations do not change that walk. Snapshot
+snapshot of a scalar map; `for (($key1,$key2),$value in @map)` destructures
+multiple keys (up to 16). Mutations do not change that walk. Snapshot
 storage is capped at 65,536 entries per invocation. Keys can be integer, float,
 string, or stack values; values can be integers or floats.
 
@@ -661,8 +713,9 @@ are decoded from bounded line tables. Reads
 occur while processing an event, so asynchronous perf samples may observe a later
 Python frame. Races, unsupported versions/build layouts, missing runtime symbols,
 and access restrictions produce an explicit unavailable frame. Trace-reference
-builds are rejected. Other Python versions, suspended coroutine logical stacks,
-and Java/.NET logical stacks are not implemented. CPython layout references:
+builds are rejected. Other physical Python frame layouts remain unavailable.
+Suspended coroutine chains and Java/.NET logical stacks use explicit cooperative
+adapters described below. CPython layout references:
 [runtime](https://github.com/python/cpython/blob/v3.12.0/Include/internal/pycore_runtime.h),
 [frames](https://github.com/python/cpython/blob/v3.12.0/Include/internal/pycore_frame.h).
 
@@ -676,18 +729,20 @@ poortrace -e 'syscall:enter:write { printf("%s", jsstack(20)); }' -- node app.js
 Function and script names are decoded using exported `v8dbg_*` postmortem
 metadata. Verified ScopeInfo schemas cover **Node 20/22/24 (V8 11.3/12.4/13.6)**.
 Native 64-bit layouts and ordinary compressed heap fields are decoded; compressed
-heap decoding has synthetic coverage, while live compatibility tests use the
-available uncompressed Node builds. Sequential one/two-byte, cons, thin, and
+heap decoding has synthetic coverage and live validation with a compressed
+Node 24.15 ARM build; CI also exercises a checksum-pinned compressed Node 20 x86
+fixture. Other compatibility tests use uncompressed Node builds. Sequential one/two-byte, cons, thin, and
 sliced UTF-16 strings and larger context scopes are supported. External strings,
 missing metadata, and unknown schemas produce unavailable labels.
 No Inspector connection, runtime flags, perf-map file, or injected code is needed.
 
-Both interpreted and compiled frames can be read. Verified uncompressed V8 12.4
-layouts reconstruct optimized inline chains and current source lines from
+Both interpreted and compiled frames can be read. Verified uncompressed V8
+11.3/12.4/13.6 layouts reconstruct optimized inline chains and current source lines from
 source-position/deoptimization metadata when available, and current interpreted
 lines from bytecode positions. Inlined frames are labeled explicitly. Other
-supported frames show marked function-start lines when available. Async ancestry
-and WebAssembly frames are not reconstructed by the external reader.
+supported frames show marked function-start lines when available. Compressed
+current/optimized source-position decoding still uses the cooperative Inspector
+path below. Async ancestry and WebAssembly frames use that same explicit adapter.
 Perf probes capture FP and bounded stack bytes automatically even in the default
 stack mode; `--stack-bytes` controls the limit. Heap objects are read when the
 handler runs, so GC/mutation races can make a sampled frame unavailable. Ptrace
@@ -705,14 +760,61 @@ inline chains. Goroutine identity and thread ownership are checked before and
 after reading. `goroutines()` / `goroutines(depth, limit)` render bounded parked
 goroutine snapshots (defaults 32/128, maxima 127/1024). Reads are best-effort
 observations, not an atomic stop of all goroutines. These readers need retained
-Go DWARF and ELF symbols; stripped executables report unavailable metadata.
-Live Go tests use Go 1.22 on AArch64.
+Go DWARF and ELF symbols for the general path. Stripped Go 1.22–1.25 executables,
+including PIE, instead use verified reflection typelinks for runtime field
+offsets and bounded `pclntab`/PC-SP tables for physical frames and source lines.
+The parked-goroutine fallback requires a uniquely validated `allgs` candidate.
+Unknown stripped schemas or ambiguous metadata report unavailable. Live stripped
+tests cover Go 1.22–1.25; CI exercises 1.22/1.24 on both architectures.
 
 Native frame symbolization also reads target-owned `/tmp/perf-PID.map` files
 inside the target mount/PID namespace. This names JIT code when the runtime writes
 perf maps; it does not manufacture unwind information or interpreter frames.
 Maps refresh with native mappings, are limited to 16 MiB and 250,000 entries,
 and fall back to raw addresses when unavailable.
+
+## Cooperative logical stacks
+
+Optional adapters provide suspended Python await chains, JVM and .NET diagnostic
+stacks, and JavaScript async/WebAssembly frames. These require explicit target
+cooperation or an enabled diagnostic interface. They produce bounded JSON
+snapshots; poortrace checks PID, process start identity, age, frame limits, and
+native TID association before using them. `--managed-max-age SECONDS` defaults
+to 10 seconds. A stale snapshot fails explicitly.
+
+```sh
+# Start an asyncio application through the explicit startup adapter.
+PYTHONPATH=adapters python3 adapters/python_async.py --output /tmp/python-stacks.json -- app.py
+# In another terminal, use the application's PID.
+poortrace -p PID --managed-snapshot /tmp/python-stacks.json -e 'interval:ms:100 { printf("%s\n", managedstacks(20)); }'
+
+# Collect JVM or .NET stacks with the corresponding installed diagnostic tool.
+python3 adapters/vm_snapshot.py java --pid PID --output /tmp/java-stacks.json
+python3 adapters/vm_snapshot.py dotnet --pid PID --output /tmp/dotnet-stacks.json
+# --tool PATH selects jcmd or dotnet-stack explicitly.
+
+# Start Node with an explicitly enabled local Inspector endpoint.
+node --inspect-brk=127.0.0.1:0 app.js
+npm ci --prefix adapters --ignore-scripts
+node adapters/node_inspector.mjs --pid PID --url ws://127.0.0.1:PORT/ID --output /tmp/js-stacks.json --run --resume --pause-ms 100
+# Add --runtime wasm for WebAssembly frames.
+```
+
+`asyncstack(N)`, `jstack(N)`, `dotnetstack(N)`, and `wasmstack(N)` return a stack
+for the observation's native thread when the adapter supplies that association.
+`managedstacks(N)` returns labeled text for all snapshot threads and is useful
+with interval probes. Inspector snapshots explicitly label process-level data;
+they do not claim an arbitrary native TID. JVM virtual-thread dumps may omit
+unmounted threads. Python walks suspended await/generator chains, without
+inventing task creation ancestry. Inspector uses the debugger's async ancestry,
+verifies that the socket belongs to the specified process, and does not evaluate
+injected target code. `--pause-ms` explicitly requests periodic pauses; these
+perturb the target. Node 20 uses the pinned `ws` dependency installed above.
+
+Snapshots describe the adapter's collection time, which can differ from the
+tracing observation. They are not exact CPU samples or causal execution totals.
+Helper results are journaled and replay after the target and snapshot file are
+gone. Native Python/Node/Go stack readers remain available independently.
 
 ## Sleeping-thread observations
 
@@ -754,21 +856,54 @@ poortrace --quantiles 0.5,0.9,0.99 -e 'BEGIN { @h=hist(42); }'
 Recordings are versioned newline-delimited JSON containing the original script,
 per-handler timestamps and fields, native frames/branches, captured unwind
 registers and stack bytes, tracepoint fields, and helper results (including
-rendered managed stacks and memory reads). New recordings use version 2; version
-1 remains readable. Default replay executes the original script and validates
+rendered managed stacks and memory reads). New recordings use version 3 and
+record architecture/byte order; versions 1 and 2 remain readable. Default replay executes the original script and validates
 helper order/types. `--replay FILE -e SCRIPT` or a script file selects an alternate
 script over captured observations. It matches recorded probes, runs BEGIN/END
 once, and coalesces duplicate handler observations with the same event identity.
 Pure helpers and captured tracepoint fields can be recomputed; memory/runtime
 helpers require a matching captured result. Native stacks/branches can fall back
-to recorded raw addresses without reading a current target. Target stdout/stderr and command exit
-status are not recorded. Replay uses the same native JIT; shared-LLVM binaries
+to recorded raw addresses without reading a current target. Optional captured
+memory regions allow new primitive reads entirely offline; conflicting captures
+and uncaptured addresses fail explicitly. Replay uses the same native JIT; shared-LLVM binaries
 still need their LLVM shared library, while static builds retain standalone
-deployment. File/event limits are 256 MiB/1 MiB. This is a handler-invocation log, not a raw perf record
-archive; new probes, arbitrary new target-memory reads, and uncaptured managed
-state cannot be reconstructed during replay. `--sort-events` gives a stable global timestamp order; this can change the
+deployment. File/event limits are 256 MiB/1 MiB. Raw perf archiving, selected
+memory, target output, and exit status are opt-in; entirely uncaptured events,
+addresses, runtime state, and debug types cannot be manufactured during replay. `--sort-events` gives a stable global timestamp order; this can change the
 results of order-sensitive aggregations. Per-thread events otherwise retain
 recorded dispatch order.
+
+Optional capture extensions are selected at recording time:
+
+```sh
+poortrace --record run.jsonl --record-raw -e 'profile:hz:99 { @[ustack] = count(); }' -- app
+poortrace --replay run.jsonl --replay-raw -e 'profile:hz:99 { @[tid] = count(); }'
+poortrace --record io.jsonl --record-output --capture-memory arg1:8 -e 'syscall:enter:write {}' -- app
+poortrace --replay io.jsonl --replay-output --replay-exit-status
+```
+
+`--record-raw` preserves perf records, capture layout, and tracepoint formats.
+`--replay-raw` decodes those records offline on a compatible architecture and
+byte order, using archived formats rather than the current host's tracefs.
+It retains sideband and loss/discontinuity records as well as samples.
+`--capture-memory ADDRESS:LENGTH` can be repeated; addresses can also be `arg0`
+through `arg5`, `sp`, or `ip`. Each region is 1..4096 bytes, with at most 256
+regions and 256 KiB per observation. Capture errors stop the trace. Replay can
+satisfy new primitive reads from these regions, with checked bounds and overlap
+consistency; it cannot reconstruct uncaptured memory or type information.
+
+`--record-output` forwards and archives a launched command's stdout/stderr;
+exit status is recorded for launched commands. Output timestamps reflect receipt
+by the tracer, and output inherited by descendants is attributed to the launch
+PID. `--replay-output` emits those bytes and `--replay-exit-status` returns the
+recorded status, including termination by tracer cleanup when applicable.
+
+`--output-format speedscope-scheduler` exports observed CPU execution intervals
+from a system-wide recording of `tracepoint:sched:sched_switch`. It requires
+complete per-CPU coverage metadata and adjacent matching switch pairs. Missing
+CPUs, lost events, throttling, discontinuities, or inconsistent pairs reject this
+export. It does not extrapolate intervals at capture boundaries. This stricter
+export is separate from the interpolated stack observation timeline below.
 
 `--live SECONDS` redraws cumulative text maps in a terminal (or emits successive
 snapshots when redirected); it does not clear script maps and cannot be combined
@@ -793,8 +928,14 @@ cargo fmt --check
 LLVM_CONFIG=llvm-config-18 cargo clippy --locked --all-targets -- -D warnings
 LLVM_CONFIG=llvm-config-18 cargo test --locked
 LLVM_CONFIG=llvm-config-18 cargo test --locked --features static-llvm
-# Opt-in live tests: perf/ptrace access, C/C++ compilers, CPython 3.11–3.14, Node 20/22/24, Go with DWARF.
-LLVM_CONFIG=llvm-config-18 cargo test --locked -- --ignored --nocapture
+# Opt-in native tests require host perf/ptrace access and the fixture compilers.
+LLVM_CONFIG=llvm-config-18 cargo test --locked --test cli -- --ignored --nocapture
+LLVM_CONFIG=llvm-config-18 cargo test --locked --test process_coverage -- --ignored
+LLVM_CONFIG=llvm-config-18 cargo test --locked --test arguments -- --ignored
+# Select managed tests for the runtimes actually installed.
+LLVM_CONFIG=llvm-config-18 cargo test --locked --test managed node_ -- --ignored --skip cooperative_
+# Compressed V8 requires an actual pointer-compressed Node build.
+POORTRACE_NODE_BIN=/path/to/compressed/node LLVM_CONFIG=llvm-config-18 cargo test --locked --test managed compressed_scope -- --ignored
 
 LLVM_CONFIG=llvm-config-18 cargo build --release --locked --bins --examples
 ./target/release/poortrace examples/profile.pt -- ./target/release/examples/workload 2
@@ -811,7 +952,11 @@ live tests cover perf capture, native stacks, syscall/function probes, fork/exec
 lifecycle and cleanup, USDT semaphores, typed reads, CPython frames, and Node
 interpreted/optimized/worker frames and replay. CI runs shared/static LLVM tests,
 selected ptrace/runtime tests, fully static builds on x86-64 and AArch64,
-managed runtime compatibility jobs, and Rust 1.85 checks.
+managed runtime compatibility jobs, cooperative JVM/.NET/Python/JS/Wasm adapter
+tests, a checksum-pinned compressed V8 fixture, and Rust 1.85 checks. Stripped Go
+fixtures cover executables and PIE builds; the compatibility matrix includes Go
+1.22 and 1.24. Cooperative tests require Java 21 tools, .NET 8 with dotnet-stack,
+Python, and Node; ordinary managed tests do not assume these adapters are installed.
 
 See [AGENTS.md](AGENTS.md#source-map) for the complete source map, build checks,
 and implementation invariants.

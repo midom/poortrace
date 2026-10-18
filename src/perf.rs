@@ -43,13 +43,15 @@ pub struct UserRegs {
     pub lr: u64,
     pub runtime_g: u64,
 }
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 pub struct Capture {
     pub ptrace_functions: bool,
     pub cpu: Option<i32>,
     pub raw: bool,
     pub kernel: bool,
     pub kernel_regs: bool,
+    pub kernel_callchain: bool,
+    pub record_raw: bool,
     pub callchain: bool,
     pub dwarf_stack: u32,
     pub branches: bool,
@@ -67,6 +69,7 @@ pub struct Sample {
     pub ip: u64,
     pub period: u64,
     pub callchain: Vec<u64>,
+    pub kernel_callchain: Vec<u64>,
     pub addr: u64,
     pub regs: Option<UserRegs>,
     pub stack: Vec<u8>,
@@ -93,6 +96,10 @@ pub enum Record {
         name: String,
     },
     Lost(u64),
+    Throttle {
+        time: u64,
+        throttled: bool,
+    },
     Switch {
         out: bool,
         preempt: bool,
@@ -113,6 +120,7 @@ pub struct PerfEvent {
     tail: u64,
     capture: Capture,
     trace_format: Option<crate::kernel::Format>,
+    raw_records: Vec<Vec<u8>>,
 }
 impl PerfEvent {
     pub fn open(tid: i32, probe: &Probe, pages: usize) -> Result<Self> {
@@ -254,7 +262,11 @@ impl PerfEvent {
             capture.uprobe = false;
             capture.retprobe = false;
         }
-        if capture.dwarf_stack != 0 {
+        if capture.kernel_callchain {
+            capture.kernel = true;
+            capture.callchain = true;
+        }
+        if capture.dwarf_stack != 0 && !capture.kernel_callchain {
             capture.callchain = false;
         }
         let sample_type = if capture.offcpu {
@@ -285,7 +297,11 @@ impl PerfEvent {
                 | 1 << 9
                 | 1 << 25
                 | if frequency { 1 << 10 } else { 0 }
-                | if capture.callchain { 1 << 21 } else { 0 }
+                | if capture.callchain && !capture.kernel_callchain {
+                    1 << 21
+                } else {
+                    0
+                }
                 | if on_exec { 1 << 12 } else { 0 }
                 | if capture.offcpu {
                     (1 << 18) | (1 << 26)
@@ -366,6 +382,7 @@ impl PerfEvent {
             tail: 0,
             capture,
             trace_format,
+            raw_records: Vec::new(),
         };
         // UAPI offsets in perf_event_mmap_page are architecture independent.
         let offset = unsafe { event.base().add(1040).cast::<u64>().read_volatile() } as usize;
@@ -407,6 +424,7 @@ impl PerfEvent {
         }
     }
     pub fn drain(&mut self) -> Result<Vec<Record>> {
+        self.raw_records.clear();
         let head = unsafe { &*self.base().add(1024).cast::<AtomicU64>() }.load(Ordering::Acquire);
         let available = head.wrapping_sub(self.tail);
         if available > self.size as u64 {
@@ -431,6 +449,9 @@ impl PerfEvent {
                 trace.fields = format.decode(&trace.raw)?;
             }
             records.push(record);
+            if self.capture.record_raw {
+                self.raw_records.push(bytes);
+            }
             self.tail = self.tail.wrapping_add(size as u64);
         }
         // The kernel must not reuse these bytes until all our reads complete.
@@ -438,6 +459,15 @@ impl PerfEvent {
         fence(Ordering::SeqCst);
         unsafe { &*self.base().add(1032).cast::<AtomicU64>() }.store(self.tail, Ordering::Release);
         Ok(records)
+    }
+    pub fn take_raw_records(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.raw_records)
+    }
+    pub fn capture(&self) -> Capture {
+        self.capture
+    }
+    pub fn trace_format(&self) -> Option<&crate::kernel::Format> {
+        self.trace_format.as_ref()
     }
     fn copy(&self, tail: u64, dst: &mut [u8]) {
         let start = tail as usize & (self.size - 1);
@@ -548,6 +578,12 @@ impl<'a> Cursor<'a> {
         ))
     }
 }
+pub fn decode_record(bytes: &[u8], capture: Capture) -> Result<Record> {
+    if capture.dwarf_stack > 32768 || capture.dwarf_stack % 8 != 0 {
+        return Err("invalid archived stack capture size".into());
+    }
+    decode_capture(bytes, capture)
+}
 fn decode_capture(bytes: &[u8], capture: Capture) -> Result<Record> {
     if bytes.len() < 8 {
         return Err("short perf header".into());
@@ -582,16 +618,22 @@ fn decode_capture(bytes: &[u8], capture: Capture) -> Result<Record> {
                 if count > (bytes.len().saturating_sub(c.at) / 8) as u64 {
                     return Err("invalid perf callchain length".into());
                 }
-                let mut user = true;
+                let mut context = if misc & 7 == 1 { -128i64 } else { -512i64 };
                 for _ in 0..count {
                     let ip = c.word()?;
                     if ip >= (-4095i64) as u64 {
-                        user = ip == (-512i64) as u64;
-                    } else if user && ip != 0 && sample.callchain.len() < 127 {
+                        context = ip as i64;
+                    } else if context == -512 && ip != 0 && sample.callchain.len() < 127 {
                         sample.callchain.push(ip);
+                    } else if capture.kernel_callchain
+                        && context == -128
+                        && ip != 0
+                        && sample.kernel_callchain.len() < 127
+                    {
+                        sample.kernel_callchain.push(ip);
                     }
                 }
-                if sample.callchain.is_empty() && ip != 0 {
+                if sample.callchain.is_empty() && ip != 0 && misc & 7 != 1 {
                     sample.callchain.push(ip);
                 }
             }
@@ -731,6 +773,18 @@ fn decode_capture(bytes: &[u8], capture: Capture) -> Result<Record> {
             Record::Lost(c.word()?)
         }
         13 => Record::Lost(c.word()?),
+        5 | 6 => {
+            let time = c.word()?;
+            c.word()?;
+            c.word()?;
+            if capture.offcpu {
+                c.take(24)?;
+            }
+            Record::Throttle {
+                time,
+                throttled: kind == 5,
+            }
+        }
         3 => {
             let (pid, tid) = c.pair()?;
             let end = bytes
@@ -871,8 +925,12 @@ mod tests {
             offset: 4096,
             size: 4096,
             tail: 4092,
-            capture: Capture::default(),
+            capture: Capture {
+                record_raw: true,
+                ..Capture::default()
+            },
             trace_format: None,
+            raw_records: Vec::new(),
         };
         let bytes = record(13, &42u64.to_ne_bytes());
         for (i, b) in bytes.iter().enumerate() {
@@ -882,10 +940,106 @@ mod tests {
         }
         unsafe { &*ring.base().add(1024).cast::<AtomicU64>() }.store(4108, Ordering::Release);
         assert_eq!(ring.drain().unwrap(), vec![Record::Lost(42)]);
+        assert_eq!(ring.take_raw_records(), vec![bytes]);
         assert_eq!(
             unsafe { &*ring.base().add(1032).cast::<AtomicU64>() }.load(Ordering::Acquire),
             4108
         );
+    }
+    #[test]
+    fn throttle_records_preserve_time_and_validate_payload() {
+        for kind in [5, 6] {
+            let payload: Vec<_> = [123u64, 9, 10]
+                .into_iter()
+                .flat_map(u64::to_ne_bytes)
+                .collect();
+            assert_eq!(
+                decode_record(&record(kind, &payload), Capture::default()).unwrap(),
+                Record::Throttle {
+                    time: 123,
+                    throttled: kind == 5
+                }
+            );
+            for length in 0..payload.len() {
+                assert!(
+                    decode_record(&record(kind, &payload[..length]), Capture::default()).is_err()
+                );
+            }
+            assert!(
+                decode_record(
+                    &record(kind, &payload),
+                    Capture {
+                        offcpu: true,
+                        ..Default::default()
+                    }
+                )
+                .is_err()
+            );
+            let mut with_id = payload;
+            with_id.extend([0; 24]);
+            assert!(
+                decode_record(
+                    &record(kind, &with_id),
+                    Capture {
+                        offcpu: true,
+                        ..Default::default()
+                    }
+                )
+                .is_ok()
+            );
+        }
+    }
+    #[test]
+    fn kernel_callchains_keep_separate_contexts_and_never_guess_user_ips() {
+        let mut payload = vec![0; 40];
+        payload[..8].copy_from_slice(&0xffff000000001234u64.to_ne_bytes());
+        let frames = [
+            (-128i64) as u64,
+            0xffff000000001234,
+            0xffff000000002345,
+            (-512i64) as u64,
+            0x1234,
+            0x2345,
+            (-32i64) as u64,
+        ];
+        payload.extend((frames.len() as u64).to_ne_bytes());
+        for ip in frames {
+            payload.extend(ip.to_ne_bytes());
+        }
+        let mut bytes = record(9, &payload);
+        bytes[4..6].copy_from_slice(&1u16.to_ne_bytes());
+        let Record::Sample(sample) = decode_capture(
+            &bytes,
+            Capture {
+                callchain: true,
+                kernel_callchain: true,
+                ..Capture::default()
+            },
+        )
+        .unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            sample.kernel_callchain,
+            [0xffff000000001234, 0xffff000000002345]
+        );
+        assert_eq!(sample.callchain, [0x1234, 0x2345]);
+        payload.truncate(40);
+        payload.extend(0u64.to_ne_bytes());
+        let mut bytes = record(9, &payload);
+        bytes[4..6].copy_from_slice(&1u16.to_ne_bytes());
+        let Record::Sample(sample) = decode_capture(
+            &bytes,
+            Capture {
+                callchain: true,
+                kernel_callchain: true,
+                ..Capture::default()
+            },
+        )
+        .unwrap() else {
+            panic!()
+        };
+        assert!(sample.callchain.is_empty());
     }
     #[test]
     fn attr_matches_version_zero_abi() {

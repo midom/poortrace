@@ -550,7 +550,10 @@ fn floating_point_maps_and_snapshot_iteration() {
     ] {
         assert!(text.contains(expected), "{expected}: {text}");
     }
-    for source in ["BEGIN { @x=1.0; @x=1; }", "BEGIN { @x=hist(1.0); }"] {
+    for source in [
+        "BEGIN { @x=1.0; @x=1; }",
+        "BEGIN { @x=hist(1.0); @x=hist(1); }",
+    ] {
         assert!(Program::compile(source).is_err(), "{source}");
     }
     let program = Program::compile("BEGIN { @x=1.0/0.0; }").unwrap();
@@ -632,4 +635,151 @@ fn floating_point_keys_have_numeric_order_and_signed_zero_identity() {
             .as_ref()
             .is_some_and(|e| e.contains("keys must be finite"))
     );
+}
+
+#[test]
+fn tuple_map_iteration_float_arrays_and_float_histograms() {
+    let text = execute(
+        r#"BEGIN {
+        @pairs["a",1,1.5]=2.25; @pairs["b",2,2.5]=3.25;
+        for (($name,$index,$key),$value in @pairs) {printf("%s:%d:%g=%g\n",$name,$index,$key,$value);delete(@pairs[$name,$index,$key]);}
+        $a[0]=1.25; $a[1]=2.5; $a[0]++; $a[1]--; $a[2]=$a[0]+$a[1]; printf("array=%g,%g,%g,%g\n",$a[0],$a[1],$a[2],$a[3]);
+        @h=hist(0.0); @h=hist(0.25); @h=hist(0.5); @h=hist(1.5); @h=hist(-0.5);
+        @l=lhist(0.25,0.0,1.0,0.25); @l=lhist(0.75,0.0,1.0,0.25); @l=lhist(1.0,0.0,1.0,0.25);
+    }"#,
+        &[0],
+    );
+    for expected in [
+        "a:1:1.5=2.25\nb:2:2.5=3.25\n",
+        "array=2.25,1.5,3.75,0",
+        "[0.25, 0.5): 1",
+        "[0.5, 1): 1",
+        "[1, 2): 1",
+        "[0.75, 1): 1",
+        "[1, +inf): 1",
+    ] {
+        assert!(text.contains(expected), "{expected}: {text}");
+    }
+    assert!(!text.contains("@pairs["));
+    for source in [
+        "BEGIN{@x[1,2]++;for(($a,$a),$v in @x){@y++;}}",
+        "BEGIN{$a[0]=1.0;$a[1]=1;}",
+        "BEGIN{@x=lhist(0.5,0.0,1.0,0.0);}",
+    ] {
+        assert!(Program::compile(source).is_err(), "{source}");
+    }
+}
+
+#[test]
+fn recursive_expression_functions_are_native_and_bounded() {
+    let source = r#"fn fact($n)=$n<=1?1:$n*fact($n-1); fn fib($n)=$n<2?$n:fib($n-1)+fib($n-2); BEGIN{printf("%d %d %d\n",fact(6),fib(10),0?1/0:42);}"#;
+    assert_eq!(execute(source, &[0]), "720 55 42\n");
+    assert_eq!(
+        execute(
+            r#"fn chain($n)=$n==0?"end":strcat("x",chain($n-1)); fn fractional($n)=$n<=0?0.5:fractional($n-1)+0.25; BEGIN {printf("%s %g\n",chain(2),fractional(3));}"#,
+            &[0]
+        ),
+        "xxend 1.25\n"
+    );
+    let program = Program::compile(source).unwrap();
+    assert!(program.ir.contains("define i64 @expr_fn_"));
+    assert!(program.ir.len() < 30000);
+    for source in [
+        "fn forever($n)=forever($n+1); BEGIN{@x=forever(0);}",
+        "fn fib($n)=$n<2?$n:fib($n-1)+fib($n-2); BEGIN{@x=fib(30);}",
+    ] {
+        let program = Program::compile(source).unwrap();
+        let mut state = program.state(Vec::new());
+        program.invoke(0, &mut state, &Event::new(c"x", c"x"));
+        assert!(
+            state
+                .error
+                .as_ref()
+                .is_some_and(|e| e.contains("recursion") || e.contains("fuel")),
+            "{:?}",
+            state.error
+        );
+    }
+}
+
+#[test]
+fn kernel_and_cooperative_managed_helpers_keep_stack_key_types() {
+    for (helper, op) in [
+        ("kstack", 120),
+        ("asyncstack", 150),
+        ("jstack", 151),
+        ("dotnetstack", 152),
+        ("wasmstack", 153),
+    ] {
+        let program = Program::compile(&format!(
+            "BEGIN {{ $stack={helper}(8); @frames[$stack]=count(); printf(\"%s\",$stack); }}"
+        ))
+        .unwrap();
+        let mut state = program.state(Vec::new());
+        state.replay_helpers(vec![poortrace::recording::Helper {
+            op,
+            value: if op == 120 { 8 } else { 0 },
+            length: if op == 120 { 0 } else { 8 },
+            number: 0,
+            text: Some("    captured_leaf\n".into()),
+            error: None,
+            descriptor: None,
+        }]);
+        program.invoke(0, &mut state, &Event::new(c"synthetic", c"BEGIN"));
+        state.flush().unwrap();
+        assert_eq!(program.needs_kstack(), op == 120);
+    }
+    for expression in [
+        "ksym(ip)",
+        "kfieldstr(ip,\"task_struct\",\"comm\")",
+        "args_native()",
+        "args_as(\"i32\")",
+        "managedstacks",
+        "managedstacks()",
+        "managedstacks(8)",
+    ] {
+        Program::compile(&format!(
+            "BEGIN {{$s={expression}; @values[$s]=count(); printf(\"%s\",$s);}}"
+        ))
+        .unwrap();
+    }
+}
+
+#[test]
+fn process_managed_snapshots_are_strings_including_recursive_function_returns() {
+    for expression in [
+        "managedstacks",
+        "managedstacks()",
+        "managedstacks(8)",
+        "snapshot(2)",
+    ] {
+        let program = Program::compile(&format!(
+            "fn snapshot($n) = $n ? snapshot($n-1) : managedstacks(8); BEGIN {{$s={expression}; @snapshots[$s]=count(); printf(\"%s\",$s);}}"
+        ))
+        .unwrap();
+        let mut output = Vec::new();
+        {
+            let mut state = program.state(&mut output);
+            state.replay_helpers(vec![poortrace::recording::Helper {
+                op: 154,
+                value: 0,
+                length: if expression == "managedstacks" || expression == "managedstacks()" {
+                    127
+                } else {
+                    8
+                },
+                number: 0,
+                text: Some("thread17 java\n    leaf\nthread23 java\n    worker\n".into()),
+                error: None,
+                descriptor: None,
+            }]);
+            program.invoke(0, &mut state, &Event::new(c"synthetic", c"BEGIN"));
+            state.flush().unwrap();
+        }
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "thread17 java\n    leaf\nthread23 java\n    worker\n"
+        );
+    }
+    assert!(Program::compile("BEGIN {printf(\"%s\",managedstacks(0));}").is_err());
 }

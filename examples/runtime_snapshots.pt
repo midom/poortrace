@@ -1,0 +1,3 @@
+// Supply --managed-snapshot FILE from an explicitly launched adapter.
+// These are adapter snapshots, rather than exact execution samples.
+interval:ms:500 { printf("%s\n", managedstacks(20)); }

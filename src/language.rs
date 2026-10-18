@@ -406,6 +406,7 @@ pub struct Clause {
     pub probes: Vec<(String, Probe)>,
     pub predicate: Option<Expr>,
     pub body: Vec<Stmt>,
+    pub functions: std::sync::Arc<std::collections::BTreeMap<String, (Vec<String>, Expr)>>,
 }
 #[derive(Clone, Debug)]
 pub enum Expr {
@@ -420,6 +421,7 @@ pub enum Expr {
     Call(String, Vec<Expr>),
     Unary(String, Box<Expr>),
     Binary(String, Box<Expr>, Box<Expr>),
+    Conditional(Box<Expr>, Box<Expr>, Box<Expr>),
 }
 #[derive(Clone, Debug)]
 pub enum Stmt {
@@ -429,7 +431,7 @@ pub enum Stmt {
     If(Expr, Vec<Stmt>, Vec<Stmt>),
     Repeat(u32, Vec<Stmt>),
     While(Expr, Vec<Stmt>),
-    For(String, String, String, Vec<Stmt>),
+    For(Vec<String>, String, String, Vec<Stmt>),
 }
 
 #[derive(Clone, Debug)]
@@ -582,7 +584,7 @@ fn lex(src: &str) -> Result<Vec<Token>> {
                 .contains(&s)
             }) {
                 i += 2;
-            } else if b"{}()[];,:./@$+-*%=!<>~&|^".contains(&bytes[i]) {
+            } else if b"{}()[];,:?./@$+-*%=!<>~&|^".contains(&bytes[i]) {
                 i += 1;
             } else {
                 return Err(diagnostic(src, i, "unexpected character"));
@@ -719,10 +721,15 @@ pub fn parse(src: &str) -> Result<Vec<Clause>> {
             probes,
             predicate,
             body,
+            functions: Default::default(),
         });
     }
     if clauses.is_empty() {
         return Err("script has no probes".into());
+    }
+    let functions = std::sync::Arc::new(p.functions);
+    for clause in &mut clauses {
+        clause.functions = functions.clone();
     }
     Ok(clauses)
 }
@@ -770,19 +777,34 @@ impl Parser<'_> {
         while !self.eat("}") {
             if self.eat("for") {
                 self.expect("(")?;
-                self.expect("$")?;
-                let key = self.word()?;
+                let tuple = self.eat("(");
+                let mut keys = Vec::new();
+                loop {
+                    self.expect("$")?;
+                    let key = self.word()?;
+                    if keys.contains(&key) {
+                        return Err(self.error("map iteration requires distinct locals"));
+                    }
+                    keys.push(key);
+                    if keys.len() > 16 {
+                        return Err(self.error("map iteration supports at most 16 keys"));
+                    }
+                    if !tuple || self.eat(")") {
+                        break;
+                    }
+                    self.expect(",")?;
+                }
                 self.expect(",")?;
                 self.expect("$")?;
                 let value = self.word()?;
-                if key == value {
+                if keys.contains(&value) {
                     return Err(self.error("map iteration requires distinct locals"));
                 }
                 self.expect("in")?;
                 self.expect("@")?;
                 let map = self.word()?;
                 self.expect(")")?;
-                stmts.push(Stmt::For(key, value, map, self.block()?));
+                stmts.push(Stmt::For(keys, value, map, self.block()?));
                 continue;
             }
             if self.eat("while") {
@@ -917,6 +939,7 @@ impl Parser<'_> {
                                     }
                                     Expr::Unary(_, e) | Expr::Array(_, e) => 1 + cost(e),
                                     Expr::Binary(_, a, b) => 1 + cost(a) + cost(b),
+                                    Expr::Conditional(c, a, b) => 1 + cost(c) + cost(a) + cost(b),
                                     _ => 1,
                                 }
                             }
@@ -971,6 +994,12 @@ impl Parser<'_> {
             let op = op.clone();
             self.at += 1;
             lhs = Expr::Binary(op, Box::new(lhs), Box::new(self.expr(prec + 1)?));
+        }
+        if min == 0 && self.eat("?") {
+            let yes = self.expr(0)?;
+            self.expect(":")?;
+            let no = self.expr(0)?;
+            lhs = Expr::Conditional(Box::new(lhs), Box::new(yes), Box::new(no));
         }
         self.depth -= 1;
         Ok(lhs)

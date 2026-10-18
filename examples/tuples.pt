@@ -1,0 +1,10 @@
+// Snapshot iteration destructures each map key.
+BEGIN {
+    @values["worker", 1] = 1.5;
+    @values["worker", 2] = 2.5;
+    for (($name, $index), $value in @values) {
+        printf("%s[%d]=%.1f\n", $name, $index, $value);
+    }
+    $samples[0] = 0.125;
+    @distribution = hist($samples[0]);
+}

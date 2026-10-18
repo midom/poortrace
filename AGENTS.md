@@ -25,14 +25,22 @@ Serde for profile/report formats; LLVM is accessed through direct C API bindings
   and callbacks called by generated code.
 - `src/symbols.rs`: target mappings, ELF/DWARF symbol lookup, sampled-stack CFI
   unwinding, perf-map JIT names, and user-stack rendering.
-- `src/recording.rs`: versioned raw-context/helper journals, alternate replay
-  coalescing, and chronological Speedscope observation exports.
+- `src/recording.rs`: bounded schema-3 invocation/helper/memory and metadata
+  journals, archived perf decoding, alternate replay, and observation/scheduler
+  Speedscope exports.
+- `src/capture.rs`: explicit bounded event-time memory capture requests.
 - `src/python.rs`: read-only, version-checked CPython frame walking.
 - `src/javascript.rs`: V8 metadata discovery and read-only JavaScript frames.
-- `src/golang.rs`: DWARF-backed running/parked Go goroutine snapshots.
+- `src/golang.rs` and `src/golang_pcln.rs`: running/parked Go goroutine snapshots
+  from DWARF or validated stripped-image metadata.
+- `src/managed_bridge.rs`: bounded, identity-checked cooperative runtime snapshots.
+- `adapters/`: explicit Python async, Node inspector/async/Wasm, JVM, and .NET
+  snapshot producers; installing an adapter does not attach it automatically.
 - `src/kernel.rs`: tracefs field metadata, raw payload decoding, kernel PMU setup,
-  and bounded online CPU enumeration.
-- `src/arguments.rs`: native C ABI argument plans and stopped-register/DWARF reads.
+  kernel symbols, and bounded online CPU enumeration.
+- `src/btf.rs`: bounded kernel BTF type layouts and read-only typed fields.
+- `src/arguments.rs`: native C ABI argument plans and stopped-register reads.
+- `src/native_args.rs`: bounded native DWARF argument-location evaluation.
 - `src/types.rs`: bounded DWARF scalar/structure layout reads.
 - `src/usdt.rs`: SystemTap SDT notes and native argument descriptors.
 - `src/wait.rs`: sleeping-thread snapshots and observed wakeup transitions, not exact scheduler events.
@@ -51,7 +59,7 @@ Serde for profile/report formats; LLVM is accessed through direct C API bindings
   linking, and embeds its version and (for shared builds) runtime library path.
 - `tests/jit.rs`: native JIT integration tests using synthetic events.
 - `tests/cli.rs`: CLI, timers, process lifecycle, and opt-in live perf tests.
-- `tests/{managed,process_coverage,arguments,kernel_cli,recording_features,float_reports}.rs`:
+- `tests/{managed,process_coverage,arguments,kernel_cli,recording_features,float_reports,expansion}.rs`:
   focused runtime, lifecycle, ABI, kernel decoder/replay, and report regressions.
 - `examples/*.pt`: sample tracing scripts. `examples/workload.rs` provides CPU
   and allocation work on the main thread and dynamically created worker threads.
@@ -82,16 +90,19 @@ tests shared LLVM, static LLVM, and fully static builds.
 Run checks appropriate to the change. Parser and perf decoder unit tests live
 alongside their implementations. Language and runtime changes should also be
 covered by synthetic-event JIT tests. CLI and lifecycle changes belong in
-`tests/cli.rs`.
+`tests/cli.rs` or the focused lifecycle suites.
 
 Live tests are ignored by default because perf/ptrace access, native C/C++
 compilers, and runtime installations vary by host. The complete suite needs
-a supported CPython 3.11–3.14, Node 20/22/24, and Go compiler with retained
-DWARF, as well as permitted software perf sampling and hardware watchpoints.
+a supported CPython 3.11–3.14, Node 20/22/24, and Go compiler, as well as
+permitted software perf sampling and hardware watchpoints. Adapter tests also
+need their corresponding VM and diagnostic tools; see `adapters/` and README.
 Kernel live tests separately require readable tracefs and kernel perf access:
 
 ```sh
 LLVM_CONFIG=llvm-config-18 cargo test --locked --test cli -- --ignored --nocapture
+LLVM_CONFIG=llvm-config-18 cargo test --locked --test process_coverage -- --ignored --nocapture
+LLVM_CONFIG=llvm-config-18 cargo test --locked --test recording_features
 ```
 
 Smoke tests that need no perf access:
@@ -121,7 +132,9 @@ Do not change host perf policy to make tests pass.
   also follows children created after attachment across exec and waits for the
   followed tree after root exit. `--attach-descendants -p PID` takes a bounded
   snapshot of existing descendants and implies fork following. Initial attachment
-  races remain; unsupported pre-existing shared-mm ownership must fail safely.
+  races remain. Function tracing can include declared `--shared-mm-pids` only
+  after `kcmp(KCMP_VM)` proves shared ownership; stop every declared peer before
+  patching. Permission failures or unproven ownership must fail safely.
 - Perf inheritance with `cpu=-1` has mmap sampling restrictions. Account for
   those restrictions when changing thread attachment.
 - Launched commands wait behind a pipe gate until attachment and `BEGIN` finish.
@@ -145,10 +158,13 @@ Do not change host perf policy to make tests pass.
   `--track-loads` refreshes on mapping syscall stops. Restore original words and
   active SDT semaphores for still-mapped matching images when execute permission
   disappears, using full mapping identity rather than executable mappings alone.
-  Observable nonlocal unwinding prunes abandoned returns; do not claim support
-  for arbitrary stack switching. Kernel perf
-  uprobes are an explicit privileged alternative; no BPF is loaded.
-- Off-CPU intervals require complete switch pairs; clear pending pairs on loss.
+  Match tail-call returns and prune observable abandoned calls within their stack
+  domain. Preserve suspended stacks in distinct VMAs or validated explicit
+  `--stack-range TID:LOW:HIGH` ranges; unknown same-VMA stack allocation cannot
+  be inferred safely. Never replace an unknown existing trap. Kernel perf uprobes
+  are an explicit privileged alternative; no BPF is loaded.
+- Off-CPU intervals require complete switch pairs; clear pending pairs on loss,
+  throttling, or other recorded discontinuities.
   Switch records do not carry a blocking stack or establish why a task waited.
 - Counter reads distinguish raw counts, scheduling times, and scaled estimates.
   Preserve unscheduled (unavailable) results and read groups before dropping them.
@@ -177,30 +193,52 @@ Do not change host perf policy to make tests pass.
 - Retain parser/resource limits and type checks when extending the language.
   Update `README.md`, examples, CLI help, and tests when user-visible behavior
   changes.
-- Repeat, while, and map-iteration loops share a 4096-iteration invocation budget.
-  Iteration uses bounded snapshots, so mutation cannot extend the current walk.
-  Retain local-array, expression expansion, snapshot, and type limits.
+- Repeat, while, map iteration, and recursive expression calls share invocation
+  fuel of 4096. Recursion additionally has depth 64 and a conservative 512 KiB
+  native-frame budget; keep per-call local scopes independent. Iteration uses
+  bounded snapshots, so mutation cannot extend the current walk. Retain
+  local-array, expression expansion, snapshot, and type limits.
 - Float maps/keys require finite values; preserve float-key ordering and canonical
   zero equality. Scalar float operations follow IEEE behavior; integer arithmetic
   retains its defined wrapping and division behavior. Keep JSON/profile weight
   type restrictions explicit.
-- Typed C ABI arguments require validated DWARF and native register-bank/stack
-  classification. Reject unsupported layouts, conventions, and variadic signatures.
-  Validate alignment and register exhaustion across aggregates/vectors.
+- Typed C ABI arguments require validated DWARF or an explicit supported
+  signature, plus native register-bank/stack classification. Reject unsupported
+  layouts, conventions, and variadic signatures.
+  Validate alignment and register exhaustion across aggregates/vectors. `args()`
+  uses the declared C calling convention; `args_native()` evaluates available
+  DWARF locations without guessing Rust/Go ABIs. Reject unavailable entry spills,
+  unsupported location operations, and unprovable register or memory pieces.
 - Replay must validate helper result types before exposing pointers to JIT code.
   Never read current target memory or its current ELF files to reconstruct a
   recorded helper result. Alternate replay recomputes deterministic helpers and
   captured trace fields; other helpers need captured descriptors/results or an
   explicit raw-address stack/branch fallback. Honor new script exit semantics
-  while running BEGIN/END once. Timeline weights interpolate observations.
+  while running BEGIN/END once. Schema 3 retains architecture/endianness, raw
+  perf layout/trace formats, captured memory, output bytes, exits, and loss/gap
+  metadata; keep readers backward compatible with schemas 1 and 2. Raw replay
+  decodes archived bytes and formats only, with matching native architecture and
+  endianness. Coalesce exact event identities while preserving all handler
+  captures; reject conflicting contexts or overlapping bytes when read. Bounded
+  new memory reads require captured regions, never a current target process.
+- Observation timelines interpolate samples; label them accordingly. Exact
+  scheduler exports require an authoritative sched_switch clause, complete
+  per-CPU coverage proof, matching adjacent next/previous tasks, and no loss,
+  throttle, descriptor replacement, or other discontinuity. Do not extrapolate
+  before the first or after the last switch or silently downgrade missing proof.
 - `pystack` supports verified CPython 3.11–3.14 release layouts; newer versions
   use validated runtime debug offsets. `jsstack` uses exported V8 metadata and
   verified Node 20/22/24 schemas, including ordinary compressed heap fields.
   Verified uncompressed V8 12.4 layouts expose interpreted/optimized current
   lines and optimized inline chains when source/deoptimization metadata exists;
   other lines are marked function starts. Keep unknown layouts explicitly unavailable.
-- `gostack`/`goroutines` need retained Go DWARF and runtime ownership checks;
-  validate captured g registers, native TID/curg identity, stack bounds, and
-  observed state before/after reads. Do not guess stripped runtime layouts. V8 heap reads are bounded and
-  read-only; sampled stack slots must come from the captured stack rather than a later live stack.
+- `gostack`/`goroutines` use DWARF or validated Go 1.22–1.25 pclntab/reflection
+  metadata; recover runtime structure offsets from metadata rather than guessing
+  stripped layouts. Validate captured g registers, native TID/curg identity, stack
+  bounds, and observed state before/after reads. V8 heap reads are bounded and
+  read-only; sampled stack slots must come from the captured stack.
+- Cooperative snapshot adapters require explicit configuration and matching PID,
+  process start identity, timestamp freshness, runtime, and thread association.
+  Preserve their snapshot/cooperative labels: they are not event-time stack reads
+  or automatic arbitrary-process VM injection.
 - Polling wait/wakeup observations do not identify wakers or exact sleep times.

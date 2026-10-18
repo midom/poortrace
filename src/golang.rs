@@ -6,6 +6,8 @@ use crate::{
     symbols::Symbolizer,
     types,
 };
+#[path = "golang_pcln.rs"]
+mod pcln;
 use object::{Object, ObjectSegment, ObjectSymbol};
 use std::{collections::BTreeMap, io::Read, os::unix::fs::MetadataExt};
 
@@ -19,6 +21,7 @@ struct Layout {
     identity: String,
     allgs: u64,
     fields: BTreeMap<String, (u64, usize)>,
+    pcln: Option<pcln::Image>,
 }
 fn word(pid: u32, address: u64) -> Result<u64> {
     Ok(u64::from_ne_bytes(
@@ -43,6 +46,76 @@ impl Layout {
             8 => u64::from_ne_bytes(bytes.try_into().unwrap()),
             _ => return Err("unsupported Go field width".into()),
         })
+    }
+    // A stripped Go ELF keeps reflection types but drops the allgs symbol.
+    // Find a unique live slice whose elements validate as goroutines. This is
+    // bounded observation, not an assumed linker-specific global offset.
+    fn find_allgs(&self, pid: u32) -> Result<u64> {
+        let image = self.pcln.as_ref().ok_or("Go allgs metadata unavailable")?;
+        let mut found = None;
+        let mut candidates = 0;
+        for &(data_address, data_size) in &image.globals {
+            for start in (0..data_size).step_by(4080) {
+                let bytes = memory::read(
+                    pid,
+                    add(data_address, start as u64)?,
+                    (data_size - start).min(4096),
+                    false,
+                )?;
+                for index in (0..bytes.len().saturating_sub(23)).step_by(8) {
+                    let read =
+                        |n| u64::from_ne_bytes(bytes[index + n..index + n + 8].try_into().unwrap());
+                    let (data, len, cap) = (read(0), read(8), read(16));
+                    if data == 0
+                        || data & 7 != 0
+                        || !(2..=65536).contains(&len)
+                        || len > cap
+                        || cap > 1048576
+                    {
+                        continue;
+                    }
+                    candidates += 1;
+                    if candidates > 512 {
+                        return Err("stripped Go slice discovery exceeded candidate budget".into());
+                    }
+                    let Ok(gs) = memory::read(pid, data, (len.min(32) * 8) as usize, false) else {
+                        continue;
+                    };
+                    let mut ids = std::collections::BTreeSet::new();
+                    let valid = gs.chunks_exact(8).all(|b| {
+                        let g = u64::from_ne_bytes(b.try_into().unwrap());
+                        if g < 4096 || g & 7 != 0 {
+                            return false;
+                        }
+                        let check = (|| -> Result<bool> {
+                            let id = self.field(pid, g, "g.goid")?;
+                            let status = self.field(pid, g, "g.atomicstatus.value")?;
+                            let lo = self.field(pid, g, "g.stack.lo")?;
+                            let hi = self.field(pid, g, "g.stack.hi")?;
+                            if status & !0x1000 == 6 && lo == 0 && hi == 0 {
+                                return Ok(true);
+                            }
+                            Ok(id > 0
+                                && id < 1u64 << 48
+                                && status & !0x1000 <= 9
+                                && lo > 0
+                                && hi > lo
+                                && hi - lo <= 1024 * 1024 * 1024
+                                && ids.insert(id))
+                        })();
+                        check.unwrap_or(false)
+                    });
+                    if !valid || !ids.contains(&1) {
+                        continue;
+                    }
+                    let address = data_address + start as u64 + index as u64;
+                    if found.replace(address).is_some() {
+                        return Err("ambiguous stripped Go goroutine slice".into());
+                    }
+                }
+            }
+        }
+        found.ok_or_else(|| "stripped Go goroutine slice unavailable or raced".into())
     }
     fn state(&self, pid: u32, g: u64) -> Result<(u64, u64, u64, u64)> {
         let id = self.field(pid, g, "g.goid")?;
@@ -122,37 +195,47 @@ impl Reader {
                     !symbol.is_undefined() && symbol.name().ok() == Some("runtime.allgs")
                 })
                 .map(|symbol| bias.wrapping_add(symbol.address()))
-                .ok_or("Go runtime symbols unavailable; retain ELF symbols and DWARF")?;
+                .unwrap_or(0);
             let mut fields = BTreeMap::new();
-            for (name, field) in [
-                ("runtime.g", "goid"),
-                ("runtime.g", "m"),
-                ("runtime.g", "atomicstatus.value"),
-                ("runtime.g", "stack.lo"),
-                ("runtime.g", "stack.hi"),
-                ("runtime.g", "sched.sp"),
-                ("runtime.g", "sched.pc"),
-                ("runtime.g", "sched.bp"),
-                ("runtime.g", "sched.lr"),
-                ("runtime.m", "procid"),
-                ("runtime.m", "curg"),
-            ] {
-                let layout = self.types.layout(pid, "", name, field)?;
-                if !layout.scalar
-                    || layout.float
-                    || layout.vector
-                    || layout.bits.is_some()
-                    || !layout.dereferences.is_empty()
-                    || layout.size != if field == "atomicstatus.value" { 4 } else { 8 }
-                    || layout.offset > 1024 * 1024
-                {
-                    return Err(format!("unsupported Go DWARF layout {name}.{field}"));
+            let dwarf = (|| -> Result<()> {
+                for (name, field) in [
+                    ("runtime.g", "goid"),
+                    ("runtime.g", "m"),
+                    ("runtime.g", "atomicstatus.value"),
+                    ("runtime.g", "stack.lo"),
+                    ("runtime.g", "stack.hi"),
+                    ("runtime.g", "sched.sp"),
+                    ("runtime.g", "sched.pc"),
+                    ("runtime.g", "sched.bp"),
+                    ("runtime.g", "sched.lr"),
+                    ("runtime.m", "procid"),
+                    ("runtime.m", "curg"),
+                ] {
+                    let layout = self.types.layout(pid, "", name, field)?;
+                    if !layout.scalar
+                        || layout.float
+                        || layout.vector
+                        || layout.bits.is_some()
+                        || !layout.dereferences.is_empty()
+                        || layout.size != if field == "atomicstatus.value" { 4 } else { 8 }
+                        || layout.offset > 1024 * 1024
+                    {
+                        return Err(format!("unsupported Go DWARF layout {name}.{field}"));
+                    }
+                    fields.insert(
+                        format!("{}.{}", name.strip_prefix("runtime.").unwrap(), field),
+                        (layout.offset, layout.size as usize),
+                    );
                 }
-                fields.insert(
-                    format!("{}.{}", name.strip_prefix("runtime.").unwrap(), field),
-                    (layout.offset, layout.size as usize),
-                );
-            }
+                Ok(())
+            })();
+            let pcln = if dwarf.is_err() || allgs == 0 {
+                let (image, recovered) = pcln::Image::parse(&elf, bias)?;
+                fields = recovered;
+                Some(image)
+            } else {
+                None
+            };
             if self.processes.len() >= 16 {
                 self.processes.clear();
             }
@@ -162,6 +245,7 @@ impl Reader {
                     identity,
                     allgs,
                     fields,
+                    pcln,
                 },
             );
         }
@@ -219,7 +303,10 @@ impl Reader {
             stack,
             ..Sample::default()
         };
-        let mut frames = self.symbols.unwind(&sample);
+        let mut frames = match &self.processes[&pid].pcln {
+            Some(image) => image.unwind(regs, &sample.stack, depth),
+            None => self.symbols.unwind(&sample),
+        };
         frames.truncate(depth.min(127));
         let layout = &self.processes[&pid];
         if layout.state(pid, g)? != before
@@ -232,16 +319,24 @@ impl Reader {
         Ok(format!(
             "    goroutine {}\n{}",
             before.0,
-            self.symbols.stack(pid, &frames)
+            match &layout.pcln {
+                Some(image) => image.stack(&frames),
+                None => self.symbols.stack(pid, &frames),
+            }
         ))
     }
     /// Best-effort parked snapshots. A waiting goroutine's stack can move while
     /// another thread runs; every saved context and status is rechecked afterward.
     pub fn parked(&mut self, pid: u32, depth: usize, limit: usize) -> Result<String> {
         let layout = self.layout(pid)?;
-        let data = word(pid, layout.allgs)?;
-        let length = word(pid, add(layout.allgs, 8)?)?;
-        let capacity = word(pid, add(layout.allgs, 16)?)?;
+        let allgs = if layout.allgs != 0 {
+            layout.allgs
+        } else {
+            layout.find_allgs(pid)?
+        };
+        let data = word(pid, allgs)?;
+        let length = word(pid, add(allgs, 8)?)?;
+        let capacity = word(pid, add(allgs, 16)?)?;
         if length > 65536 || length > capacity || data == 0 {
             return Err("Go allgs slice exceeds65536goroutines or is inconsistent".into());
         }
@@ -291,7 +386,10 @@ impl Reader {
                 stack,
                 ..Sample::default()
             };
-            let mut frames = self.symbols.unwind(&sample);
+            let mut frames = match &self.processes[&pid].pcln {
+                Some(image) => image.unwind(regs, &sample.stack, depth),
+                None => self.symbols.unwind(&sample),
+            };
             frames.truncate(depth.min(127));
             let layout = &self.processes[&pid];
             if layout.state(pid, g)? != before
@@ -306,7 +404,10 @@ impl Reader {
             let rendered = format!(
                 "    goroutine {} [parked; observed]\n{}",
                 before.0,
-                self.symbols.stack(pid, &frames)
+                match &layout.pcln {
+                    Some(image) => image.stack(&frames),
+                    None => self.symbols.stack(pid, &frames),
+                }
             );
             if output.len() + rendered.len() > 512 * 1024 {
                 output.push_str("    <Go goroutine output truncated at 512 KiB>\n");
@@ -328,6 +429,7 @@ mod tests {
     fn metadata_fields_and_goroutine_bounds_are_validated() {
         let layout = Layout {
             identity: String::new(),
+            pcln: None,
             allgs: 0,
             fields: [
                 ("g.goid".into(), (0, 8)),

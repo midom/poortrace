@@ -378,7 +378,7 @@ fn read_location(tid: u32, sp: u64, location: &Location, size: usize) -> Result<
         }
     }
 }
-fn field_text(bytes: &[u8], layout: &crate::types::Layout) -> Result<String> {
+pub(crate) fn field_text(bytes: &[u8], layout: &crate::types::Layout) -> Result<String> {
     if !(1..=8).contains(&layout.size)
         || layout.float && !matches!(layout.size, 4 | 8)
         || layout.bits.is_some_and(|(shift, bits)| {
@@ -433,7 +433,14 @@ pub fn format(
     let architecture = Architecture::Aarch64;
     #[cfg(target_arch = "x86_64")]
     let architecture = Architecture::X86_64;
-    let locations = plan(&parameters, architecture)?;
+    format_parameters(&parameters, tid, architecture)
+}
+fn format_parameters(
+    parameters: &[Parameter],
+    tid: u32,
+    architecture: Architecture,
+) -> Result<String> {
+    let locations = plan(parameters, architecture)?;
     let regs = crate::functions::user_registers(tid as i32)?;
     let sp = regs
         .sp
@@ -473,6 +480,202 @@ pub fn format(
         }
     }
     Ok(output)
+}
+
+pub fn format_explicit(
+    reader: &mut Reader,
+    pid: u32,
+    tid: u32,
+    path: &str,
+    signature: &str,
+) -> Result<String> {
+    if signature.len() > 4096 {
+        return Err("explicit argument signature exceeds4096bytes".into());
+    }
+    let (arguments, result) = signature
+        .split_once("->")
+        .map_or((signature, None), |(args, result)| {
+            (args, Some(result.trim()))
+        });
+    let mut parameters = Vec::new();
+    let mut variadic = false;
+    for value in arguments
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if value == "..." {
+            if variadic {
+                return Err("duplicate variadic marker".into());
+            }
+            variadic = true;
+            continue;
+        }
+        if parameters.len() >= 32 {
+            return Err("explicit arguments exceed32parameters".into());
+        }
+        let (name, ty) = value
+            .split_once('=')
+            .map_or((format!("arg{}", parameters.len()), value), |(name, ty)| {
+                (name.trim().to_owned(), ty.trim())
+            });
+        if name.is_empty()
+            || name.len() > 256
+            || !name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
+        {
+            return Err("invalid explicit argument name".into());
+        }
+        let parameter = explicit_parameter(reader, pid, path, &name, ty)?;
+        if variadic
+            && parameter.layout.scalar
+            && (parameter.layout.float && parameter.layout.size < 8
+                || !parameter.layout.float
+                    && !parameter.layout.pointer
+                    && parameter.layout.size < 4)
+        {
+            return Err("variadic arguments require promoted i32/u32 or f64 scalar types".into());
+        }
+        parameters.push(parameter);
+    }
+    #[cfg(target_arch = "aarch64")]
+    let architecture = Architecture::Aarch64;
+    #[cfg(target_arch = "x86_64")]
+    let architecture = Architecture::X86_64;
+    if let Some(result) = result.filter(|result| *result != "void") {
+        let result = explicit_parameter(reader, pid, path, "$result", result)?;
+        if architecture == Architecture::X86_64
+            && (result.layout.by_reference
+                || matches!(
+                    plan(std::slice::from_ref(&result), architecture)?.first(),
+                    Some(Location::Stack(_) | Location::Indirect(_))
+                ))
+        {
+            let mut hidden = explicit_parameter(reader, pid, path, "$return", "ptr")?;
+            hidden.hidden = true;
+            parameters.insert(0, hidden);
+        }
+    }
+    format_parameters(&parameters, tid, architecture)
+}
+fn primitive(ty: &str) -> Option<crate::types::Layout> {
+    let (size, signed, float, pointer) = match ty {
+        "i8" => (1, true, false, false),
+        "u8" | "bool" => (1, false, false, false),
+        "i16" => (2, true, false, false),
+        "u16" => (2, false, false, false),
+        "i32" => (4, true, false, false),
+        "u32" => (4, false, false, false),
+        "i64" | "isize" => (8, true, false, false),
+        "u64" | "usize" => (8, false, false, false),
+        "ptr" => (8, false, false, true),
+        "f32" => (4, false, true, false),
+        "f64" => (8, false, true, false),
+        _ => return None,
+    };
+    Some(crate::types::Layout {
+        offset: 0,
+        size,
+        signed,
+        float,
+        scalar: true,
+        pointer,
+        vector: false,
+        vector_size: 0,
+        vector_offset: 0,
+        by_reference: false,
+        alignment: size,
+        members: Vec::new(),
+        dereferences: Vec::new(),
+        bits: None,
+    })
+}
+fn explicit_parameter(
+    reader: &mut Reader,
+    pid: u32,
+    path: &str,
+    name: &str,
+    ty: &str,
+) -> Result<Parameter> {
+    if let Some(layout) = primitive(ty) {
+        return Ok(Parameter {
+            hidden: false,
+            name: name.into(),
+            fields: vec![(String::new(), layout.clone())],
+            layout,
+        });
+    }
+    if let Some(vector) = ty.strip_prefix('v') {
+        let digits = vector.bytes().take_while(u8::is_ascii_digit).count();
+        if digits > 0 {
+            let count = vector[..digits]
+                .parse::<u64>()
+                .map_err(|_| "invalid vector count")?;
+            let base = primitive(&vector[digits..]).ok_or("invalid vector element type")?;
+            let size = base.size.checked_mul(count).ok_or("vector size overflow")?;
+            if !matches!(size, 8 | 16) {
+                return Err("explicit vectors must be64or128bits".into());
+            }
+            let fields = (0..count)
+                .map(|index| {
+                    let mut layout = base.clone();
+                    layout.offset = index * base.size;
+                    layout.vector_size = size;
+                    (format!("[{index}]"), layout)
+                })
+                .collect();
+            let mut layout = base;
+            layout.size = size;
+            layout.scalar = false;
+            layout.vector = true;
+            layout.vector_size = size;
+            layout.alignment = size;
+            return Ok(Parameter {
+                hidden: false,
+                name: name.into(),
+                layout,
+                fields,
+            });
+        }
+    }
+    let layout = reader.layout(pid, path, ty, "")?;
+    let mut fields = Vec::new();
+    fn fields_for(
+        reader: &mut Reader,
+        pid: u32,
+        path: &str,
+        ty: &str,
+        field: &str,
+        depth: u32,
+        out: &mut Vec<(String, crate::types::Layout)>,
+    ) -> Result<()> {
+        if depth >= 8 || out.len() >= 128 {
+            return Err("explicit argument member limit exceeded".into());
+        }
+        let layout = reader.layout(pid, path, ty, field)?;
+        if layout.scalar {
+            out.push((field.into(), layout));
+            return Ok(());
+        }
+        if layout.members.is_empty() {
+            return Err("explicit aggregate needs named DWARF members".into());
+        }
+        for member in layout.members {
+            let field = if field.is_empty() {
+                member
+            } else {
+                format!("{field}.{member}")
+            };
+            fields_for(reader, pid, path, ty, &field, depth + 1, out)?;
+        }
+        Ok(())
+    }
+    fields_for(reader, pid, path, ty, "", 0, &mut fields)?;
+    Ok(Parameter {
+        hidden: false,
+        name: name.into(),
+        layout,
+        fields,
+    })
 }
 
 #[cfg(test)]

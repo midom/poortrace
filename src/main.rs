@@ -61,6 +61,39 @@ struct Args {
     /// Save handler events and helper results for offline replay
     #[arg(long, conflicts_with_all=["replay","stat"])]
     record: Option<PathBuf>,
+    /// Archive original perf records and their capture layout
+    #[arg(long, requires = "record")]
+    record_raw: bool,
+    /// Capture target output while forwarding it to stdout/stderr
+    #[arg(long, requires = "record")]
+    record_output: bool,
+    /// Capture ADDRESS:LENGTH, argN:LENGTH, sp:LENGTH or ip:LENGTH at each event
+    #[arg(long, requires = "record")]
+    capture_memory: Vec<poortrace::capture::MemoryRequest>,
+    /// Replay captured target stdout/stderr as well as tracing handlers
+    #[arg(long, requires = "replay")]
+    replay_output: bool,
+    /// Re-decode archived raw perf samples for offline analysis
+    #[arg(long, requires = "replay")]
+    replay_raw: bool,
+    /// Return the captured launched command's exit status during replay
+    #[arg(long, requires = "replay")]
+    replay_exit_status: bool,
+    /// Explicit opt-in cooperative VM/async snapshot file
+    #[arg(long)]
+    managed_snapshot: Option<PathBuf>,
+    /// Maximum age in seconds of a cooperative managed snapshot
+    #[arg(long, default_value="10", value_parser=duration)]
+    managed_max_age: Duration,
+    /// BTF metadata file (defaults to /sys/kernel/btf/vmlinux)
+    #[arg(long)]
+    btf: Option<PathBuf>,
+    /// Additional stopped process groups proven to share the target's mm
+    #[arg(long, requires="pid",value_delimiter=',',value_parser=clap::value_parser!(i32).range(1..))]
+    shared_mm_pids: Vec<i32>,
+    /// Declare a coroutine stack TID:LOW:HIGH for return matching (repeatable)
+    #[arg(long)]
+    stack_range: Vec<String>,
     /// Replay a recording without attaching to a live target
     #[arg(long, conflicts_with_all=["pid","shell_command","command","stat","check","emit_llvm","list","list_functions","list_usdt","track_threads","follow_forks","attach_descendants","system_wide","track_loads","live","window","duration"])]
     replay: Option<PathBuf>,
@@ -97,7 +130,7 @@ struct Args {
     )]
     stat_events: Vec<String>,
     /// Report encoding; script printf output is separate when --output is used
-    #[arg(long, default_value="text",value_parser=["text","json","folded","speedscope","speedscope-timeline","flamegraph"])]
+    #[arg(long, default_value="text",value_parser=["text","json","folded","speedscope","speedscope-timeline","speedscope-scheduler","flamegraph"])]
     output_format: String,
     /// Write the final report to a file
     #[arg(short = 'o', long)]
@@ -192,8 +225,12 @@ fn run(mut args: Args) -> Result<i32> {
     if args.attach_descendants {
         args.follow_forks = true;
     }
-    if args.output_format == "speedscope-timeline" && args.replay.is_none() {
-        return Err("--output-format speedscope-timeline requires --replay".into());
+    if matches!(
+        args.output_format.as_str(),
+        "speedscope-timeline" | "speedscope-scheduler"
+    ) && args.replay.is_none()
+    {
+        return Err("timeline and scheduler output formats require --replay".into());
     }
     if let Some(path) = &args.list_usdt {
         for site in poortrace::usdt::sites(args.pid.unwrap_or(std::process::id() as i32), path)? {
@@ -396,6 +433,19 @@ fn run(mut args: Args) -> Result<i32> {
     {
         return Err("--system-wide supports perf sampling, tracepoint/kernel probes, and lifecycle/timer handlers; ptrace, wait/wakeup, uprobes and offcpu require a target".into());
     }
+    if (!args.shared_mm_pids.is_empty() || !args.stack_range.is_empty())
+        && (args.uprobe_backend != "ptrace"
+            || !program.clauses.iter().any(|c| {
+                c.probes
+                    .iter()
+                    .any(|(_, p)| matches!(p, Probe::Uprobe { .. }))
+            }))
+    {
+        return Err("shared-mm groups and stack ranges require ptrace function probes".into());
+    }
+    if args.record_output && args.command.is_empty() && args.shell_command.is_none() {
+        return Err("--record-output requires a launched command".into());
+    }
     if args.track_loads && args.uprobe_backend != "ptrace" {
         return Err("--track-loads requires --uprobe-backend ptrace".into());
     }
@@ -436,7 +486,9 @@ fn run(mut args: Args) -> Result<i32> {
     }
     let capture = Capture {
         addr: true,
-        kernel: args.include_kernel,
+        kernel: args.include_kernel || program.needs_kstack(),
+        kernel_callchain: program.needs_kstack() || args.include_kernel && args.record.is_some(),
+        record_raw: args.record_raw,
         callchain: program.needs_ustack() || args.record.is_some(),
         dwarf_stack: if (args.stack_mode == "dwarf" && program.needs_ustack())
             || program.needs_jsstack()
@@ -458,7 +510,11 @@ fn run(mut args: Args) -> Result<i32> {
     let mut child = if command.is_empty() {
         None
     } else {
-        Some(Child::spawn(&command, args.follow_forks)?)
+        Some(Child::spawn(
+            &command,
+            args.follow_forks,
+            args.record_output,
+        )?)
     };
     let target = child
         .as_ref()
@@ -509,6 +565,20 @@ fn run(mut args: Args) -> Result<i32> {
             c.start()?;
         }
     }
+    let coverage = if args.system_wide && state.recorder.is_some() {
+        let clause=program.clauses.iter().position(|clause|clause.probes.iter().any(|(_,p)|matches!(p,Probe::Tracepoint{category,event}if category=="sched"&&event=="sched_switch")));
+        clause.map(|clause| {
+            let generations: Vec<_> = streams
+                .iter()
+                .filter(|s| s.clause == clause && s.name == "tracepoint:sched:sched_switch")
+                .map(|s| (s.tid, s.generation))
+                .collect();
+            (clause, generations, monotonic_ns())
+        })
+    } else {
+        None
+    };
+    let mut coverage_end = 0;
     let start = Instant::now();
     let mut timers: Vec<_> = program
         .clauses
@@ -537,6 +607,9 @@ fn run(mut args: Args) -> Result<i32> {
             } else {
                 false
             };
+            if let Some(child) = &mut child {
+                child.poll_output(state.recorder.as_mut())?;
+            }
             dispatch_waits(&program, &mut state, &mut waits, target)?;
             drain(&program, &mut state, &mut streams, &mut lost)?;
             if state.stopped || INTERRUPTED.load(Ordering::Relaxed) || child_done {
@@ -625,6 +698,7 @@ fn run(mut args: Args) -> Result<i32> {
                 stream.hup = fd.revents & libc::POLLHUP != 0;
             }
         }
+        coverage_end = monotonic_ns();
         for stream in &streams {
             stream.event.disable()?;
         }
@@ -634,6 +708,36 @@ fn run(mut args: Args) -> Result<i32> {
         Ok(())
     })();
     // END handlers still run after exit(), target exit, or an interrupt.
+    if let Some((clause, generations, start)) = coverage {
+        let cpus = poortrace::kernel::online_cpus().ok();
+        let covered: BTreeSet<_> = generations.iter().map(|(cpu, _)| *cpu).collect();
+        let unchanged = generations.iter().all(|(cpu, generation)| {
+            streams.iter().any(|s| {
+                s.tid == *cpu
+                    && s.clause == clause
+                    && s.name == "tracepoint:sched:sched_switch"
+                    && s.generation == *generation
+                    && !s.hup
+                    && !s.discontinuous
+            })
+        });
+        let complete = result.is_ok()
+            && !state.stopped
+            && lost == 0
+            && unchanged
+            && cpus.is_some_and(|cpus| cpus.into_iter().collect::<BTreeSet<_>>() == covered)
+            && coverage_end >= start;
+        if let Some(recorder) = &mut state.recorder {
+            recorder.metadata(&poortrace::recording::Metadata::SchedulerCoverage {
+                cpus: covered.into_iter().map(|c| c as u32).collect(),
+                start,
+                end: coverage_end.max(start),
+                complete,
+                clause: Some(clause),
+            })?;
+        }
+    }
+    let child_record_result = finalize_recorded_child(&mut state, child.as_mut());
     state.stopped = false;
     invoke_kind(&program, &mut state, target, false);
     finish_report(&mut state, &args, window_start.elapsed())?;
@@ -644,7 +748,12 @@ fn run(mut args: Args) -> Result<i32> {
         );
     }
     result?;
-    Ok(child.as_ref().and_then(|c| c.status).unwrap_or(0))
+    child_record_result?;
+    Ok(child
+        .as_ref()
+        .filter(|c| !c.terminated_by_tracer)
+        .and_then(|c| c.status)
+        .unwrap_or(0))
 }
 
 struct Stream {
@@ -656,6 +765,8 @@ struct Stream {
     comm: CString,
     on_exec: bool,
     switched_out: Option<(u64, bool)>,
+    generation: u64,
+    discontinuous: bool,
 }
 fn threads(pid: i32) -> Result<BTreeSet<i32>> {
     std::fs::read_dir(format!("/proc/{pid}/task"))
@@ -725,6 +836,8 @@ fn attach(
                             comm: task_comm(pid, *tid),
                             on_exec,
                             switched_out: None,
+                            generation: monotonic_ns(),
+                            discontinuous: false,
                         });
                     }
                     Ok(None) => {}
@@ -758,7 +871,58 @@ fn drain(
         stream.hup |= fd.revents & libc::POLLHUP != 0;
     }
     for stream in streams.iter_mut() {
-        for record in stream.event.drain()? {
+        let records = stream.event.drain()?;
+        let mut raw_records = stream.event.take_raw_records().into_iter();
+        for record in records {
+            let cpu = if stream.event.system_wide() {
+                stream.tid as u32
+            } else {
+                u32::MAX
+            };
+            if let Some(bytes) = raw_records.next() {
+                let (pid, tid, cpu, nsecs) = match &record {
+                    Record::Sample(s) => (s.pid as u64, s.tid as u64, s.cpu, s.time),
+                    Record::Switch {
+                        pid,
+                        tid,
+                        cpu,
+                        time,
+                        ..
+                    } => (*pid as u64, *tid as u64, *cpu, *time),
+                    Record::Comm { pid, tid, .. } => {
+                        (*pid as u64, *tid as u64, cpu, monotonic_ns())
+                    }
+                    _ => (0, 0, cpu, monotonic_ns()),
+                };
+                if let Some(recorder) = &mut state.recorder {
+                    recorder.metadata(&poortrace::recording::Metadata::RawPerf{pid,tid,cpu,nsecs,probe:stream.name.clone(),bytes,capture:Some(serde_json::json!({"architecture":std::env::consts::ARCH,"endianness":if cfg!(target_endian="little"){"little"}else{"big"},"layout":stream.event.capture(),"trace_format":stream.event.trace_format(),"clause":stream.clause}))})?;
+                }
+            }
+            if let Record::Lost(count) = &record {
+                if let Some(recorder) = &mut state.recorder {
+                    recorder.metadata(&poortrace::recording::Metadata::Lost {
+                        cpu,
+                        nsecs: monotonic_ns(),
+                        count: *count,
+                    })?;
+                }
+            }
+            if let Record::Throttle { time, throttled } = &record {
+                stream.discontinuous = true;
+                stream.switched_out = None;
+                if let Some(recorder) = &mut state.recorder {
+                    recorder.metadata(&poortrace::recording::Metadata::Discontinuity {
+                        cpu,
+                        nsecs: *time,
+                        reason: if *throttled {
+                            "perf throttled"
+                        } else {
+                            "perf unthrottled"
+                        }
+                        .into(),
+                    })?;
+                }
+            }
             match record {
                 Record::Sample(sample) if !state.stopped => invoke(
                     program,
@@ -895,7 +1059,17 @@ fn invoke(
     } else {
         None
     };
-    program.invoke(clause, state, &event);
+    state.kernel_frames = sample
+        .map(|s| s.kernel_callchain.clone())
+        .unwrap_or_default();
+    if sample.is_some() {
+        state.capture_event_memory(&event);
+    } else {
+        state.captured_memory.clear();
+    }
+    if !state.stopped {
+        program.invoke(clause, state, &event);
+    }
     state.js_snapshot = None;
     state.trace_fields.clear();
 }
@@ -923,9 +1097,34 @@ struct Child {
     gate: Option<OwnedFd>,
     status: Option<i32>,
     descendants: std::collections::BTreeMap<i32, OwnedFd>,
+    output: Option<TargetOutput>,
+    terminated_by_tracer: bool,
+}
+struct TargetOutput {
+    pipes: [OwnedFd; 2],
+}
+fn output_pipe() -> Result<(OwnedFd, OwnedFd)> {
+    let mut pair = [0; 2];
+    if unsafe { libc::pipe2(pair.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
+        return Err(io::Error::last_os_error().to_string());
+    }
+    let mut owned = [unsafe { OwnedFd::from_raw_fd(pair[0]) }, unsafe {
+        OwnedFd::from_raw_fd(pair[1])
+    }];
+    for descriptor in &mut owned {
+        if descriptor.as_raw_fd() < 3 {
+            let fd = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+            if fd < 0 {
+                return Err(io::Error::last_os_error().to_string());
+            }
+            *descriptor = unsafe { OwnedFd::from_raw_fd(fd) };
+        }
+    }
+    let [read, write] = owned;
+    Ok((read, write))
 }
 impl Child {
-    fn spawn(args: &[String], follow: bool) -> Result<Self> {
+    fn spawn(args: &[String], follow: bool, capture_output: bool) -> Result<Self> {
         if follow && unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } < 0 {
             return Err(format!(
                 "enabling owned descendant reaping: {}",
@@ -938,12 +1137,14 @@ impl Child {
             .collect::<Result<_>>()?;
         let mut argv: Vec<_> = args.iter().map(|s| s.as_ptr()).collect();
         argv.push(std::ptr::null());
-        let mut pipe = [0; 2];
-        if unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
-            return Err(format!("pipe: {}", io::Error::last_os_error()));
-        }
-        let read = unsafe { OwnedFd::from_raw_fd(pipe[0]) };
-        let write = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
+        let output = if capture_output {
+            Some([output_pipe()?, output_pipe()?])
+        } else {
+            None
+        };
+        // Keep the gate clear of dup2 destinations even when the caller closed
+        // standard descriptors before starting the tracer.
+        let (read, write) = output_pipe()?;
         let pid = unsafe { libc::fork() };
         if pid < 0 {
             return Err(format!("fork: {}", io::Error::last_os_error()));
@@ -953,6 +1154,15 @@ impl Child {
             // gate holds the child until perf streams and BEGIN handlers are ready.
             unsafe {
                 libc::setpgid(0, 0);
+                if let Some(pipes) = &output {
+                    for (index, (read, write)) in pipes.iter().enumerate() {
+                        if libc::dup2(write.as_raw_fd(), index as i32 + 1) < 0 {
+                            libc::_exit(125);
+                        }
+                        libc::close(read.as_raw_fd());
+                        libc::close(write.as_raw_fd());
+                    }
+                }
                 libc::close(write.as_raw_fd());
                 let mut byte = 0u8;
                 loop {
@@ -980,12 +1190,99 @@ impl Child {
             libc::setpgid(pid, pid);
         }
         drop(read);
+        let output = if let Some([(read_out, write_out), (read_err, write_err)]) = output {
+            drop(write_out);
+            drop(write_err);
+            for fd in [&read_out, &read_err] {
+                let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+                if flags < 0
+                    || unsafe {
+                        libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK)
+                    } < 0
+                {
+                    let error = io::Error::last_os_error();
+                    unsafe {
+                        libc::kill(-pid, libc::SIGKILL);
+                        libc::kill(pid, libc::SIGKILL);
+                        libc::waitpid(pid, std::ptr::null_mut(), 0);
+                    }
+                    return Err(error.to_string());
+                }
+            }
+            Some(TargetOutput {
+                pipes: [read_out, read_err],
+            })
+        } else {
+            None
+        };
         Ok(Self {
             pid,
             gate: Some(write),
             status: None,
             descendants: std::collections::BTreeMap::new(),
+            output,
+            terminated_by_tracer: false,
         })
+    }
+    fn poll_output(
+        &mut self,
+        mut recorder: Option<&mut poortrace::recording::Recorder>,
+    ) -> Result<()> {
+        let Some(output) = &self.output else {
+            return Ok(());
+        };
+        for (index, fd) in output.pipes.iter().enumerate() {
+            let mut buffer = [0u8; 4096];
+            for _ in 0..256 {
+                let n =
+                    unsafe { libc::read(fd.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len()) };
+                if n == 0 {
+                    break;
+                }
+                if n < 0 {
+                    let error = io::Error::last_os_error();
+                    if error.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    if error.kind() == io::ErrorKind::WouldBlock {
+                        break;
+                    }
+                    return Err(format!("target output: {error}"));
+                }
+                let bytes = &buffer[..n as usize];
+                let mut offset = 0;
+                while offset < bytes.len() {
+                    let written = unsafe {
+                        libc::write(
+                            index as i32 + 1,
+                            bytes[offset..].as_ptr().cast(),
+                            bytes.len() - offset,
+                        )
+                    };
+                    if written < 0
+                        && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
+                    {
+                        continue;
+                    }
+                    if written <= 0 {
+                        return Err(format!(
+                            "forwarding target output: {}",
+                            io::Error::last_os_error()
+                        ));
+                    }
+                    offset += written as usize;
+                }
+                if let Some(recorder) = recorder.as_deref_mut() {
+                    recorder.metadata(&poortrace::recording::Metadata::Output {
+                        pid: self.pid as u64,
+                        nsecs: monotonic_ns(),
+                        stream: if index == 0 { "stdout" } else { "stderr" }.into(),
+                        bytes: bytes.to_vec(),
+                    })?;
+                }
+            }
+        }
+        Ok(())
     }
     fn kill_descendants(&self) {
         for fd in self.descendants.values() {
@@ -1068,7 +1365,61 @@ fn command_for(args: &Args) -> Vec<String> {
         .map(|s| vec!["/bin/sh".into(), "-c".into(), s.clone()])
         .unwrap_or_else(|| args.command.clone())
 }
+fn finalize_recorded_child(state: &mut State<'_>, child: Option<&mut Child>) -> Result<()> {
+    if state.recorder.is_none() {
+        return Ok(());
+    }
+    let Some(child) = child else {
+        return Ok(());
+    };
+    if child.status.is_none() {
+        child.terminated_by_tracer = true;
+        child.kill_descendants();
+        unsafe {
+            libc::kill(-child.pid, libc::SIGKILL);
+            libc::kill(child.pid, libc::SIGKILL);
+        }
+        let mut status = 0;
+        loop {
+            let result = unsafe { libc::waitpid(child.pid, &mut status, 0) };
+            if result == child.pid {
+                child.status = Some(if libc::WIFEXITED(status) {
+                    libc::WEXITSTATUS(status)
+                } else {
+                    128 + libc::WTERMSIG(status)
+                });
+                break;
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(format!("reaping recorded command: {error}"));
+        }
+    }
+    child.poll_output(state.recorder.as_mut())?;
+    if let Some(status) = child.status {
+        state
+            .recorder
+            .as_mut()
+            .unwrap()
+            .metadata(&poortrace::recording::Metadata::Exit {
+                pid: child.pid as u64,
+                nsecs: monotonic_ns(),
+                status,
+            })?;
+    }
+    Ok(())
+}
 fn configure_report(state: &mut State<'_>, args: &Args) -> Result<()> {
+    state.capture_requests = args.capture_memory.clone();
+    if let Some(path) = &args.btf {
+        state.configure_btf(path.clone());
+    }
+    if let Some(path) = &args.managed_snapshot {
+        state.managed.configure(path.clone())?;
+    }
+    state.managed.set_max_age(args.managed_max_age)?;
     state.report = poortrace::report::Options {
         format: args.output_format.clone(),
         top: args.top.map(|n| n as usize),
@@ -1114,7 +1465,11 @@ fn run_stat(args: &Args) -> Result<i32> {
     let mut child = if command.is_empty() {
         None
     } else {
-        Some(Child::spawn(&command, args.follow_forks)?)
+        Some(Child::spawn(
+            &command,
+            args.follow_forks,
+            args.record_output,
+        )?)
     };
     let pid = child
         .as_ref()
@@ -1321,7 +1676,11 @@ fn run_stat(args: &Args) -> Result<i32> {
             .write_all(text.as_bytes())
             .map_err(|e| e.to_string())?;
     }
-    Ok(child.as_ref().and_then(|child| child.status).unwrap_or(0))
+    Ok(child
+        .as_ref()
+        .filter(|child| !child.terminated_by_tracer)
+        .and_then(|child| child.status)
+        .unwrap_or(0))
 }
 fn run_syscalls(args: &Args, program: &Program) -> Result<i32> {
     install_signals()?;
@@ -1329,7 +1688,11 @@ fn run_syscalls(args: &Args, program: &Program) -> Result<i32> {
     let mut child = if command.is_empty() {
         None
     } else {
-        Some(Child::spawn(&command, args.follow_forks)?)
+        Some(Child::spawn(
+            &command,
+            args.follow_forks,
+            args.record_output,
+        )?)
     };
     let pid = child
         .as_ref()
@@ -1347,7 +1710,9 @@ fn run_syscalls(args: &Args, program: &Program) -> Result<i32> {
     let capture = Capture {
         ptrace_functions: false,
         addr: true,
-        kernel: args.include_kernel,
+        kernel: args.include_kernel || program.needs_kstack(),
+        kernel_callchain: program.needs_kstack() || args.include_kernel && args.record.is_some(),
+        record_raw: args.record_raw,
         callchain: program.needs_ustack() || args.record.is_some(),
         dwarf_stack: if (args.stack_mode == "dwarf" && program.needs_ustack())
             || program.needs_jsstack()
@@ -1361,7 +1726,7 @@ fn run_syscalls(args: &Args, program: &Program) -> Result<i32> {
         ..Default::default()
     };
     let mut streams = Vec::new();
-    if args.attach_descendants {
+    if args.attach_descendants || !args.shared_mm_pids.is_empty() {
         for target in tracer.targets() {
             if target != pid {
                 attach(
@@ -1430,6 +1795,9 @@ fn run_syscalls(args: &Args, program: &Program) -> Result<i32> {
                 .duration
                 .is_some_and(|duration| start.elapsed() >= duration)
         {
+            if let Some(child) = &mut child {
+                child.poll_output(state.recorder.as_mut())?;
+            }
             dispatch_waits(program, &mut state, &mut waits, tracer.targets())?;
             drain(program, &mut state, &mut streams, &mut lost)?;
             if state.stopped {
@@ -1521,7 +1889,11 @@ fn run_syscalls(args: &Args, program: &Program) -> Result<i32> {
                             sample.retval = event.retval;
                             sample.latency = event.latency;
                             sample.args = event.args;
-                            program.invoke(id, &mut state, &sample);
+                            state.kernel_frames.clear();
+                            state.capture_event_memory(&sample);
+                            if !state.stopped {
+                                program.invoke(id, &mut state, &sample);
+                            }
                             if state.stopped {
                                 break;
                             }
@@ -1610,16 +1982,22 @@ fn run_syscalls(args: &Args, program: &Program) -> Result<i32> {
         }
     }
     drop(tracer);
+    let child_record_result = finalize_recorded_child(&mut state, child.as_mut());
     state.stopped = false;
     invoke_kind(program, &mut state, Some(pid), false);
     finish_report(&mut state, args, window_start.elapsed())?;
     state.flush()?;
     result?;
+    child_record_result?;
     drain_result?;
     if lost != 0 {
         eprintln!("poortrace: lost {lost} perf samples");
     }
-    Ok(child.as_ref().and_then(|child| child.status).unwrap_or(0))
+    Ok(child
+        .as_ref()
+        .filter(|child| !child.terminated_by_tracer)
+        .and_then(|child| child.status)
+        .unwrap_or(0))
 }
 
 fn run_functions(args: &Args, program: &Program) -> Result<i32> {
@@ -1628,7 +2006,11 @@ fn run_functions(args: &Args, program: &Program) -> Result<i32> {
     let mut child = if command.is_empty() {
         None
     } else {
-        Some(Child::spawn(&command, args.follow_forks)?)
+        Some(Child::spawn(
+            &command,
+            args.follow_forks,
+            args.record_output,
+        )?)
     };
     let pid = child
         .as_ref()
@@ -1654,20 +2036,39 @@ fn run_functions(args: &Args, program: &Program) -> Result<i32> {
             }
         }
     }
-    let mut tracer = poortrace::functions::Tracer::seize_tree(
+    let mut tracer = poortrace::functions::Tracer::seize_group(
         pid,
         threads(pid)?,
         &specs,
         child.is_some(),
         args.attach_descendants,
+        &args.shared_mm_pids,
     )?;
+    for specification in &args.stack_range {
+        let components: Vec<_> = specification.split(':').collect();
+        if components.len() != 3 {
+            return Err("stack range needs TID:LOW:HIGH".into());
+        }
+        let tid = components[0].parse::<i32>().map_err(|e| e.to_string())?;
+        let parse = |s: &str| -> Result<u64> {
+            if let Some(hex) = s.strip_prefix("0x") {
+                u64::from_str_radix(hex, 16).map_err(|e| e.to_string())
+            } else {
+                s.parse()
+                    .map_err(|e: std::num::ParseIntError| e.to_string())
+            }
+        };
+        tracer.register_stack_range(tid, parse(components[1])?, parse(components[2])?)?;
+    }
     tracer.trace_syscalls(program.has_syscalls());
     tracer.track_loads(args.track_loads);
     tracer.follow_forks(args.follow_forks);
     let capture = Capture {
         ptrace_functions: true,
         addr: true,
-        kernel: args.include_kernel,
+        kernel: args.include_kernel || program.needs_kstack(),
+        kernel_callchain: program.needs_kstack() || args.include_kernel && args.record.is_some(),
+        record_raw: args.record_raw,
         callchain: program.needs_ustack() || args.record.is_some(),
         dwarf_stack: if (args.stack_mode == "dwarf" && program.needs_ustack())
             || program.needs_jsstack()
@@ -1681,7 +2082,7 @@ fn run_functions(args: &Args, program: &Program) -> Result<i32> {
         ..Default::default()
     };
     let mut streams = Vec::new();
-    if args.attach_descendants {
+    if args.attach_descendants || !args.shared_mm_pids.is_empty() {
         for target in tracer.targets() {
             if target != pid {
                 attach(
@@ -1750,6 +2151,9 @@ fn run_functions(args: &Args, program: &Program) -> Result<i32> {
                 .duration
                 .is_some_and(|duration| start.elapsed() >= duration)
         {
+            if let Some(child) = &mut child {
+                child.poll_output(state.recorder.as_mut())?;
+            }
             dispatch_waits(program, &mut state, &mut waits, tracer.targets())?;
             drain(program, &mut state, &mut streams, &mut lost)?;
             if state.stopped {
@@ -1853,7 +2257,11 @@ fn run_functions(args: &Args, program: &Program) -> Result<i32> {
                     sample.args = event.args;
                     sample.retval = event.retval;
                     sample.latency = event.latency;
-                    program.invoke(id, &mut state, &sample);
+                    state.kernel_frames.clear();
+                    state.capture_event_memory(&sample);
+                    if !state.stopped {
+                        program.invoke(id, &mut state, &sample);
+                    }
                     if state.stopped {
                         break;
                     }
@@ -1939,16 +2347,22 @@ fn run_functions(args: &Args, program: &Program) -> Result<i32> {
         }
     }
     drop(tracer);
+    let child_record_result = finalize_recorded_child(&mut state, child.as_mut());
     state.stopped = false;
     invoke_kind(program, &mut state, Some(pid), false);
     finish_report(&mut state, args, window_start.elapsed())?;
     state.flush()?;
     result?;
+    child_record_result?;
     drain_result?;
     if lost != 0 {
         eprintln!("poortrace: lost {lost} perf samples");
     }
-    Ok(child.as_ref().and_then(|child| child.status).unwrap_or(0))
+    Ok(child
+        .as_ref()
+        .filter(|child| !child.terminated_by_tracer)
+        .and_then(|child| child.status)
+        .unwrap_or(0))
 }
 
 fn configure_record(state: &mut State<'_>, args: &Args, program: &Program) -> Result<()> {
@@ -1961,10 +2375,64 @@ fn configure_record(state: &mut State<'_>, args: &Args, program: &Program) -> Re
     Ok(())
 }
 fn run_replay(args: &Args, path: &std::path::Path) -> Result<i32> {
-    let (header, mut events) = poortrace::recording::read(path)?;
-    let alternate = args.expression.is_some() || args.script.is_some();
+    let mut recording = poortrace::recording::read_full(path)?;
+    if args.output_format == "speedscope-scheduler" {
+        if args.expression.is_some() || args.script.is_some() {
+            return Err("scheduler export uses recorded switches; omit alternate script".into());
+        }
+        let report = poortrace::recording::scheduler_speedscope(&recording)?;
+        if let Some(path) = &args.output {
+            std::fs::write(path, report).map_err(|e| e.to_string())?;
+        } else {
+            use std::io::Write;
+            io::stdout()
+                .write_all(report.as_bytes())
+                .map_err(|e| e.to_string())?;
+        }
+        return Ok(0);
+    }
+    let captured_status = recording.metadata.iter().find_map(|item| {
+        if let poortrace::recording::Metadata::Exit { status, .. } = item {
+            Some(*status)
+        } else {
+            None
+        }
+    });
+    let mut replayed_output = Vec::new();
+    if args.replay_output {
+        for item in &recording.metadata {
+            if let poortrace::recording::Metadata::Output {
+                nsecs,
+                stream,
+                bytes,
+                ..
+            } = item
+            {
+                replayed_output.push((*nsecs, stream.clone(), bytes.clone()));
+            }
+        }
+        replayed_output.sort_by_key(|row| row.0);
+    }
+    let mut events = if args.replay_raw {
+        poortrace::recording::observations_from_raw(&recording)?
+    } else {
+        std::mem::take(&mut recording.events)
+    };
+    let header = recording.header;
+    if header.endianness.as_ref().is_some_and(|value| {
+        value
+            != if cfg!(target_endian = "little") {
+                "little"
+            } else {
+                "big"
+            }
+    }) {
+        return Err("recording memory byte order differs from this host".into());
+    }
+
+    let alternate = args.replay_raw || args.expression.is_some() || args.script.is_some();
     if args.output_format == "speedscope-timeline" {
-        if alternate {
+        if args.expression.is_some() || args.script.is_some() {
             return Err("timeline export uses captured stacks; omit an alternate script".into());
         }
         let report = poortrace::recording::timeline_speedscope(&events)?;
@@ -1979,7 +2447,7 @@ fn run_replay(args: &Args, path: &std::path::Path) -> Result<i32> {
         return Ok(0);
     }
     if alternate {
-        events = poortrace::recording::coalesce(events);
+        events = poortrace::recording::coalesce(events)?;
         let pid = events.first().map(|e| e.pid).unwrap_or(0);
         let tid = events.first().map(|e| e.tid).unwrap_or(0);
         let first = events.iter().map(|e| e.nsecs).min().unwrap_or(0);
@@ -2033,7 +2501,15 @@ fn run_replay(args: &Args, path: &std::path::Path) -> Result<i32> {
     let mut first = u64::MAX;
     let mut last = 0;
     let mut exited = false;
+    let mut replayed_output = replayed_output.into_iter().peekable();
     for saved in events {
+        while replayed_output
+            .peek()
+            .is_some_and(|item| item.0 <= saved.nsecs)
+        {
+            let (_, stream, bytes) = replayed_output.next().unwrap();
+            write_replayed_output(&stream, &bytes)?;
+        }
         if alternate && exited && saved.probe != "END" {
             continue;
         }
@@ -2104,6 +2580,8 @@ fn run_replay(args: &Args, path: &std::path::Path) -> Result<i32> {
         first = first.min(event.nsecs);
         last = last.max(event.nsecs);
         state.trace_fields = saved.trace_fields;
+        state.replay_memory = saved.memory;
+        state.kernel_frames = saved.kernel_stack;
         state.js_snapshot = saved.raw.and_then(|raw| {
             (raw.architecture == std::env::consts::ARCH).then(|| {
                 (
@@ -2133,13 +2611,20 @@ fn run_replay(args: &Args, path: &std::path::Path) -> Result<i32> {
             }
         }
     }
+    for (_, stream, bytes) in replayed_output {
+        write_replayed_output(&stream, &bytes)?;
+    }
     finish_report(
         &mut state,
         args,
         Duration::from_nanos(last.saturating_sub(first)),
     )?;
     state.flush()?;
-    Ok(0)
+    Ok(if args.replay_exit_status {
+        captured_status.unwrap_or(0)
+    } else {
+        0
+    })
 }
 
 fn dispatch_waits(
@@ -2184,7 +2669,11 @@ fn dispatch_waits(
         if program.needs_jsstack() {
             state.js_snapshot = Some((snapshot.regs, (*snapshot.stack).clone()));
         }
-        program.invoke(snapshot.clause, state, &event);
+        state.kernel_frames.clear();
+        state.capture_event_memory(&event);
+        if !state.stopped {
+            program.invoke(snapshot.clause, state, &event);
+        }
         state.js_snapshot = None;
         state.wait_reason = None;
     }
@@ -2237,4 +2726,14 @@ fn track_owned_descendants(
             .insert(pid, unsafe { OwnedFd::from_raw_fd(fd as i32) });
     }
     Ok(())
+}
+
+fn write_replayed_output(stream: &str, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    match stream {
+        "stdout" => io::stdout().write_all(bytes),
+        "stderr" => io::stderr().write_all(bytes),
+        _ => return Err("unknown recorded output stream".into()),
+    }
+    .map_err(|e| e.to_string())
 }

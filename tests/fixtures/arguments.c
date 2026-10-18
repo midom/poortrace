@@ -1,3 +1,4 @@
+#include <stdarg.h>
 typedef float Vector __attribute__((vector_size(16)));
 struct Pair { long integer; double floating; };
 struct Hfa { float first, second, third; };
@@ -27,6 +28,7 @@ __attribute__((noinline)) void union_hfa(union FloatUnion overlap,int afterunion
 __attribute__((noinline)) void nested_vector(struct VectorHolder nested,int aftervector) { sink=nested.first[0]+nested.first[3]+aftervector; }
 __attribute__((noinline)) void vector_pair(struct VectorPair pair,int afterpair) { sink=pair.first[0]+pair.second[3]+afterpair; }
 __attribute__((noinline)) struct Big returns_big(long value,double factor) { return (struct Big){value,(long)factor,33}; }
+__attribute__((noinline)) void variadic(int fixed,...) { va_list args;va_start(args,fixed);int small=va_arg(args,int);double ratio=va_arg(args,double);long large=va_arg(args,long);va_end(args);sink=fixed+small+ratio+large; }
 int main(void) {
     inspect(-7,1.25,(struct Pair){42,2.5},(struct Hfa){1,2,3},
         (Vector){1.25,2.5,3.75,4},(struct Big){10,20,30},1,2,3,4,5,6,7,8,9);
@@ -36,5 +38,6 @@ int main(void) {
     nested_vector((struct VectorHolder){(Vector){1.25,2.5,3.75,4}},17);
     vector_pair((struct VectorPair){(Vector){1,2,3,4},(Vector){5,6,7,8}},19);
     sink+=returns_big(77,2.5).first;
+    variadic(7,-3,1.25,99L);
     return sink==0;
 }
