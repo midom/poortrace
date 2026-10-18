@@ -1,6 +1,8 @@
 use poortrace::report::{self, Options, Row};
 fn row(value: f64) -> Row {
     Row {
+        stats: None,
+        series: Vec::new(),
         map: "value".into(),
         keys: vec![],
         value: 0,

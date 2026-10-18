@@ -266,3 +266,105 @@ fn reliable_interrupt_runs_end_and_cleans_owned_target() {
     assert!(tracer.wait().unwrap().success());
     assert_eq!(unsafe { libc::kill(target, 0) }, -1, "owned target leaked");
 }
+
+#[test]
+#[ignore = "requires ptrace access and a C compiler"]
+fn unsafe_helpers_use_stopped_registers_and_deliver_signals_after_detach() {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+    let dir = std::env::temp_dir().join(format!("poortrace-effects-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("target.c");
+    let binary = dir.join("target");
+    std::fs::write(
+        &source,
+        r#"
+#include <signal.h>
+#include <stdio.h>
+#include <sys/prctl.h>
+#include <unistd.h>
+volatile unsigned char value = 1;
+static void received(int sig) { (void)sig; }
+__attribute__((noinline)) void observed(void) { asm volatile("" ::: "memory"); }
+int main(void) {
+ prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY,0,0,0);
+ signal(SIGUSR1,received); signal(SIGUSR2,received);
+ printf("%llu\n",(unsigned long long)&value); fflush(stdout);
+ for (;;) { observed(); usleep(1000); }
+}
+"#,
+    )
+    .unwrap();
+    assert!(
+        Command::new("cc")
+            .args(["-g", "-O0"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&binary)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let mut child = Command::new(&binary)
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    struct Cleanup(std::process::Child);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut line = String::new();
+    BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let mut child = Cleanup(child);
+    let address = line.trim().parse::<u64>().unwrap();
+    let pid = child.0.id().to_string();
+    let selector = format!("u:{}:observed", binary.display());
+    for effect in ["signal(SIGUSR1);", "signal_thread(SIGUSR2);"] {
+        let script = format!(
+            "{selector} {{ assert(reg(\"sp\")>0); assert(write_user({address},\"Z\",1)); assert(read_u8({address})==90); {effect} exit(); }}"
+        );
+        let out = trace(&[
+            "-q",
+            "--unsafe",
+            "--reliable",
+            "-p",
+            &pid,
+            "-d",
+            "1",
+            "-e",
+            &script,
+        ]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(child.0.try_wait().unwrap().is_none());
+        assert_eq!(
+            poortrace::memory::read(child.0.id(), address, 1, false).unwrap(),
+            b"Z"
+        );
+    }
+    let out = trace(&[
+        "-q",
+        "--unsafe",
+        "--reliable",
+        "-p",
+        &pid,
+        "-e",
+        &format!("{selector} {{ signal(SIGKILL); exit(); }}"),
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(child.0.wait().unwrap().signal(), Some(libc::SIGKILL));
+    std::fs::remove_dir_all(dir).unwrap();
+}

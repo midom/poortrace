@@ -177,6 +177,7 @@ impl Poller {
                             fp: 0,
                             lr: 0,
                             runtime_g: 0,
+                            ..Default::default()
                         },
                         number,
                         args,

@@ -109,7 +109,34 @@ impl Registers {
     }
     #[cfg(target_arch = "x86_64")]
     fn user(&self) -> UserRegs {
+        let mut extra = [0u64; 32];
+        for (dest, source) in [
+            (0, 10),
+            (1, 5),
+            (2, 11),
+            (3, 12),
+            (4, 13),
+            (5, 14),
+            (6, 4),
+            (7, 19),
+            (8, 16),
+            (9, 18),
+            (10, 17),
+            (11, 20),
+            (16, 9),
+            (17, 8),
+            (18, 7),
+            (19, 6),
+            (20, 3),
+            (21, 2),
+            (22, 1),
+            (23, 0),
+        ] {
+            extra[dest] = self.data[source];
+        }
         UserRegs {
+            extra,
+            valid: 0xfff | (0xff << 16),
             ip: self.data[16],
             sp: self.data[19],
             fp: self.data[4],
@@ -120,6 +147,8 @@ impl Registers {
     #[cfg(target_arch = "aarch64")]
     fn user(&self) -> UserRegs {
         UserRegs {
+            extra: self.data[..32].try_into().unwrap(),
+            valid: (1u64 << 33) - 1,
             ip: self.data[32],
             sp: self.data[31],
             fp: self.data[29],

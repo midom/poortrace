@@ -41,6 +41,19 @@ pub(super) fn invoke(
         .filter(|pid| *pid >= 0)
         .unwrap_or_else(|| std::process::id() as i32);
     let tid = sample.map(|s| s.tid as i32).unwrap_or(pid);
+    let ptrace_observation = state.target_paused
+        || name.starts_with("syscall:")
+            && state.report.provenance.as_ref().is_some_and(|p| {
+                matches!(p.backend.as_str(), "syscalls" | "functions" | "reliable")
+            });
+    if sample.is_some() && ptrace_observation && !state.has_target_identity(pid as u32) {
+        if let Err(error) = state.register_target_identity(pid as u32) {
+            state.error = Some(error);
+            state.stopped = true;
+            return;
+        }
+    }
+
     let fallback;
     let comm = match comm {
         Some(c) => c,
@@ -73,15 +86,17 @@ pub(super) fn invoke(
     event.nsecs = sample.map(|s| s.time).unwrap_or_else(monotonic_ns);
     event.ip = sample.map(|s| s.ip).unwrap_or(0);
     event.period = sample.map(|s| s.period).unwrap_or(0);
+    state.register_snapshot = sample.and_then(|sample| sample.kernel_regs.or(sample.regs));
     state.trace_fields = sample
         .and_then(|sample| sample.trace.as_ref())
         .map(|trace| trace.fields.clone())
         .unwrap_or_default();
-    state.js_snapshot = if program.needs_jsstack() || state.recorder.is_some() {
-        sample.and_then(|sample| sample.regs.map(|regs| (regs, sample.stack.clone())))
-    } else {
-        None
-    };
+    state.js_snapshot =
+        if program.needs_jsstack() || program.needs_registers() || state.recorder.is_some() {
+            sample.and_then(|sample| sample.regs.map(|regs| (regs, sample.stack.clone())))
+        } else {
+            None
+        };
     state.kernel_frames = sample
         .map(|s| s.kernel_callchain.clone())
         .unwrap_or_default();
@@ -94,6 +109,7 @@ pub(super) fn invoke(
         program.invoke(clause, state, &event);
     }
     state.js_snapshot = None;
+    state.register_snapshot = None;
     state.trace_fields.clear();
 }
 pub(super) fn invoke_kind(
@@ -185,6 +201,9 @@ pub(super) fn dispatch_function_events(
                 .with_syscall(&syscall_name);
             sample.sysno = event.syscall.as_ref().map(|e| e.number as u64).unwrap_or(0);
             sample.pid = event_pid as u64;
+            if !state.has_target_identity(event_pid as u32) {
+                state.register_target_identity(event_pid as u32)?;
+            }
             sample.tid = event.tid as u64;
             sample.nsecs = event_nsecs;
             sample.ip = event.regs.ip;
@@ -192,10 +211,14 @@ pub(super) fn dispatch_function_events(
             sample.retval = event.retval;
             sample.latency = event.latency;
             state.kernel_frames.clear();
+            state.js_snapshot = Some((event.regs, Vec::new()));
+            state.register_snapshot = Some(event.regs);
             state.capture_event_memory(&sample);
             if !state.stopped {
                 program.invoke(id, state, &sample);
             }
+            state.js_snapshot = None;
+            state.register_snapshot = None;
             if state.stopped {
                 break;
             }

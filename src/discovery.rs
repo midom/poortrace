@@ -16,6 +16,8 @@ pub struct FunctionMatch {
     pub path: String,
     pub name: String,
     pub offset: u64,
+    pub device: u64,
+    pub inode: u64,
 }
 
 pub struct Listing {
@@ -132,6 +134,8 @@ fn process_inner(pid: i32, pattern: &str, printable: bool) -> Result<Listing> {
                 path: mapping.path.clone(),
                 name: function.name.clone(),
                 offset: function.offset,
+                device: mapping.device,
+                inode: mapping.inode,
             });
             if printable {
                 let symbol = function_selector(function, names[function.name.as_str()] > 1)?;

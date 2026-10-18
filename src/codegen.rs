@@ -18,6 +18,8 @@ pub struct Program {
     kstack: bool,
     jsstack: bool,
     branches: bool,
+    registers: bool,
+    dwarf: bool,
     _engine: Engine,
 }
 impl Program {
@@ -57,6 +59,8 @@ impl Program {
             kstack: generator.kstack,
             jsstack: generator.jsstack,
             branches: generator.branches,
+            registers: generator.registers,
+            dwarf: generator.dwarf,
             _engine: engine,
         })
     }
@@ -66,6 +70,7 @@ impl Program {
             std::sync::Arc::ptr_eq(&state.origin, &self.origin),
             "State belongs to a different Program"
         );
+        state.first_event_ns.get_or_insert(event.nsecs);
         let mut recorded = state
             .recorder
             .as_ref()
@@ -118,6 +123,12 @@ impl Program {
     pub fn needs_jsstack(&self) -> bool {
         self.jsstack
     }
+    pub fn needs_registers(&self) -> bool {
+        self.registers
+    }
+    pub fn needs_dwarf(&self) -> bool {
+        self.dwarf
+    }
     pub fn needs_kstack(&self) -> bool {
         self.kstack
     }
@@ -125,27 +136,43 @@ impl Program {
         self.ustack
     }
     pub fn state<'a>(&self, writer: impl std::io::Write + 'a) -> State<'a> {
-        State::new(
+        let mut state = State::new(
             self.origin.clone(),
             self.specs.clone(),
             self.formats.clone(),
             writer,
-        )
+        );
+        if self.dwarf {
+            state.stack_mode = crate::runtime::StackMode::Dwarf;
+        }
+        state
     }
 }
 
 const PRELUDE: &str = "
 %Event = type { i64, i64, i64, i64, i64, i64, ptr, ptr, ptr, i64, i64, i64, i64, i64, i64, i64, [6 x i64], ptr, ptr, i64 }
 declare void @pt_map_update(ptr, i64, ptr, i64, i64, i64)
+declare void @pt_series_update(ptr, ptr, i64, ptr, i64, i64)
 declare i64 @pt_map_get(ptr, i64, ptr, i64)
 declare void @pt_printf(ptr, i64, ptr)
 declare void @pt_map_action(ptr, i64, i64)
+declare i64 @pt_map_query(ptr, i64, ptr, i64, i64)
+declare void @pt_map_print(ptr, i64, i64, i64)
 declare void @pt_exit(ptr)
+declare void @pt_exit_code(ptr, i64)
+declare void @pt_diagnostic(ptr, i64)
 declare i64 @pt_stopped(ptr)
 declare i64 @pt_streq(ptr, ptr)
 declare i64 @pt_ustack(ptr, ptr, i64)
 declare i64 @pt_helper(ptr, ptr, i64, i64, i64)
 ";
+
+#[derive(Default)]
+struct MapOptions {
+    float_linear: Option<(u64, u64, u64)>,
+    histogram_precision: u8,
+    series: Option<(u64, usize, Aggregate)>,
+}
 
 #[derive(Default)]
 struct Generator {
@@ -168,6 +195,8 @@ struct Generator {
     kstack: bool,
     jsstack: bool,
     branches: bool,
+    registers: bool,
+    dwarf: bool,
 }
 struct Value {
     reg: String,
@@ -289,6 +318,7 @@ impl Generator {
                     n.as_str(),
                     "kstack" | "asyncstack" | "jstack" | "dotnetstack" | "wasmstack"
                 ) || n == "ustack"
+                    || n == "dw_ustack"
                     || n == "branches"
                     || n == "pystack"
                     || n == "jsstack"
@@ -319,8 +349,165 @@ impl Generator {
             {
                 Type::String
             }
+            Expr::Builtin(name) | Expr::Call(name, _)
+                if crate::builtins::signature(name).is_some() =>
+            {
+                if let Expr::Call(_, args) = e {
+                    if name == "getopt"
+                        && args
+                            .get(1)
+                            .is_some_and(|arg| Self::infer_with(arg, types) == Type::String)
+                    {
+                        return Type::String;
+                    }
+                }
+                crate::builtins::signature(name).unwrap().0
+            }
             _ => Type::Number,
         }
+    }
+    fn constant(expr: &Expr) -> Option<i64> {
+        match expr {
+            Expr::Number(n) => Some(*n),
+            Expr::Builtin(name) if crate::builtins::constant(name).is_some() => {
+                Some(crate::builtins::constant(name)? as i64)
+            }
+            Expr::Builtin(n) if n == "true" => Some(1),
+            Expr::Builtin(n) if n == "false" => Some(0),
+            Expr::Unary(op, v) => {
+                let v = Self::constant(v)?;
+                Some(match op.as_str() {
+                    "-" => v.wrapping_neg(),
+                    "+" => v,
+                    "!" => (v == 0) as i64,
+                    "~" => !v,
+                    _ => return None,
+                })
+            }
+            Expr::Binary(op, a, b) => {
+                if matches!((&**a, &**b), (Expr::String(_), Expr::String(_))) {
+                    let (Expr::String(a), Expr::String(b)) = (&**a, &**b) else {
+                        return None;
+                    };
+                    return Some(match op.as_str() {
+                        "==" => (a == b) as i64,
+                        "!=" => (a != b) as i64,
+                        _ => return None,
+                    });
+                }
+                let a = Self::constant(a)?;
+                if op == "&&" && a == 0 {
+                    return Some(0);
+                }
+                if op == "||" && a != 0 {
+                    return Some(1);
+                }
+                let b = Self::constant(b)?;
+                Some(match op.as_str() {
+                    "+" => a.wrapping_add(b),
+                    "-" => a.wrapping_sub(b),
+                    "*" => a.wrapping_mul(b),
+                    "/" => {
+                        if b == 0 {
+                            0
+                        } else {
+                            a.wrapping_div(b)
+                        }
+                    }
+                    "%" => {
+                        if b == 0 {
+                            0
+                        } else {
+                            a.wrapping_rem(b)
+                        }
+                    }
+                    "<<" => a.wrapping_shl(b as u32 & 63),
+                    ">>" => a.wrapping_shr(b as u32 & 63),
+                    "&" => a & b,
+                    "|" => a | b,
+                    "^" => a ^ b,
+                    "==" => (a == b) as i64,
+                    "!=" => (a != b) as i64,
+                    "<" => (a < b) as i64,
+                    "<=" => (a <= b) as i64,
+                    ">" => (a > b) as i64,
+                    ">=" => (a >= b) as i64,
+                    "&&" => (a != 0 && b != 0) as i64,
+                    "||" => (a != 0 || b != 0) as i64,
+                    _ => return None,
+                })
+            }
+            Expr::Call(name, args) if name == "sizeof" && args.len() == 1 => match &args[0] {
+                Expr::String(ty) => Self::primitive_size(ty),
+                _ => Some(8),
+            },
+            Expr::Conditional(c, a, b) => {
+                Self::constant(if Self::constant(c)? != 0 { a } else { b })
+            }
+            _ => None,
+        }
+    }
+    fn constant_message(args: &[Expr]) -> Result<String> {
+        let Some(Expr::String(format)) = args.first() else {
+            return Err("fail requires a literal format string".into());
+        };
+        let format = Format::parse(format)?;
+        if format.types.len() + 1 != args.len() {
+            return Err("fail format argument count does not match".into());
+        }
+        let mut storage = Vec::new();
+        let mut values = Vec::new();
+        for (expr, ty) in args[1..].iter().zip(&format.types) {
+            values.push(match (expr, ty) {
+                (Expr::String(text), Type::String) => {
+                    let text = std::ffi::CString::new(text.as_str())
+                        .map_err(|_| "fail string contains NUL")?;
+                    let ptr = text.as_ptr() as u64;
+                    storage.push(text);
+                    ptr
+                }
+                (Expr::Float(value), Type::Float) => value.to_bits(),
+                (_, Type::Number) => {
+                    Self::constant(expr).ok_or("fail arguments must be constants")? as u64
+                }
+                _ => return Err("fail format argument has the wrong type".into()),
+            });
+        }
+        Ok(format.render(&values))
+    }
+    fn primitive_size(name: &str) -> Option<i64> {
+        let name = name.strip_prefix("__ctype__:").unwrap_or(name).trim();
+        if let Some((base, count)) = name.strip_suffix(']').and_then(|s| s.rsplit_once('[')) {
+            let count = count.trim().parse::<i64>().ok()?;
+            if !(0..=4096).contains(&count) {
+                return None;
+            }
+            return Self::primitive_size(base)?.checked_mul(count);
+        }
+        if name.ends_with('*') {
+            return Some(8);
+        }
+        Some(match name {
+            "char" | "signed char" | "unsigned char" | "int8_t" | "uint8_t" | "bool" | "_Bool" => 1,
+            "short" | "short int" | "unsigned short" | "unsigned short int" | "int16_t"
+            | "uint16_t" => 2,
+            "int" | "unsigned" | "unsigned int" | "signed" | "signed int" | "float" | "int32_t"
+            | "uint32_t" => 4,
+            "long"
+            | "long int"
+            | "unsigned long"
+            | "unsigned long int"
+            | "long long"
+            | "long long int"
+            | "unsigned long long"
+            | "unsigned long long int"
+            | "double"
+            | "int64_t"
+            | "uint64_t"
+            | "size_t" => 8,
+            "long double" => 16,
+            _ => return None,
+        })
     }
     fn aggregate(rhs: &Expr) -> Result<(Aggregate, Option<&Expr>)> {
         if let Expr::Call(name, args) = rhs {
@@ -332,17 +519,18 @@ impl Generator {
                 "avg" => Aggregate::Avg,
                 "hist" => Aggregate::Hist,
                 "lhist" => Aggregate::Lhist,
+                "stats" => Aggregate::Stats,
+                "tseries" => Aggregate::Tseries,
                 _ => return Ok((Aggregate::Set, Some(rhs))),
             };
-            if args.len()
-                != if agg == Aggregate::Count {
-                    0
-                } else if agg == Aggregate::Lhist {
-                    4
-                } else {
-                    1
-                }
-            {
+            let valid = match agg {
+                Aggregate::Count => args.is_empty(),
+                Aggregate::Lhist => args.len() == 4,
+                Aggregate::Tseries => matches!(args.len(), 3 | 4),
+                Aggregate::Hist => matches!(args.len(), 1 | 2),
+                _ => args.len() == 1,
+            };
+            if !valid {
                 return Err(format!("wrong number of arguments to {name}()"));
             }
             Ok((agg, args.first()))
@@ -356,8 +544,13 @@ impl Generator {
         agg: Aggregate,
         linear: Option<(i64, i64, i64)>,
         value_type: Type,
-        float_linear: Option<(u64, u64, u64)>,
+        options: MapOptions,
     ) -> Result<()> {
+        let MapOptions {
+            float_linear,
+            histogram_precision,
+            series,
+        } = options;
         if let Expr::Map(name, keys) = lhs {
             let types: Vec<_> = keys.iter().map(|key| self.infer(key)).collect();
             if let Some(id) = self.ids.get(name) {
@@ -367,6 +560,8 @@ impl Generator {
                     || old.linear != linear
                     || old.value_type != value_type
                     || old.float_linear != float_linear
+                    || old.histogram_precision != histogram_precision
+                    || old.series != series
                 {
                     return Err(format!("inconsistent key types or aggregation for @{name}"));
                 }
@@ -379,6 +574,8 @@ impl Generator {
                     linear,
                     value_type,
                     float_linear,
+                    histogram_precision,
+                    series,
                 });
                 self.local_types.insert(format!("@{name}"), value_type);
             }
@@ -475,7 +672,65 @@ impl Generator {
                     if !matches!(value_type, Type::Number | Type::Float) {
                         return Err("map values require numbers".into());
                     }
-                    self.declare_map(lhs, agg, linear, value_type, float_linear)?;
+                    let mut precision = 0;
+                    let mut series = None;
+                    if let Expr::Call(_, args) = rhs {
+                        if agg == Aggregate::Hist && args.len() == 2 {
+                            let Expr::Number(k) = args[1] else {
+                                return Err("hist subdivision must be a constant 0..5".into());
+                            };
+                            if !(0..=5).contains(&k) {
+                                return Err("hist subdivision must be 0..5".into());
+                            }
+                            precision = k as u8;
+                            if value_type == Type::Float && precision != 0 {
+                                return Err(
+                                    "hist subdivisions currently require integer inputs".into()
+                                );
+                            }
+                        }
+                        if agg == Aggregate::Tseries {
+                            if value_type != Type::Number {
+                                return Err("tseries requires integer values".into());
+                            }
+                            let (Expr::Number(interval), Expr::Number(limit)) =
+                                (&args[1], &args[2])
+                            else {
+                                return Err(
+                                    "tseries interval and capacity must be constants".into()
+                                );
+                            };
+                            if *interval <= 0 || !(1..=4096).contains(limit) {
+                                return Err(
+                                    "tseries requires a positive interval and 1..4096 intervals"
+                                        .into(),
+                                );
+                            }
+                            let operation = match args.get(3) {
+                                None => Aggregate::Set,
+                                Some(Expr::String(agg)) => match agg.as_str() {
+                                    "sum" => Aggregate::Sum,
+                                    "avg" => Aggregate::Avg,
+                                    "min" => Aggregate::Min,
+                                    "max" => Aggregate::Max,
+                                    _ => return Err("invalid tseries aggregation".into()),
+                                },
+                                _ => return Err("tseries aggregation must be a literal".into()),
+                            };
+                            series = Some((*interval as u64, *limit as usize, operation));
+                        }
+                    }
+                    self.declare_map(
+                        lhs,
+                        agg,
+                        linear,
+                        value_type,
+                        MapOptions {
+                            float_linear,
+                            histogram_precision: precision,
+                            series,
+                        },
+                    )?;
                 }
                 Stmt::Increment(lhs, _) => {
                     let ty = if let Expr::Map(name, _) = lhs {
@@ -486,7 +741,7 @@ impl Generator {
                     } else {
                         Type::Number
                     };
-                    self.declare_map(lhs, Aggregate::Set, None, ty, None)?;
+                    self.declare_map(lhs, Aggregate::Set, None, ty, MapOptions::default())?;
                 }
                 Stmt::Repeat(_, body) | Stmt::While(_, body) => self.declare_maps(body)?,
                 Stmt::For(key, value, map, body) => {
@@ -688,6 +943,7 @@ impl Generator {
     }
     fn expr(&mut self, expr: &Expr) -> Result<Value> {
         match expr {
+            Expr::Tuple(_) => Err("tuples are currently supported as map-key arguments".into()),
             Expr::Float(n) => Ok(Value {
                 reg: n.to_bits().to_string(),
                 ty: Type::Float,
@@ -710,6 +966,17 @@ impl Generator {
                 Ok(self.value(format!("ptrtoint ptr @str{id} to i64"), Type::String))
             }
             Expr::Builtin(name) => {
+                if let Some(value) = crate::builtins::constant(name) {
+                    return Ok(Value {
+                        reg: value.to_string(),
+                        ty: Type::Number,
+                    });
+                }
+                if crate::builtins::signature(name).is_some_and(|(_, min, _)| min == 0)
+                    && !matches!(name.as_str(), "nsecs" | "comm")
+                {
+                    return self.compat_call(name, &[]);
+                }
                 if name == "managedstacks" {
                     return self.helper(154, "0".into(), 127, Type::String);
                 }
@@ -897,6 +1164,41 @@ impl Generator {
                     self.specs[id].value_type,
                 ))
             }
+            Expr::Call(name, args) if name == "sizeof" && args.len() == 1 => {
+                if let Expr::String(ty) = &args[0] {
+                    if let Some(size) = Self::primitive_size(ty) {
+                        return Ok(Value {
+                            reg: size.to_string(),
+                            ty: Type::Number,
+                        });
+                    }
+                    let ty = ty.strip_prefix("__ctype__:").unwrap_or(ty);
+                    let descriptor = serde_json::to_string(&(
+                        "",
+                        ty.strip_prefix("struct ")
+                            .or_else(|| ty.strip_prefix("union "))
+                            .or_else(|| ty.strip_prefix("enum "))
+                            .unwrap_or(ty),
+                        "",
+                    ))
+                    .map_err(|e| e.to_string())?;
+                    let pointer = self.expr(&Expr::String(descriptor))?.reg;
+                    return Ok(self.value(format!("call i64 @pt_helper(ptr %state, ptr %event, i64 42, i64 0, i64 {pointer})"),Type::Number));
+                }
+                let size = if let Expr::Local(local) = &args[0] {
+                    if self.arrays.contains_key(local) {
+                        2048
+                    } else {
+                        8
+                    }
+                } else {
+                    8
+                };
+                Ok(Value {
+                    reg: size.to_string(),
+                    ty: Type::Number,
+                })
+            }
             Expr::Call(name, args) if self.definitions.contains_key(name) => {
                 self.native_call(name, args)
             }
@@ -931,6 +1233,39 @@ impl Generator {
                     address,
                     length,
                     if op >= 3 { Type::Number } else { Type::String },
+                )
+            }
+            Expr::Call(name, args)
+                if matches!(name.as_str(), "ustack" | "kstack")
+                    && matches!(args.first(), Some(Expr::Builtin(_) | Expr::String(_))) =>
+            {
+                let mode = match &args[0] {
+                    Expr::Builtin(mode) | Expr::String(mode) => mode.as_str(),
+                    _ => unreachable!(),
+                };
+                if !matches!(mode, "raw" | "perf" | "bpftrace") {
+                    return Err("stack format must be raw, perf or bpftrace".into());
+                }
+                let depth = match &args[1..] {
+                    [] => 127,
+                    [Expr::Number(n)] if (1..=127).contains(n) => *n,
+                    _ => return Err("stack depth must be a constant 1..127".into()),
+                };
+                if mode == "bpftrace" {
+                    return self.expr(&Expr::Call(name.clone(), vec![Expr::Number(depth)]));
+                }
+                if name == "ustack" {
+                    self.ustack = true;
+                } else {
+                    self.kstack = true;
+                }
+                self.compat_call(
+                    "__stack_format",
+                    &[
+                        Expr::String(if name == "ustack" { "user" } else { "kernel" }.into()),
+                        Expr::String(mode.into()),
+                        Expr::Number(depth),
+                    ],
                 )
             }
             Expr::Call(name, args)
@@ -1284,6 +1619,10 @@ impl Generator {
                     Type::Number,
                 ))
             }
+            Expr::Call(name, args) if name == "dw_ustack" => {
+                self.dwarf = true;
+                self.expr(&Expr::Call("ustack".into(), args.clone()))
+            }
             Expr::Call(name, args)
                 if name == "ustack"
                     || name == "pystack"
@@ -1310,6 +1649,62 @@ impl Generator {
                 } else {
                     self.stack(depth)
                 }
+            }
+            Expr::Call(name, args)
+                if matches!(name.as_str(), "has_key" | "find" | "delete")
+                    || name == "len"
+                        && matches!(args.first(),Some(Expr::Map(_,keys)) if keys.is_empty()) =>
+            {
+                self.map_query(name, args)
+            }
+            Expr::Call(name, args) if crate::builtins::signature(name).is_some() => {
+                self.compat_call(name, args)
+            }
+            Expr::Call(name, args)
+                if args.is_empty()
+                    && matches!(
+                        name.as_str(),
+                        "pid" | "tid" | "cpu" | "comm" | "probe" | "retval"
+                    ) =>
+            {
+                self.expr(&Expr::Builtin(name.clone()))
+            }
+            Expr::Call(name, args)
+                if matches!(
+                    name.as_str(),
+                    "is_array"
+                        | "is_integer"
+                        | "is_unsigned_integer"
+                        | "is_str"
+                        | "is_ptr"
+                        | "is_literal"
+                        | "is_err"
+                        | "assert_str"
+                ) =>
+            {
+                let [arg] = args.as_slice() else {
+                    return Err(format!("{name} requires one expression"));
+                };
+                let ty = self.infer(arg);
+                let yes = match name.as_str() {
+                    "is_array" => matches!(arg,Expr::Local(n) if self.arrays.contains_key(n)),
+                    "is_integer" => ty == Type::Number,
+                    "is_str" | "assert_str" => matches!(ty, Type::String | Type::Stack),
+                    "is_literal" => {
+                        matches!(arg, Expr::String(_) | Expr::Number(_) | Expr::Float(_))
+                    }
+                    "is_ptr" => {
+                        matches!(arg,Expr::Call(n,_) if matches!(n.as_str(),"uptr"|"uaddr"|"kaddr"))
+                    }
+                    _ => false,
+                };
+                if name == "assert_str" && !yes {
+                    return Err("assert_str requires a string-like expression".into());
+                }
+                Ok(Value {
+                    reg: (yes as u64).to_string(),
+                    ty: Type::Number,
+                })
             }
             Expr::Call(name, _) => Err(format!(
                 "{name}() cannot be used here; aggregations must be assigned directly to maps"
@@ -1680,7 +2075,11 @@ impl Generator {
                         "1".into()
                     };
                     let (id, array) = self.keys(name, keys)?;
-                    self.emit(format!("call void @pt_map_update(ptr %state, i64 {id}, ptr {array}, i64 {}, i64 {value}, i64 {})", keys.len(), agg as u64));
+                    if agg == Aggregate::Tseries {
+                        self.emit(format!("call void @pt_series_update(ptr %state, ptr %event, i64 {id}, ptr {array}, i64 {}, i64 {value})",keys.len()));
+                    } else {
+                        self.emit(format!("call void @pt_map_update(ptr %state, i64 {id}, ptr {array}, i64 {}, i64 {value}, i64 {})", keys.len(), agg as u64));
+                    }
                 }
                 Stmt::Assign(Expr::Array(name, index), rhs) => {
                     let value = self.expr(rhs)?;
@@ -1872,6 +2271,10 @@ impl Generator {
                     self.label(&done);
                 }
                 Stmt::If(e, yes, no) => {
+                    if let Some(condition) = Self::constant(e) {
+                        self.stmts(if condition != 0 { yes } else { no })?;
+                        continue;
+                    }
                     let v = self.truth(e)?;
                     let c = self.value(format!("icmp ne i64 {v}, 0"), Type::Number).reg;
                     let y = self.label_name();
@@ -1942,11 +2345,40 @@ impl Generator {
                         self.output_value("%s", value)?;
                     }
                     "delete" => {
-                        let [Expr::Map(name, keys)] = args.as_slice() else {
-                            return Err("delete requires one map entry".into());
+                        self.map_query("delete", args)?;
+                    }
+                    "zero" => {
+                        let [Expr::Map(map, keys)] = args.as_slice() else {
+                            return Err("zero requires one whole map".into());
                         };
-                        let (id, array) = self.keys(name, keys)?;
-                        self.emit(format!("call void @pt_map_update(ptr %state, i64 {id}, ptr {array}, i64 {}, i64 0, i64 8)",keys.len()));
+                        if !keys.is_empty() {
+                            return Err("zero requires a whole map".into());
+                        }
+                        let id = self.ids.get(map).ok_or("map is never assigned")?;
+                        self.emit(format!(
+                            "call void @pt_map_action(ptr %state, i64 {id}, i64 2)"
+                        ));
+                    }
+                    "print" if args.len() > 1 => {
+                        let Some(Expr::Map(map, keys)) = args.first() else {
+                            return Err(
+                                "print(value) accepts one argument; top/div apply to whole maps"
+                                    .into(),
+                            );
+                        };
+                        if !keys.is_empty() || args.len() > 3 {
+                            return Err("print requires a whole map and optional top/div".into());
+                        }
+                        let id = *self.ids.get(map).ok_or("map is never assigned")?;
+                        let top = self.numeric(&args[1])?;
+                        let div = if let Some(expr) = args.get(2) {
+                            self.numeric(expr)?
+                        } else {
+                            "1".into()
+                        };
+                        self.emit(format!(
+                            "call void @pt_map_print(ptr %state, i64 {id}, i64 {top}, i64 {div})"
+                        ));
                     }
                     "print" if !matches!(args.as_slice(), [Expr::Map(_, keys)] if keys.is_empty()) =>
                     {
@@ -1977,7 +2409,47 @@ impl Generator {
                             if name == "print" { 0 } else { 1 }
                         ));
                     }
-                    "exit" if args.is_empty() => self.emit("call void @pt_exit(ptr %state)"),
+                    name if crate::builtins::signature(name).is_some() => {
+                        let value = self.compat_call(name, args)?;
+                        if matches!(name, "cat" | "system" | "join") {
+                            self.output_value("%s", value)?;
+                        } else if matches!(name, "errorf" | "warnf") {
+                            self.emit(format!(
+                                "call void @pt_diagnostic(ptr %state, i64 {})",
+                                value.reg
+                            ));
+                        }
+                    }
+                    "static_assert" | "fail" => {
+                        if name == "fail" {
+                            return Err(format!("fail(): {}", Self::constant_message(args)?));
+                        }
+                        if !(1..=2).contains(&args.len()) {
+                            return Err(
+                                "static_assert requires a condition and optional literal message"
+                                    .into(),
+                            );
+                        }
+                        let condition = Self::constant(&args[0])
+                            .ok_or("static_assert requires a constant expression")?;
+                        if condition == 0 {
+                            return Err(match args.get(1) {
+                                Some(Expr::String(message)) => message.clone(),
+                                _ => "static assertion failed".into(),
+                            });
+                        }
+                    }
+                    "assert_str" => {
+                        self.expr(&Expr::Call(name.clone(), args.clone()))?;
+                    }
+                    "exit" => {
+                        let value = match args.as_slice() {
+                            [] => "0".into(),
+                            [expr] => self.numeric(expr)?,
+                            _ => return Err("exit accepts zero or one status".into()),
+                        };
+                        self.emit(format!("call void @pt_exit_code(ptr %state, i64 {value})"));
+                    }
                     _ => return Err(format!("unknown function or invalid arguments: {name}()")),
                 },
             }
@@ -1990,6 +2462,170 @@ impl Generator {
             self.label(&next);
         }
         Ok(())
+    }
+    fn map_query(&mut self, name: &str, args: &[Expr]) -> Result<Value> {
+        let Some(Expr::Map(map, old_keys)) = args.first() else {
+            return Err(format!("{name} requires a map"));
+        };
+        let mut keys = old_keys.clone();
+        if name == "find" && args.len() < 2 {
+            return Err("find requires a map key and output local".into());
+        }
+        let end = args.len() - usize::from(name == "find");
+        for arg in &args[1..end] {
+            if let Expr::Tuple(parts) = arg {
+                keys.extend(parts.clone());
+            } else {
+                keys.push(arg.clone());
+            }
+        }
+        let id = *self
+            .ids
+            .get(map)
+            .ok_or_else(|| format!("map @{map} is never assigned"))?;
+        if name == "len" {
+            if args.len() != 1 || !keys.is_empty() || self.specs[id].keys.is_empty() {
+                return Err("len requires a keyed whole map".into());
+            }
+            return Ok(self.value(
+                format!("call i64 @pt_map_query(ptr %state, i64 {id}, ptr null, i64 0, i64 1)"),
+                Type::Number,
+            ));
+        }
+        if self.specs[id].keys.is_empty() && name != "delete" {
+            return Err(format!("{name} requires a keyed map"));
+        }
+        let (id, array) = self.keys(map, &keys)?;
+        let op = if name == "delete" { 2 } else { 0 };
+        let found = self.value(
+            format!(
+                "call i64 @pt_map_query(ptr %state, i64 {id}, ptr {array}, i64 {}, i64 {op})",
+                keys.len()
+            ),
+            Type::Number,
+        );
+        if name == "find" {
+            let Some(Expr::Local(local)) = args.last() else {
+                return Err("find requires a local output variable".into());
+            };
+            let ty = self.specs[id].value_type;
+            let ptr = if let Some(ptr) = self.locals.get(local) {
+                if self.local_types.get(local).copied().unwrap_or(Type::Number) != ty {
+                    return Err("find output type differs from map value".into());
+                }
+                ptr.clone()
+            } else {
+                return Err("initialize the find output local before calling find()".into());
+            };
+            let condition = self
+                .value(format!("icmp ne i64 {}, 0", found.reg), Type::Number)
+                .reg;
+            let yes = self.label_name();
+            let done = self.label_name();
+            self.emit(format!("br i1 {condition}, label %{yes}, label %{done}"));
+            self.label(&yes);
+            let value = self
+                .value(
+                    format!(
+                        "call i64 @pt_map_get(ptr %state, i64 {id}, ptr {array}, i64 {})",
+                        keys.len()
+                    ),
+                    ty,
+                )
+                .reg;
+            self.emit(format!("store i64 {value}, ptr {ptr}"));
+            self.emit(format!("br label %{done}"));
+            self.label(&done);
+        }
+        Ok(found)
+    }
+    fn compat_call(&mut self, name: &str, args: &[Expr]) -> Result<Value> {
+        if let Some(reason) = crate::builtins::unavailable(name) {
+            return Err(format!("{name}() unavailable: {reason}"));
+        }
+        if name == "nsecs" {
+            if let [Expr::Builtin(mode)] = args {
+                if matches!(mode.as_str(), "monotonic" | "boot" | "tai" | "sw_tai") {
+                    return self.compat_call(name, &[Expr::String(mode.clone())]);
+                }
+            }
+        }
+        if matches!(name, "cat" | "system" | "errorf" | "warnf") {
+            let Some(Expr::String(format)) = args.first() else {
+                return Err(format!("{name} requires a literal format string"));
+            };
+            let format = Format::parse(format)?;
+            if format.types.len() + 1 != args.len() {
+                return Err(format!("{name} format argument count does not match"));
+            }
+            for (expr, ty) in args[1..].iter().zip(&format.types) {
+                let actual = self.infer(expr);
+                if actual != *ty && !(actual == Type::Stack && *ty == Type::String) {
+                    return Err(format!("{name} format argument has the wrong type"));
+                }
+            }
+        }
+        if name == "bswap" && args.len() == 1 {
+            if let Expr::Call(cast, _) = &args[0] {
+                if matches!(
+                    cast.as_str(),
+                    "u8" | "i8" | "u16" | "i16" | "u32" | "i32" | "u64" | "i64"
+                ) {
+                    let bits = cast[1..].parse::<i64>().map_err(|e| e.to_string())?;
+                    return self.compat_call(name, &[args[0].clone(), Expr::Number(bits)]);
+                }
+            }
+        }
+        let (mut ty, min, max) = crate::builtins::signature(name).ok_or("unknown helper")?;
+        if args.len() < min || args.len() > max {
+            return Err(format!("{name} requires {min}..{max} arguments"));
+        }
+        let mut values = Vec::new();
+        for arg in args {
+            values.push(self.expr(arg)?);
+        }
+        if name == "reg" {
+            self.registers = true;
+        }
+        if name == "getopt" && values.get(1).is_some_and(|v| v.ty == Type::String) {
+            ty = Type::String;
+        }
+        if values.iter().any(|value| value.ty == Type::Float)
+            && !matches!(name, "cat" | "system" | "errorf" | "warnf")
+        {
+            return Err(format!("{name} does not accept floating-point arguments"));
+        }
+        let descriptor =
+            serde_json::to_string(&(name, values.iter().map(|v| v.ty as u64).collect::<Vec<_>>()))
+                .map_err(|e| e.to_string())?;
+        let descriptor = self.expr(&Expr::String(descriptor))?.reg;
+        let array = self
+            .value(
+                format!("alloca [{} x i64]", values.len().max(1)),
+                Type::Number,
+            )
+            .reg;
+        for (index, value) in values.iter().enumerate() {
+            let ptr = self
+                .value(
+                    format!("getelementptr i64, ptr {array}, i64 {index}"),
+                    Type::Number,
+                )
+                .reg;
+            self.emit(format!("store i64 {}, ptr {ptr}", value.reg));
+        }
+        let pointer = self
+            .value(format!("ptrtoint ptr {array} to i64"), Type::Number)
+            .reg;
+        if name == "len" && !values.first().is_some_and(|value| value.ty == Type::Stack) {
+            return Err("len requires a keyed whole map or stack".into());
+        }
+        let op = if matches!(ty, Type::String | Type::Stack) {
+            200
+        } else {
+            201
+        };
+        Ok(self.value(format!("call i64 @pt_helper(ptr %state, ptr %event, i64 {op}, i64 {pointer}, i64 {descriptor})"),ty))
     }
     fn output_value(&mut self, format: &str, value: Value) -> Result<()> {
         let format = Format::parse(format)?;

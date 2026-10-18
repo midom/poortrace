@@ -51,6 +51,8 @@ fn cli_json_and_recording_replay_preserve_measurement_context() {
 #[test]
 fn report_envelopes_import_legacy_arrays_and_profiles_embed_labels_safely() {
     let rows = vec![Row {
+        stats: None,
+        series: Vec::new(),
         map: "x".into(),
         keys: vec![],
         value: 1,

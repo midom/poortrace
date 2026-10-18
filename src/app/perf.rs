@@ -50,7 +50,7 @@ pub(super) fn run(args: Args, program: Program) -> Result<i32> {
             &mut streams,
             false,
             child.is_some(),
-            capture,
+            (capture, &std::collections::BTreeSet::new()),
         )?;
     }
     if !args.quiet {
@@ -69,9 +69,14 @@ pub(super) fn run(args: Args, program: Program) -> Result<i32> {
     let mut state = program.state(io::BufWriter::new(stdout.lock()));
     configure_report(&mut state, &args, &program, "perf")?;
     configure_record(&mut state, &args, &program)?;
+    state.child_pid = child.as_ref().map(|child| child.pid as u64);
+    if let Some(pid) = state.child_pid {
+        state.register_target_identity(pid as u32)?;
+    }
     state.max_entries = args.max_map_entries as usize;
     invoke_kind(&program, &mut state, target, true);
     state.flush()?;
+    super::perf::apply_unwatched(&mut streams, &state.unwatched)?;
     if !state.stopped {
         for s in &streams {
             if !s.on_exec {
@@ -133,7 +138,7 @@ pub(super) fn run(args: Args, program: Program) -> Result<i32> {
                         &mut streams,
                         true,
                         false,
-                        capture,
+                        (capture, &state.unwatched),
                     )?;
                 }
                 refresh = Instant::now();
@@ -236,6 +241,9 @@ pub(super) fn run(args: Args, program: Program) -> Result<i32> {
     }
     result?;
     child_record_result?;
+    if state.exit_set {
+        return Ok(state.exit_code);
+    }
     Ok(child
         .as_ref()
         .filter(|c| !c.terminated_by_tracer)
@@ -261,8 +269,9 @@ pub(super) fn attach(
     streams: &mut Vec<Stream>,
     enabled: bool,
     on_exec: bool,
-    capture: Capture,
+    context: (Capture, &BTreeSet<u64>),
 ) -> Result<()> {
+    let (capture, unwatched) = context;
     if !program.has_perf() {
         return Ok(());
     }
@@ -282,6 +291,9 @@ pub(super) fn attach(
     let mut pending = Vec::new();
     for (clause, c) in program.clauses.iter().enumerate() {
         for (name, probe) in &c.probes {
+            if matches!(probe,Probe::Watchpoint{address,..} if unwatched.contains(address)) {
+                continue;
+            }
             if !probe.is_perf() || capture.ptrace_functions && matches!(probe, Probe::Uprobe { .. })
             {
                 continue;
@@ -440,19 +452,25 @@ pub(super) fn drain(
                 }
             }
             match record {
-                Record::Sample(sample) if !state.stopped => invoke(
-                    program,
-                    stream.clause,
-                    state,
-                    Some(sample.pid as i32),
-                    &stream.name,
-                    Some(&sample),
-                    if stream.event.system_wide() {
-                        None
-                    } else {
-                        Some(&stream.comm)
-                    },
-                ),
+                Record::Sample(sample)
+                    if !state.stopped
+                        && !watch_address(&stream.name)
+                            .is_some_and(|address| state.unwatched.contains(&address)) =>
+                {
+                    invoke(
+                        program,
+                        stream.clause,
+                        state,
+                        Some(sample.pid as i32),
+                        &stream.name,
+                        Some(&sample),
+                        if stream.event.system_wide() {
+                            None
+                        } else {
+                            Some(&stream.comm)
+                        },
+                    )
+                }
                 Record::Comm { tid, name, .. } if tid as i32 == stream.tid => {
                     stream.comm = CString::new(name).unwrap()
                 }
@@ -498,6 +516,30 @@ pub(super) fn drain(
             }
         }
     }
+    apply_unwatched(streams, &state.unwatched)?;
     streams.retain(|s| !s.hup);
+    Ok(())
+}
+
+pub(super) fn watch_address(name: &str) -> Option<u64> {
+    let address = name.strip_prefix("watchpoint:")?.split(':').next()?;
+    if let Some(hex) = address.strip_prefix("0x") {
+        u64::from_str_radix(hex, 16).ok()
+    } else {
+        address.parse().ok()
+    }
+}
+pub(super) fn apply_unwatched(streams: &mut Vec<Stream>, unwatched: &BTreeSet<u64>) -> Result<()> {
+    if unwatched.is_empty() {
+        return Ok(());
+    }
+    for stream in streams.iter() {
+        if watch_address(&stream.name).is_some_and(|address| unwatched.contains(&address)) {
+            stream.event.disable()?;
+        }
+    }
+    streams.retain(|stream| {
+        !watch_address(&stream.name).is_some_and(|address| unwatched.contains(&address))
+    });
     Ok(())
 }

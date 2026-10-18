@@ -42,6 +42,8 @@ pub struct UserRegs {
     pub fp: u64,
     pub lr: u64,
     pub runtime_g: u64,
+    pub extra: [u64; 32],
+    pub valid: u64,
 }
 #[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 pub struct Capture {
@@ -59,6 +61,8 @@ pub struct Capture {
     pub offcpu: bool,
     pub uprobe: bool,
     pub retprobe: bool,
+    #[serde(default)]
+    pub full_regs: bool,
 }
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Sample {
@@ -72,6 +76,7 @@ pub struct Sample {
     pub kernel_callchain: Vec<u64>,
     pub addr: u64,
     pub regs: Option<UserRegs>,
+    pub kernel_regs: Option<UserRegs>,
     pub stack: Vec<u8>,
     pub branches: Vec<Branch>,
     pub offcpu_ns: u64,
@@ -292,7 +297,7 @@ impl PerfEvent {
                 | if capture.raw { 1 << 10 } else { 0 }
                 | if capture.kernel_regs { 1 << 18 } else { 0 }
                 | if capture.branches { 1 << 11 } else { 0 }
-                | if capture.dwarf_stack != 0 || capture.uprobe {
+                | if capture.dwarf_stack != 0 || capture.uprobe || capture.full_regs {
                     1 << 12
                 } else {
                     0
@@ -327,15 +332,15 @@ impl PerfEvent {
             config1,
             config2,
             branch_type: if capture.branches { 1 | 8 } else { 0 },
-            regs_user: if capture.dwarf_stack != 0 || capture.uprobe {
-                register_mask(capture.uprobe)
+            regs_user: if capture.dwarf_stack != 0 || capture.uprobe || capture.full_regs {
+                register_mask(capture.uprobe, capture.full_regs)
             } else {
                 0
             },
             stack_user: capture.dwarf_stack,
             clockid: libc::CLOCK_MONOTONIC,
             regs_intr: if capture.kernel_regs {
-                register_mask(true)
+                register_mask(true, capture.full_regs)
             } else {
                 0
             },
@@ -539,7 +544,10 @@ fn open_error(tid: i32, error: io::Error) -> String {
 }
 
 #[cfg(target_arch = "x86_64")]
-fn register_mask(arguments: bool) -> u64 {
+fn register_mask(arguments: bool, full: bool) -> u64 {
+    if full {
+        return 0xfff | (0xff << 16);
+    }
     (1 << 22)
         | (1 << 6)
         | (1 << 7)
@@ -551,7 +559,10 @@ fn register_mask(arguments: bool) -> u64 {
         }
 }
 #[cfg(target_arch = "aarch64")]
-fn register_mask(arguments: bool) -> u64 {
+fn register_mask(arguments: bool, full: bool) -> u64 {
+    if full {
+        return (1u64 << 33) - 1;
+    }
     (1 << 28) | (1 << 29) | (1 << 30) | (1 << 31) | (1 << 32) | if arguments { 63 } else { 0 }
 }
 #[cfg(test)]
@@ -677,7 +688,7 @@ fn decode_capture(bytes: &[u8], capture: Capture) -> Result<Record> {
                     }
                 }
             }
-            if capture.dwarf_stack != 0 || capture.uprobe {
+            if capture.dwarf_stack != 0 || capture.uprobe || capture.full_regs {
                 let abi = c.word()?;
                 if abi != 0 {
                     if abi != 2 {
@@ -685,7 +696,7 @@ fn decode_capture(bytes: &[u8], capture: Capture) -> Result<Record> {
                     }
                     let mut values = [0u64; 33];
                     for (index, value) in values.iter_mut().enumerate() {
-                        if register_mask(capture.uprobe) & (1u64 << index) != 0 {
+                        if register_mask(capture.uprobe, capture.full_regs) & (1u64 << index) != 0 {
                             *value = c.word()?;
                         }
                     }
@@ -697,6 +708,8 @@ fn decode_capture(bytes: &[u8], capture: Capture) -> Result<Record> {
                             ip: values[8],
                             lr: 0,
                             runtime_g: values[22],
+                            extra: values[..32].try_into().unwrap(),
+                            valid: register_mask(capture.uprobe, capture.full_regs),
                         },
                         [
                             values[5], values[4], values[3], values[2], values[16], values[17],
@@ -711,6 +724,8 @@ fn decode_capture(bytes: &[u8], capture: Capture) -> Result<Record> {
                             sp: values[31],
                             ip: values[32],
                             runtime_g: values[28],
+                            extra: values[..32].try_into().unwrap(),
+                            valid: register_mask(capture.uprobe, capture.full_regs),
                         },
                         values[..6].try_into().unwrap(),
                         values[0] as i64,
@@ -746,9 +761,33 @@ fn decode_capture(bytes: &[u8], capture: Capture) -> Result<Record> {
                     }
                     let mut values = [0u64; 33];
                     for (index, value) in values.iter_mut().enumerate() {
-                        if register_mask(true) & (1u64 << index) != 0 {
+                        if register_mask(true, capture.full_regs) & (1u64 << index) != 0 {
                             *value = c.word()?;
                         }
+                    }
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        sample.kernel_regs = Some(UserRegs {
+                            ip: values[8],
+                            sp: values[7],
+                            fp: values[6],
+                            lr: 0,
+                            runtime_g: values[22],
+                            extra: values[..32].try_into().unwrap(),
+                            valid: register_mask(true, capture.full_regs),
+                        });
+                    }
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        sample.kernel_regs = Some(UserRegs {
+                            ip: values[32],
+                            sp: values[31],
+                            fp: values[29],
+                            lr: values[30],
+                            runtime_g: values[28],
+                            extra: values[..32].try_into().unwrap(),
+                            valid: register_mask(true, capture.full_regs),
+                        });
                     }
                     #[cfg(target_arch = "x86_64")]
                     {
@@ -1144,7 +1183,7 @@ mod extended_tests {
             bytes.extend(word.to_ne_bytes());
         }
         for index in 0..33 {
-            if register_mask(true) & (1 << index) != 0 {
+            if register_mask(true, false) & (1 << index) != 0 {
                 bytes.extend((index as u64 + 1000).to_ne_bytes());
             }
         }
@@ -1240,7 +1279,7 @@ mod kernel_capture_tests {
         data.extend(0u64.to_ne_bytes());
         data.extend(2u64.to_ne_bytes());
         for i in 0..33 {
-            if register_mask(true) & (1u64 << i) != 0 {
+            if register_mask(true, false) & (1u64 << i) != 0 {
                 data.extend((i as u64 + 100).to_ne_bytes());
             }
         }
@@ -1279,5 +1318,55 @@ mod kernel_capture_tests {
         }
         data[40..44].copy_from_slice(&u32::MAX.to_ne_bytes());
         assert!(decode_capture(&header(&data), capture).is_err());
+    }
+}
+
+#[cfg(test)]
+mod full_register_tests {
+    use super::*;
+    #[test]
+    fn complete_user_and_kernel_banks_are_separate_and_truncation_is_rejected() {
+        for kernel in [false, true] {
+            let capture = Capture {
+                full_regs: true,
+                kernel_regs: kernel,
+                ..Default::default()
+            };
+            let mut payload = Vec::new();
+            for value in [0x1234u64, (43 << 32) | 42, 100, 3, 1] {
+                payload.extend(value.to_ne_bytes());
+            }
+            if kernel {
+                payload.extend(0u64.to_ne_bytes());
+            }
+            payload.extend(2u64.to_ne_bytes());
+            for index in 0..33 {
+                if register_mask(kernel, true) & (1 << index) != 0 {
+                    payload.extend((0x9000u64 + index).to_ne_bytes());
+                }
+            }
+            let mut bytes = 9u32.to_ne_bytes().to_vec();
+            bytes.extend(0u16.to_ne_bytes());
+            bytes.extend(((payload.len() + 8) as u16).to_ne_bytes());
+            bytes.extend(payload);
+            let Record::Sample(sample) = decode_capture(&bytes, capture).unwrap() else {
+                panic!()
+            };
+            let regs = if kernel {
+                assert!(sample.regs.is_none());
+                sample.kernel_regs.unwrap()
+            } else {
+                assert!(sample.kernel_regs.is_none());
+                sample.regs.unwrap()
+            };
+            assert_eq!(regs.extra[0], 0x9000);
+            assert_ne!(regs.valid & 1, 0);
+            #[cfg(target_arch = "aarch64")]
+            assert_eq!(regs.ip, 0x9020);
+            #[cfg(target_arch = "x86_64")]
+            assert_eq!(regs.ip, 0x9008);
+            bytes.pop();
+            assert!(decode_capture(&bytes, capture).is_err());
+        }
     }
 }

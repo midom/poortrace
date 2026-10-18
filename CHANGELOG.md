@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Expand userspace bpftrace helper support: map queries/stats/time series, strings and networking, identity/symbol/register helpers, diagnostics, script arguments, stack formats, and exit statuses. Add explicitly gated commands/signals/writes and session watchpoint removal, with captured-result replay and specific no-BPF capability errors. See the helper compatibility guide for limits and differences.
+
 - Allow `print()` on scalar values, expressions, and map entries; add formatted wall-clock output with `time()` and capture its text for deterministic replay.
 
 - Wake ptrace function loops on child-status notifications, resume targets immediately after safe breakpoint rearming, and avoid redundant per-hit thread scans. Add exact-count hot-loop regressions and a reproducible function throughput benchmark.

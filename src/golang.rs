@@ -373,6 +373,7 @@ impl Reader {
                 fp: layout.field(pid, g, "g.sched.bp")?,
                 lr: layout.field(pid, g, "g.sched.lr")?,
                 runtime_g: g,
+                ..Default::default()
             };
             if regs.sp < before.2 || regs.sp >= before.3 {
                 continue;

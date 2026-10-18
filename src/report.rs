@@ -17,6 +17,10 @@ pub struct Row {
     pub float_value: Option<f64>,
     #[serde(default)]
     pub buckets: Vec<(String, i64)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stats: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub series: Vec<(u64, i64)>,
 }
 /// Measurement context travels with exported results. Unknown loss is not zero loss.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -156,6 +160,16 @@ pub fn render(rows: &[Row], options: &Options) -> Result<String> {
     {
         return Err("reports require finite floating-point values".into());
     }
+    if rows
+        .iter()
+        .any(|row| row.stats.is_some() || !row.series.is_empty())
+        && (!options.baseline.is_empty()
+            || options.percent
+            || options.rate
+            || !options.quantiles.is_empty())
+    {
+        return Err("stats/tseries reports require text or JSON without scalar comparison/rate/percent options".into());
+    }
     let mut rows = rows.to_vec();
     let mut old = BTreeMap::new();
     for row in &options.baseline {
@@ -262,6 +276,20 @@ pub fn render(rows: &[Row], options: &Options) -> Result<String> {
                     }
                     out.push(']');
                 }
+                if let Some(stats) = &row.stats {
+                    out.push_str(&format!(
+                        ": count {}, average {}, total {}\n",
+                        stats["count"], stats["average"], stats["total"]
+                    ));
+                    continue;
+                }
+                if !row.series.is_empty() {
+                    out.push_str(":\n");
+                    for (time, value) in &row.series {
+                        out.push_str(&format!("  {time}: {value}\n"));
+                    }
+                    continue;
+                }
                 if !row.buckets.is_empty() {
                     out.push_str(":\n");
                     for (label, count) in &row.buckets {
@@ -321,6 +349,13 @@ pub fn render(rows: &[Row], options: &Options) -> Result<String> {
 }
 
 fn stacks(rows: &[Row], signed: bool) -> Result<Vec<(Vec<String>, i64)>> {
+    if rows
+        .iter()
+        .any(|row| row.stats.is_some() || !row.series.is_empty())
+    {
+        return Err("stack profile weights require scalar maps, not stats/tseries".into());
+    }
+
     if rows.iter().any(|row| row.float_value.is_some()) {
         return Err("stack profile exports require integer weights; use text or JSON for floating-point maps".into());
     }
@@ -464,6 +499,8 @@ mod tests {
     use super::*;
     fn rows() -> Vec<Row> {
         vec![Row {
+            stats: None,
+            series: Vec::new(),
             map: "cpu".into(),
             keys: vec![Key {
                 kind: "stack".into(),
@@ -522,6 +559,8 @@ mod tests {
     #[test]
     fn signed_histogram_differences_and_percentile_buckets() {
         let current = vec![Row {
+            stats: None,
+            series: Vec::new(),
             map: "h".into(),
             keys: vec![],
             value: 0,
@@ -529,6 +568,8 @@ mod tests {
             buckets: vec![("[1, 2)".into(), 1), ("[2, 4)".into(), 3)],
         }];
         let old = vec![Row {
+            stats: None,
+            series: Vec::new(),
             map: "h".into(),
             keys: vec![],
             value: 0,
@@ -559,6 +600,8 @@ mod tests {
         .unwrap();
         assert!(text.contains("p50: [2, 4) (bucket estimate)"), "{text}");
         let negative = vec![Row {
+            stats: None,
+            series: Vec::new(),
             map: "cpu".into(),
             keys: vec![Key {
                 kind: "stack".into(),

@@ -55,7 +55,7 @@ pub(super) fn run_syscalls(args: &Args, program: &Program) -> Result<i32> {
                     &mut streams,
                     false,
                     false,
-                    capture,
+                    (capture, &std::collections::BTreeSet::new()),
                 )?;
             }
         }
@@ -67,7 +67,7 @@ pub(super) fn run_syscalls(args: &Args, program: &Program) -> Result<i32> {
         &mut streams,
         false,
         child.is_some(),
-        capture,
+        (capture, &std::collections::BTreeSet::new()),
     )?;
     let mut lost = 0;
     let mut refresh = Instant::now();
@@ -75,9 +75,17 @@ pub(super) fn run_syscalls(args: &Args, program: &Program) -> Result<i32> {
     let mut state = program.state(io::BufWriter::new(stdout.lock()));
     configure_report(&mut state, args, program, "syscalls")?;
     configure_record(&mut state, args, program)?;
+    state.child_pid = child.as_ref().map(|child| child.pid as u64);
+    if let Some(pid) = state.child_pid {
+        state.register_target_identity(pid as u32)?;
+    }
     state.max_entries = args.max_map_entries as usize;
+    for target in tracer.targets() {
+        state.register_target_identity(target as u32)?;
+    }
     invoke_kind(program, &mut state, Some(pid), true);
     state.flush()?;
+    super::perf::apply_unwatched(&mut streams, &state.unwatched)?;
     if !state.stopped {
         for stream in &streams {
             if !stream.on_exec {
@@ -110,6 +118,9 @@ pub(super) fn run_syscalls(args: &Args, program: &Program) -> Result<i32> {
             }
             if refresh.elapsed() >= Duration::from_millis(10) {
                 for target in tracer.targets() {
+                    if !state.has_target_identity(target as u32) {
+                        state.register_target_identity(target as u32)?;
+                    }
                     attach(
                         program,
                         target,
@@ -117,7 +128,7 @@ pub(super) fn run_syscalls(args: &Args, program: &Program) -> Result<i32> {
                         &mut streams,
                         true,
                         false,
-                        capture,
+                        (capture, &state.unwatched),
                     )?;
                 }
                 refresh = Instant::now();
@@ -132,7 +143,7 @@ pub(super) fn run_syscalls(args: &Args, program: &Program) -> Result<i32> {
                     &mut streams,
                     true,
                     false,
-                    capture,
+                    (capture, &state.unwatched),
                 )?;
                 tracer.resume(tid)?;
             }
@@ -281,6 +292,9 @@ pub(super) fn run_syscalls(args: &Args, program: &Program) -> Result<i32> {
     drain_result?;
     if lost != 0 {
         eprintln!("poortrace: lost {lost} perf samples");
+    }
+    if state.exit_set {
+        return Ok(state.exit_code);
     }
     Ok(child
         .as_ref()

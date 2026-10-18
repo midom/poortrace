@@ -1088,6 +1088,10 @@ runner setup, and draft release packaging. Benchmark CI uploads measurements
 for both supported architectures; it does not treat noisy hosted timings as
 performance guarantees.
 
+See [bpftrace helper compatibility](docs/bpftrace-compatibility.md) for map queries,
+statistics, strings/networking, identity and register helpers, script arguments,
+explicit unsafe effects, replay semantics, and kernel-only exceptions.
+
 The library modules in `src/` implement the tracing language, JIT, runtime,
 collectors, and recording formats. The binary entry point is `src/main.rs`;
 private CLI modules live in `src/app/`. Start with `app/mod.rs` for probe

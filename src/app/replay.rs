@@ -193,6 +193,12 @@ pub(super) fn run_replay(args: &Args, path: &std::path::Path) -> Result<i32> {
             continue;
         }
         let actual_probe = saved.actual_probe();
+        if super::perf::watch_address(&actual_probe)
+            .is_some_and(|address| state.unwatched.contains(&address))
+        {
+            continue;
+        }
+
         let destinations: Vec<usize> = if alternate {
             program
                 .clauses
@@ -300,6 +306,8 @@ pub(super) fn run_replay(args: &Args, path: &std::path::Path) -> Result<i32> {
                         fp: raw.registers[2],
                         lr: raw.registers[3],
                         runtime_g: raw.runtime_g,
+                        extra: raw.extra,
+                        valid: raw.valid,
                     },
                     raw.stack_bytes,
                 )
@@ -329,7 +337,9 @@ pub(super) fn run_replay(args: &Args, path: &std::path::Path) -> Result<i32> {
         Duration::from_nanos(last.saturating_sub(first)),
     )?;
     state.flush()?;
-    Ok(if args.replay_exit_status {
+    Ok(if state.exit_set {
+        state.exit_code
+    } else if args.replay_exit_status {
         captured_status.unwrap_or(0)
     } else {
         0

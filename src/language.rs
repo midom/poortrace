@@ -449,6 +449,7 @@ pub struct Clause {
 #[derive(Clone, Debug)]
 pub enum Expr {
     Number(i64),
+    Tuple(Vec<Expr>),
     Float(f64),
     String(String),
     Builtin(String),
@@ -572,11 +573,29 @@ fn lex(src: &str) -> Result<Vec<Token>> {
                     }
                     TokenKind::Float(value)
                 } else {
-                    TokenKind::Number(
-                        src[start..i]
-                            .parse::<i64>()
-                            .map_err(|_| diagnostic(src, start, "integer exceeds i64"))?,
-                    )
+                    let mut number = src[start..i]
+                        .parse::<i64>()
+                        .map_err(|_| diagnostic(src, start, "integer exceeds i64"))?;
+                    for (suffix, scale) in [
+                        ("ns", 1i64),
+                        ("us", 1000),
+                        ("ms", 1_000_000),
+                        ("s", 1_000_000_000),
+                    ] {
+                        if src[i..].starts_with(suffix)
+                            && !src
+                                .as_bytes()
+                                .get(i + suffix.len())
+                                .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+                        {
+                            number = number.checked_mul(scale).ok_or_else(|| {
+                                diagnostic(src, start, "duration exceeds i64 nanoseconds")
+                            })?;
+                            i += suffix.len();
+                            break;
+                        }
+                    }
+                    TokenKind::Number(number)
                 }
             }
         } else if bytes[i] == b'"' {
@@ -938,8 +957,23 @@ impl Parser<'_> {
             Expr::Unary(op, Box::new(self.expr(11)?))
         } else if self.eat("(") {
             let e = self.expr(0)?;
-            self.expect(")")?;
-            e
+            if self.eat(",") {
+                let mut values = vec![e];
+                loop {
+                    values.push(self.expr(0)?);
+                    if values.len() > 16 {
+                        return Err(self.error("tuple exceeds 16 elements"));
+                    }
+                    if !self.eat(",") {
+                        break;
+                    }
+                }
+                self.expect(")")?;
+                Expr::Tuple(values)
+            } else {
+                self.expect(")")?;
+                e
+            }
         } else if self.eat("$") {
             let name = self.word()?;
             if self.eat("[") {
@@ -979,7 +1013,53 @@ impl Parser<'_> {
                 TokenKind::Word(w) => {
                     self.at += 1;
                     if self.eat("(") {
-                        let args = self.args(")")?;
+                        let ctype = matches!(&self.token().kind,TokenKind::Word(ty) if matches!(ty.as_str(),"struct"|"union"|"enum"|"char"|"short"|"int"|"long"|"unsigned"|"signed"|"float"|"double"|"void"|"bool"|"size_t"|"uint8_t"|"uint16_t"|"uint32_t"|"uint64_t"|"int8_t"|"int16_t"|"int32_t"|"int64_t"));
+                        let args = if w == "sizeof" && ctype {
+                            let start = self.token().start;
+                            let mut count = 0;
+                            while !self.is(")") {
+                                if matches!(self.token().kind, TokenKind::Eof) || count >= 32 {
+                                    return Err(self.error("invalid sizeof type"));
+                                }
+                                self.at += 1;
+                                count += 1;
+                            }
+                            let ty = self.src[start..self.token().start].trim().to_string();
+                            self.expect(")")?;
+                            vec![Expr::String(format!("__ctype__:{ty}"))]
+                        } else if w == "offsetof" && ctype {
+                            let start = self.token().start;
+                            let mut count = 0;
+                            while !self.is(",") {
+                                if matches!(self.token().kind, TokenKind::Eof) || count >= 32 {
+                                    return Err(self.error("invalid offsetof type"));
+                                }
+                                self.at += 1;
+                                count += 1;
+                            }
+                            let ty = self.src[start..self.token().start].trim().to_string();
+                            self.expect(",")?;
+                            let start = self.token().start;
+                            let mut count = 0;
+                            while !self.is(")") {
+                                if matches!(self.token().kind, TokenKind::Eof) || count >= 128 {
+                                    return Err(self.error("invalid offsetof field"));
+                                }
+                                self.at += 1;
+                                count += 1;
+                            }
+                            let field = self.src[start..self.token().start].trim().to_string();
+                            self.expect(")")?;
+                            let ty = ty
+                                .strip_prefix("struct ")
+                                .or_else(|| ty.strip_prefix("union "))
+                                .or_else(|| ty.strip_prefix("enum "))
+                                .unwrap_or(&ty)
+                                .to_string();
+                            vec![Expr::String(ty), Expr::String(field)]
+                        } else {
+                            self.args(")")?
+                        };
                         if let Some((parameters, body)) = self.functions.get(&w) {
                             if args.len() != parameters.len() {
                                 return Err(self.error("function argument count mismatch"));

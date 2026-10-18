@@ -82,6 +82,8 @@ fn new_recording_preserves_native_context_without_live_memory() {
                 fp: 3,
                 lr: 4,
                 runtime_g: 0,
+                extra: [9; 32],
+                valid: 1,
             },
             vec![7; 8192],
         ));
@@ -99,6 +101,8 @@ fn new_recording_preserves_native_context_without_live_memory() {
     assert_eq!(events[0].branches, vec![[5, 6]]);
     assert_eq!(events[0].raw.as_ref().unwrap().registers, [1, 2, 3, 4]);
     assert_eq!(events[0].raw.as_ref().unwrap().stack_bytes.len(), 8192);
+    assert_eq!(events[0].raw.as_ref().unwrap().extra, [9; 32]);
+    assert_eq!(events[0].raw.as_ref().unwrap().valid, 1);
 }
 
 #[test]

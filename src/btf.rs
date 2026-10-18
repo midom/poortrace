@@ -406,6 +406,13 @@ impl Reader {
         }
         Ok(self.database.as_ref().unwrap())
     }
+    pub fn function_exists(&mut self, name: &str) -> Result<bool> {
+        let db = self.database()?;
+        Ok(db
+            .names
+            .get(name)
+            .is_some_and(|ids| ids.iter().any(|id| db.types[*id].kind == 12)))
+    }
     pub fn size_of(&mut self, name: &str) -> Result<u64> {
         self.database()?.size_of(name)
     }

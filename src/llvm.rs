@@ -139,10 +139,18 @@ impl Engine {
                 (c"pt_ustack", runtime::ustack as *const () as Ref),
                 (c"pt_helper", runtime::helper as *const () as Ref),
                 (c"pt_map_update", runtime::map_update as *const () as Ref),
+                (
+                    c"pt_series_update",
+                    runtime::series_update as *const () as Ref,
+                ),
                 (c"pt_map_get", runtime::map_get as *const () as Ref),
                 (c"pt_printf", runtime::print as *const () as Ref),
                 (c"pt_map_action", runtime::map_action as *const () as Ref),
+                (c"pt_map_query", runtime::map_query as *const () as Ref),
+                (c"pt_map_print", runtime::map_print as *const () as Ref),
                 (c"pt_exit", runtime::stop as *const () as Ref),
+                (c"pt_exit_code", runtime::exit_code as *const () as Ref),
+                (c"pt_diagnostic", runtime::diagnostic as *const () as Ref),
                 (c"pt_stopped", runtime::stopped as *const () as Ref),
                 (c"pt_streq", runtime::streq as *const () as Ref),
             ];

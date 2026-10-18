@@ -118,7 +118,14 @@ pub(super) fn run(args: &Args, program: &Program) -> Result<i32> {
     let stdout = io::stdout();
     let mut state = program.state(io::BufWriter::new(stdout.lock()));
     configure_report(&mut state, args, program, "reliable")?;
+    state.child_pid = child.as_ref().map(|child| child.pid as u64);
+    if let Some(pid) = state.child_pid {
+        state.register_target_identity(pid as u32)?;
+    }
     state.max_entries = args.max_map_entries as usize;
+    for target in tracer.targets() {
+        state.register_target_identity(target as u32)?;
+    }
     super::report::configure_record(&mut state, args, program)?;
     if !args.quiet {
         eprintln!(
@@ -258,6 +265,7 @@ pub(super) fn run(args: &Args, program: &Program) -> Result<i32> {
                 }
             }
             if !state.stopped {
+                state.deliver_signals()?;
                 tracer.release_snapshot()?;
                 state.target_paused = false;
             }
@@ -278,6 +286,7 @@ pub(super) fn run(args: &Args, program: &Program) -> Result<i32> {
     }
     tracer.detach();
     state.target_paused = false;
+    let signal_result = state.deliver_signals();
     if let Some(child) = &child {
         if child.status.is_some() && !args.follow_forks {
             unsafe {
@@ -293,6 +302,10 @@ pub(super) fn run(args: &Args, program: &Program) -> Result<i32> {
     result?;
     end_result?;
     child_result?;
+    signal_result?;
+    if state.exit_set {
+        return Ok(state.exit_code);
+    }
     Ok(child
         .as_ref()
         .filter(|c| !c.terminated_by_tracer)

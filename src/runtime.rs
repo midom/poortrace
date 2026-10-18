@@ -96,6 +96,8 @@ pub enum Aggregate {
     Avg,
     Hist,
     Lhist,
+    Stats = 9,
+    Tseries = 10,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MapSpec {
@@ -105,6 +107,8 @@ pub struct MapSpec {
     pub linear: Option<(i64, i64, i64)>,
     pub float_linear: Option<(u64, u64, u64)>,
     pub value_type: Type,
+    pub histogram_precision: u8,
+    pub series: Option<(u64, usize, Aggregate)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -203,7 +207,7 @@ impl Format {
         }
         Ok(Self { parts, types })
     }
-    fn render(&self, args: &[u64]) -> String {
+    pub(crate) fn render(&self, args: &[u64]) -> String {
         let mut out = String::new();
         let mut at = 0;
         for part in &self.parts {
@@ -269,10 +273,11 @@ struct Cell {
     total: i128,
     count: u64,
     buckets: BTreeMap<i32, u64>,
+    series: BTreeMap<u64, (i128, u64, i64)>,
 }
 impl Cell {
     fn floating(&self, agg: Aggregate) -> f64 {
-        if agg == Aggregate::Avg {
+        if matches!(agg, Aggregate::Avg | Aggregate::Stats) {
             self.floating / self.count.max(1) as f64
         } else {
             self.floating
@@ -286,7 +291,7 @@ impl Cell {
         }
     }
     fn number(&self, agg: Aggregate) -> i64 {
-        if agg == Aggregate::Avg {
+        if matches!(agg, Aggregate::Avg | Aggregate::Stats) {
             (self.total / self.count.max(1) as i128) as i64
         } else {
             self.value
@@ -309,6 +314,16 @@ pub struct State<'a> {
     pub(crate) formats: Vec<Format>,
     writer: Box<dyn Write + 'a>,
     pub stopped: bool,
+    pub exit_code: i32,
+    pub exit_set: bool,
+    pub allow_unsafe: bool,
+    pub unwatched: std::collections::BTreeSet<u64>,
+    pub child_pid: Option<u64>,
+    pub(crate) target_starts: BTreeMap<u32, u64>,
+    pub script_args: BTreeMap<String, String>,
+    pub(crate) first_event_ns: Option<u64>,
+    pub(crate) pending_signals: Vec<crate::builtins::DeferredSignal>,
+    series_points: usize,
     pub error: Option<String>,
     pub max_entries: usize,
     pub(crate) stack_strings: Vec<CString>,
@@ -317,7 +332,7 @@ pub struct State<'a> {
     pub(crate) recursion_cost: u64,
     pub(crate) iterations: Vec<Vec<(Vec<Key>, i64)>>,
     pub(crate) scratch: BTreeMap<u32, Vec<u64>>,
-    symbols: crate::symbols::Symbolizer,
+    pub(crate) symbols: crate::symbols::Symbolizer,
     pub stack_mode: StackMode,
     python: crate::python::Reader,
     javascript: crate::javascript::Reader,
@@ -326,12 +341,13 @@ pub struct State<'a> {
     pub captured_memory: Vec<crate::recording::MemoryRegion>,
     pub capture_requests: Vec<crate::capture::MemoryRequest>,
     pub replay_memory: Vec<crate::recording::MemoryRegion>,
-    kernel_symbols: crate::kernel::Symbols,
-    btf: crate::btf::Reader,
+    pub(crate) kernel_symbols: crate::kernel::Symbols,
+    pub(crate) btf: crate::btf::Reader,
     pub managed: crate::managed_bridge::Reader,
     pub trace_fields: crate::kernel::Fields,
     pub(crate) replay_lookup: bool,
     pub js_snapshot: Option<(crate::perf::UserRegs, Vec<u8>)>,
+    pub register_snapshot: Option<crate::perf::UserRegs>,
     /// Set only while handlers execute under a verified stopped-target pause.
     pub target_paused: bool,
     types: crate::types::Reader,
@@ -356,6 +372,16 @@ impl<'a> State<'a> {
             formats,
             writer: Box::new(writer),
             stopped: false,
+            exit_code: 0,
+            exit_set: false,
+            allow_unsafe: false,
+            unwatched: std::collections::BTreeSet::new(),
+            child_pid: None,
+            target_starts: BTreeMap::new(),
+            script_args: BTreeMap::new(),
+            first_event_ns: None,
+            pending_signals: Vec::new(),
+            series_points: 0,
             error: None,
             max_entries: 65536,
             stack_strings: Vec::new(),
@@ -377,6 +403,7 @@ impl<'a> State<'a> {
             btf: crate::btf::Reader::default(),
             managed: crate::managed_bridge::Reader::default(),
             js_snapshot: None,
+            register_snapshot: None,
             target_paused: false,
             trace_fields: Default::default(),
             replay_lookup: false,
@@ -403,6 +430,21 @@ impl<'a> State<'a> {
         }
         self.stopped = true;
     }
+    /// Deliver queued, identity-bound signal requests after breakpoint rearming
+    /// or detachment. Replay never creates these requests.
+    pub fn deliver_signals(&mut self) -> Result<()> {
+        if let Some(error) = &self.error {
+            self.pending_signals.clear();
+            return Err(error.clone());
+        }
+        for request in std::mem::take(&mut self.pending_signals) {
+            if let Err(error) = request.deliver() {
+                self.fail(error.clone());
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
     pub fn flush(&mut self) -> Result<()> {
         self.writer.flush().map_err(|e| format!("output: {e}"))?;
         match &self.error {
@@ -420,6 +462,25 @@ impl<'a> State<'a> {
             Ok(memory) => self.captured_memory = memory,
             Err(error) => self.fail(error),
         }
+    }
+    /// Pin the observed process start identity before accepting live metadata.
+    pub fn register_target_identity(&mut self, pid: u32) -> Result<()> {
+        let started = crate::managed_bridge::start_ticks(pid)?;
+        if self
+            .target_starts
+            .get(&pid)
+            .is_some_and(|old| *old != started)
+        {
+            return Err(format!("PID {pid} changed identity"));
+        }
+        if self.target_starts.len() >= 4096 && !self.target_starts.contains_key(&pid) {
+            return Err("target identity limit (4096) exceeded".into());
+        }
+        self.target_starts.insert(pid, started);
+        Ok(())
+    }
+    pub fn has_target_identity(&self, pid: u32) -> bool {
+        self.target_starts.contains_key(&pid)
     }
     pub fn configure_btf(&mut self, path: std::path::PathBuf) {
         self.btf.configure(path);
@@ -448,6 +509,7 @@ impl<'a> State<'a> {
         self.print_all();
     }
     pub fn clear_all(&mut self) {
+        self.series_points = 0;
         for map in &mut self.maps {
             map.clear();
         }
@@ -489,6 +551,8 @@ impl<'a> State<'a> {
                     })
                     .collect();
                 rows.push(crate::report::Row {
+                    stats: (spec.aggregate==Aggregate::Stats).then(|| if spec.value_type==Type::Float {serde_json::json!({"count":cell.count,"total":cell.floating,"average":cell.floating(spec.aggregate)})}else{serde_json::json!({"count":cell.count,"total":cell.total,"average":cell.number(spec.aggregate)})}),
+                    series:cell.series.iter().map(|(time,(sum,count,last))|(*time,if spec.series.is_some_and(|(_,_,agg)|agg==Aggregate::Avg){(*sum/(*count).max(1) as i128) as i64}else{*last})).collect(),
                     map: spec.name.clone(),
                     keys,
                     value: if spec.value_type == Type::Float {
@@ -550,7 +614,33 @@ impl<'a> State<'a> {
                 out.push(']');
             }
             out.push_str(": ");
-            if matches!(spec.aggregate, Aggregate::Hist | Aggregate::Lhist) {
+            if spec.aggregate == Aggregate::Stats {
+                if spec.value_type == Type::Float {
+                    out.push_str(&format!(
+                        "count {}, average {}, total {}\n",
+                        cell.count,
+                        cell.floating(spec.aggregate),
+                        cell.floating
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "count {}, average {}, total {}\n",
+                        cell.count,
+                        cell.number(spec.aggregate),
+                        cell.total
+                    ));
+                }
+            } else if spec.aggregate == Aggregate::Tseries {
+                out.push('\n');
+                for (timestamp, (sum, count, last)) in &cell.series {
+                    let value = if spec.series.is_some_and(|(_, _, agg)| agg == Aggregate::Avg) {
+                        (*sum / (*count).max(1) as i128) as i64
+                    } else {
+                        *last
+                    };
+                    out.push_str(&format!("  {timestamp}: {value}\n"));
+                }
+            } else if matches!(spec.aggregate, Aggregate::Hist | Aggregate::Lhist) {
                 out.push('\n');
                 for (bucket, count) in &cell.buckets {
                     let label = bucket_label(*bucket, spec);
@@ -660,7 +750,9 @@ pub(crate) unsafe extern "C" fn map_update(
     let linear = state.specs[id as usize].linear;
     let map = &mut state.maps[id as usize];
     if op == 8 {
-        map.remove(&key);
+        if let Some(cell) = map.remove(&key) {
+            state.series_points = state.series_points.saturating_sub(cell.series.len());
+        }
         return;
     }
     if !map.contains_key(&key) && map.len() >= state.max_entries {
@@ -719,7 +811,7 @@ pub(crate) unsafe extern "C" fn map_update(
         }
         let result = match op {
             0 => value,
-            2 | 5 => cell.floating + value,
+            2 | 5 | 9 => cell.floating + value,
             3 => {
                 if cell.count == 0 {
                     value
@@ -764,14 +856,18 @@ pub(crate) unsafe extern "C" fn map_update(
                 cell.value.max(value)
             }
         }
-        5 => cell.total += value as i128,
+        5 | 9 => cell.total = cell.total.wrapping_add(value as i128),
         6 => {
             let bin = if value < 0 {
                 -1
             } else if value == 0 {
                 0
             } else {
-                64 - (value as u64).leading_zeros() as i32
+                let power = 63 - (value as u64).leading_zeros();
+                let parts = 1u128 << state.specs[id as usize].histogram_precision;
+                let base = 1u128 << power;
+                let sub = (((value as u128) - base) * parts / base) as i32;
+                (power as i32) * (parts as i32) + sub + 1
             };
             *cell.buckets.entry(bin).or_default() += 1;
         }
@@ -786,7 +882,14 @@ pub(crate) unsafe extern "C" fn map_update(
             };
             *cell.buckets.entry(bin).or_default() += 1;
         }
-        _ => unreachable!(),
+        10 => {
+            state.fail("tseries requires its timestamp-aware update path".into());
+            return;
+        }
+        _ => {
+            state.fail("invalid aggregate operation".into());
+            return;
+        }
     }
     cell.count = cell.count.saturating_add(1);
 }
@@ -820,8 +923,19 @@ pub(crate) unsafe extern "C" fn map_action(state: *mut State<'_>, id: u64, actio
     let state = unsafe { &mut *state };
     if action == 0 {
         state.print_map(id as usize);
-    } else {
+    } else if action == 1 {
+        state.series_points = state.series_points.saturating_sub(
+            state.maps[id as usize]
+                .values()
+                .map(|cell| cell.series.len())
+                .sum::<usize>(),
+        );
         state.maps[id as usize].clear();
+    } else if action == 2 {
+        for cell in state.maps[id as usize].values_mut() {
+            state.series_points = state.series_points.saturating_sub(cell.series.len());
+            *cell = Cell::default();
+        }
     }
 }
 pub(crate) unsafe extern "C" fn stop(state: *mut State<'_>) {
@@ -911,7 +1025,17 @@ fn bucket_label(bucket: i32, spec: &MapSpec) -> String {
     match bucket {
         -1 => "(-inf, 0)".into(),
         0 => "[0, 1)".into(),
-        n => format!("[{}, {})", 1u64 << (n - 1), 1u64 << n),
+        n => {
+            let parts = 1u128 << spec.histogram_precision;
+            let power = ((n - 1) as u128 / parts) as u32;
+            let sub = (n - 1) as u128 % parts;
+            let base = 1u128 << power;
+            format!(
+                "[{}, {})",
+                base + base * sub / parts,
+                base + base * (sub + 1) / parts
+            )
+        }
     }
 }
 
@@ -1531,6 +1655,9 @@ unsafe fn recorded_helper(
     value: u64,
     length: u64,
 ) -> u64 {
+    if matches!(op, 200 | 201) {
+        return unsafe { crate::builtins::invoke(state, event, op, value, length) };
+    }
     if matches!(op, 110 | 111 | 130 | 131) || (90..=93).contains(&op) {
         return unsafe { helper_inner(state, event, op, value, length) };
     }
@@ -1863,6 +1990,150 @@ pub(crate) unsafe extern "C" fn ustack(
     depth: u64,
 ) -> u64 {
     unsafe { recorded_helper(state, event, 100, depth, 0) }
+}
+
+pub(crate) unsafe extern "C" fn exit_code(state: *mut State<'_>, code: u64) {
+    let state = unsafe { &mut *state };
+    if code > 255 {
+        state.fail("exit status must be 0..255".into());
+    } else {
+        state.exit_code = code as i32;
+        state.exit_set = true;
+        state.stopped = true;
+    }
+}
+pub(crate) unsafe extern "C" fn diagnostic(state: *mut State<'_>, text: u64) {
+    let state = unsafe { &mut *state };
+    let text = unsafe { CStr::from_ptr(text as *const c_char) }.to_bytes();
+    if let Err(error) = std::io::stderr().write_all(text) {
+        state.fail(format!("diagnostic output: {error}"));
+    }
+}
+
+pub(crate) unsafe extern "C" fn map_query(
+    state: *mut State<'_>,
+    id: u64,
+    raw: *const RawKey,
+    len: u64,
+    op: u64,
+) -> u64 {
+    let state = unsafe { &mut *state };
+    if op == 1 {
+        return state.maps[id as usize].len() as u64;
+    }
+    let key = match unsafe { keys(raw, len) } {
+        Ok(key) => key,
+        Err(error) => {
+            state.fail(error);
+            return 0;
+        }
+    };
+    let map = &mut state.maps[id as usize];
+    if op == 2 {
+        if let Some(cell) = map.remove(&key) {
+            state.series_points = state.series_points.saturating_sub(cell.series.len());
+            1
+        } else {
+            0
+        }
+    } else {
+        map.contains_key(&key) as u64
+    }
+}
+pub(crate) unsafe extern "C" fn map_print(state: *mut State<'_>, id: u64, top: u64, div: u64) {
+    let state = unsafe { &mut *state };
+    if div == 0 || div > i64::MAX as u64 || top > i64::MAX as u64 {
+        state.fail("print requires nonnegative top and positive div".into());
+        return;
+    }
+    let saved = std::mem::take(&mut state.maps[id as usize]);
+    let spec = state.specs[id as usize].clone();
+    let mut entries: Vec<_> = saved.iter().collect();
+    entries.sort_by(|(ka, a), (kb, b)| {
+        let order = if spec.value_type == Type::Float {
+            b.floating(spec.aggregate)
+                .total_cmp(&a.floating(spec.aggregate))
+        } else {
+            b.number(spec.aggregate).cmp(&a.number(spec.aggregate))
+        };
+        order.then_with(|| ka.cmp(kb))
+    });
+    for (key, cell) in entries
+        .into_iter()
+        .take(if top == 0 { usize::MAX } else { top as usize })
+    {
+        let mut cell = cell.clone();
+        if spec.value_type == Type::Float {
+            cell.floating /= div as f64;
+        } else {
+            cell.value /= div as i64;
+            cell.total /= div as i128;
+            for (total, _, value) in cell.series.values_mut() {
+                *total /= div as i128;
+                *value /= div as i64;
+            }
+            for count in cell.buckets.values_mut() {
+                *count /= div;
+            }
+        }
+        state.maps[id as usize].insert(key.clone(), cell);
+        state.print_map(id as usize);
+        state.maps[id as usize].clear();
+    }
+    // Restore original map contents even when rendering reports an output error.
+    state.maps[id as usize] = saved;
+}
+
+pub(crate) unsafe extern "C" fn series_update(
+    state: *mut State<'_>,
+    event: *const Event<'_>,
+    id: u64,
+    raw: *const RawKey,
+    len: u64,
+    value: i64,
+) {
+    let state = unsafe { &mut *state };
+    let event = unsafe { &*event };
+    let key = match unsafe { keys(raw, len) } {
+        Ok(key) => key,
+        Err(e) => {
+            state.fail(e);
+            return;
+        }
+    };
+    let Some((interval, limit, agg)) = state.specs[id as usize].series else {
+        state.fail("invalid tseries metadata".into());
+        return;
+    };
+    let map = &mut state.maps[id as usize];
+    if !map.contains_key(&key) && map.len() >= state.max_entries {
+        state.fail("tseries map entry limit exceeded".into());
+        return;
+    }
+    let cell = map.entry(key).or_default();
+    let bin = event.nsecs / interval * interval;
+    let old_len = cell.series.len();
+    if !cell.series.contains_key(&bin) && state.series_points >= 1_048_576 {
+        state.fail("global tseries interval limit (1048576) exceeded".into());
+        return;
+    }
+    let entry = cell.series.entry(bin).or_insert((0, 0, value));
+    entry.0 = entry.0.wrapping_add(value as i128);
+    entry.2 = match agg {
+        Aggregate::Sum => entry.2.wrapping_add(if entry.1 == 0 { 0 } else { value }),
+        Aggregate::Min => entry.2.min(value),
+        Aggregate::Max => entry.2.max(value),
+        _ => value,
+    };
+    entry.1 = entry.1.saturating_add(1);
+    let newest = *cell.series.last_key_value().unwrap().0;
+    let cutoff = newest.saturating_sub(interval.saturating_mul(limit.saturating_sub(1) as u64));
+    cell.series.retain(|time, _| *time >= cutoff);
+    while cell.series.len() > limit {
+        cell.series.pop_first();
+    }
+    state.series_points = state.series_points.saturating_sub(old_len) + cell.series.len();
+    cell.value = value;
 }
 
 #[cfg(test)]

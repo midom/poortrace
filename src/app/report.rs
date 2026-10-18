@@ -42,7 +42,26 @@ pub(super) fn configure_report(
     program: &Program,
     backend: &str,
 ) -> Result<()> {
-    state.stack_mode = if args.stack_mode == "dwarf" {
+    state.allow_unsafe = args.allow_unsafe;
+    if let Some(pid) = args.pid {
+        state.register_target_identity(pid as u32)?;
+    }
+    if args.script_args.len() > 256 {
+        return Err("--script-arg exceeds 256 named options".into());
+    }
+    for argument in &args.script_args {
+        if argument.len() > 4096 {
+            return Err("script argument exceeds 4096 bytes".into());
+        }
+        let (name, value) = argument
+            .split_once('=')
+            .ok_or("--script-arg requires NAME=VALUE")?;
+        if name.is_empty() {
+            return Err("script argument name is empty".into());
+        }
+        state.script_args.insert(name.into(), value.into());
+    }
+    state.stack_mode = if args.stack_mode == "dwarf" || program.needs_dwarf() {
         poortrace::runtime::StackMode::Dwarf
     } else {
         poortrace::runtime::StackMode::FramePointer
@@ -64,6 +83,9 @@ pub(super) fn configure_report(
             .collect(),
         backend,
     );
+    if program.needs_dwarf() {
+        context.stack_mode = "dwarf".into();
+    }
     for (name, probe) in program.clauses.iter().flat_map(|c| &c.probes) {
         use poortrace::language::Probe;
         let meaning = match probe {

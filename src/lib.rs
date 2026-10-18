@@ -46,3 +46,5 @@ pub mod capture;
 pub mod native_args;
 
 pub mod discovery;
+
+mod builtins;

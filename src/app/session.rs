@@ -6,12 +6,16 @@ use std::time::{Duration, Instant};
 pub(super) fn capture(args: &Args, program: &Program, ptrace_functions: bool) -> Capture {
     Capture {
         ptrace_functions,
+        full_regs: program.needs_registers(),
         addr: true,
         kernel: args.include_kernel || program.needs_kstack(),
         kernel_callchain: program.needs_kstack() || args.include_kernel && args.record.is_some(),
         record_raw: args.record_raw,
-        callchain: args.stack_mode == "fp" && (program.needs_ustack() || args.record.is_some()),
-        dwarf_stack: if (args.stack_mode == "dwarf" && program.needs_ustack())
+        callchain: args.stack_mode == "fp"
+            && !program.needs_dwarf()
+            && (program.needs_ustack() || args.record.is_some()),
+        dwarf_stack: if ((args.stack_mode == "dwarf" || program.needs_dwarf())
+            && program.needs_ustack())
             || program.needs_jsstack()
             || args.record.is_some()
         {

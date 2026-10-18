@@ -89,6 +89,10 @@ pub struct RawContext {
     pub registers: [u64; 4],
     #[serde(default)]
     pub runtime_g: u64,
+    #[serde(default)]
+    pub extra: [u64; 32],
+    #[serde(default)]
+    pub valid: u64,
     pub stack_bytes: Vec<u8>,
 }
 #[derive(Clone, Serialize, Deserialize)]
@@ -173,6 +177,8 @@ impl Saved {
             architecture: std::env::consts::ARCH.into(),
             registers: [r.ip, r.sp, r.fp, r.lr],
             runtime_g: r.runtime_g,
+            extra: r.extra,
+            valid: r.valid,
             stack_bytes: bytes.clone(),
         });
     }
@@ -957,6 +963,8 @@ pub fn observations_from_raw(recording: &Recording) -> Result<Vec<Saved>> {
             architecture: descriptor.architecture,
             registers: [r.ip, r.sp, r.fp, r.lr],
             runtime_g: r.runtime_g,
+            extra: r.extra,
+            valid: r.valid,
             stack_bytes: sample.stack,
         });
         if let Some(comm) = comms.get(&(sample.pid, sample.tid)) {

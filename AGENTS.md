@@ -21,6 +21,7 @@ Serde for profile/report formats; LLVM is accessed through direct C API bindings
   public `Program` compilation/invocation interface.
 - `src/llvm.rs`: LLVM C API bindings, native target initialization, MCJIT, callback
   registration, and engine/context ownership.
+- `src/builtins.rs`: userspace compatibility helpers, bounded explicit effects, and typed replay descriptors.
 - `src/runtime.rs`: event ABI, typed map keys, aggregations, formatting, output,
   and callbacks called by generated code.
 - `src/symbols.rs`: target mappings, ELF/DWARF symbol lookup, sampled-stack CFI
@@ -197,6 +198,10 @@ Do not change host perf policy to make tests pass.
 - Counter reads distinguish raw counts, scheduling times, and scaled estimates.
   Preserve unscheduled (unavailable) results and read groups before dropping them.
 - Memory helpers are read-only, limited to 4096 bytes, and subject to ptrace checks.
+  The explicit `write_user` exception requires `--unsafe --reliable`, a verified
+  stopped external target and captured registers; it writes at most 4096 bytes.
+  Signal helpers use identity-bound pidfds and defer delivery until breakpoint
+  rearming or detach. Replay must never repeat these effects or shell commands.
   Stack snapshot reads have a separate 32768-byte bound, preserve accessible
   prefixes, and support the full CLI size range for perf, ptrace, and polling.
   Ptrace `jsstack` reads frame slots directly; polling snapshots lack FP and

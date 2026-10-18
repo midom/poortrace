@@ -534,6 +534,22 @@ fn live_watchpoints() {
         "-e",
         &probe,
     ]);
+    let once = format!(
+        "watchpoint:0x{}:8:w {{ @once=count(); unwatch(addr); }}",
+        line.trim()
+    );
+    let removed = trace(&[
+        "-q",
+        "-p",
+        &target.id().to_string(),
+        "-d",
+        "0.25",
+        "-e",
+        &once,
+    ]);
+    assert!(removed.status.success(), "{}", errors(&removed));
+    assert_eq!(output(&removed), "@once: 1\n");
+    assert!(target.try_wait().unwrap().is_none());
     target.kill().unwrap();
     target.wait().unwrap();
     std::fs::remove_dir_all(directory).unwrap();
@@ -1513,4 +1529,63 @@ fn scalar_print_and_time_cli_record_and_replay() {
         assert_eq!(output(&replayed), text);
     }
     std::fs::remove_file(journal).unwrap();
+}
+
+#[test]
+fn compatibility_getopt_exit_status_and_owned_command_replay() {
+    let out = trace(&[
+        "-q",
+        "--script-arg",
+        "label=hello",
+        "--script-arg",
+        "number=23",
+        "-e",
+        r#"BEGIN { print(getopt("label","default")); assert(!has_cpid); exit(getopt("number",0)); } END { print("end"); }"#,
+    ]);
+    assert_eq!(out.status.code(), Some(23), "{}", errors(&out));
+    assert_eq!(output(&out), "hello\nend\n");
+    let out = trace(&[
+        "-q",
+        "-e",
+        "BEGIN { assert(has_cpid); print(cpid); exit(17); }",
+        "--",
+        "/bin/true",
+    ]);
+    assert_eq!(out.status.code(), Some(17), "{}", errors(&out));
+    assert!(output(&out).trim().parse::<u32>().unwrap() > 0);
+    let directory =
+        std::env::temp_dir().join(format!("poortrace-helper-replay-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let input = directory.join("input");
+    let marker = directory.join("marker");
+    let archive = directory.join("run.jsonl");
+    std::fs::write(&input, "payload\n").unwrap();
+    let command = format!("printf 'child\\n'; printf changed > '{}'", marker.display());
+    let source = format!(
+        "BEGIN {{ cat({:?}); system({command:?}); }}",
+        input.to_str().unwrap()
+    );
+    let recorded = Command::new(env!("CARGO_BIN_EXE_poortrace"))
+        .args(["-q", "--unsafe", "--record"])
+        .arg(&archive)
+        .args(["-e", &source])
+        .output()
+        .unwrap();
+    assert!(recorded.status.success(), "{}", errors(&recorded));
+    assert_eq!(output(&recorded), "payload\nchild\n");
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "changed");
+    std::fs::remove_file(&input).unwrap();
+    std::fs::remove_file(&marker).unwrap();
+    for alternate in [false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_poortrace"));
+        command.args(["-q", "--replay"]).arg(&archive);
+        if alternate {
+            command.args(["-e", &source]);
+        }
+        let replayed = command.output().unwrap();
+        assert!(replayed.status.success(), "{}", errors(&replayed));
+        assert_eq!(output(&replayed), output(&recorded));
+        assert!(!marker.exists());
+    }
+    std::fs::remove_dir_all(directory).unwrap();
 }

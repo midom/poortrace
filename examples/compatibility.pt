@@ -1,0 +1,22 @@
+// poortrace examples/compatibility.pt --script-arg label=demo
+BEGIN {
+    print(getopt("label", "example"));
+    print(ntop(pton("127.0.0.1")));
+    @values["first"] = 10;
+    @values["second"] = 20;
+    print(has_key(@values, "first"));
+    $value = 0;
+    if (find(@values, "second", $value)) { print($value); }
+    print(@values, 1, 10);
+    clear(@values);
+}
+interval:ms:100 {
+    @samples = stats(1);
+    @history = tseries(1, 1s, 10, "sum");
+}
+interval:s:1 {
+    time("%H:%M:%S ");
+    print(@samples);
+    print(@history);
+    exit();
+}
