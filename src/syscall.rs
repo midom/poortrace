@@ -61,6 +61,7 @@ pub struct Tracer {
     observe_syscalls: bool,
     discovered: Vec<i32>,
     pending: VecDeque<(i32, i32)>,
+    wait_cursor: i32,
 }
 fn ptrace_io(
     request: libc::c_uint,
@@ -100,6 +101,7 @@ impl Tracer {
             observe_syscalls: true,
             discovered: Vec::new(),
             pending: VecDeque::new(),
+            wait_cursor: 0,
         };
         let flags = libc::PTRACE_O_TRACESYSGOOD
             | libc::PTRACE_O_TRACECLONE
@@ -219,6 +221,29 @@ impl Tracer {
             }
         }
     }
+    fn wait_next(&mut self, status: &mut i32) -> i32 {
+        use std::ops::Bound::{Excluded, Unbounded};
+        // waitpid(-1) can repeatedly choose the lowest busy TID. Check one
+        // rotating tracked task first, then accept any other ready/new child.
+        // This costs at most two waits per event, independent of thread count.
+        let candidate = self
+            .tids
+            .range((Excluded(self.wait_cursor), Unbounded))
+            .next()
+            .or_else(|| self.tids.first())
+            .copied();
+        if let Some(tid) = candidate {
+            self.wait_cursor = tid;
+            let result = unsafe { libc::waitpid(tid, status, libc::__WALL | libc::WNOHANG) };
+            if result > 0
+                || result < 0
+                    && std::io::Error::last_os_error().raw_os_error() != Some(libc::ECHILD)
+            {
+                return result;
+            }
+        }
+        unsafe { libc::waitpid(-1, status, libc::__WALL | libc::WNOHANG) }
+    }
     pub fn poll(&mut self) -> Result<Vec<Event>> {
         let mut output = Vec::new();
         // Bound each pass so timers, duration limits and interrupts remain responsive.
@@ -228,7 +253,7 @@ impl Tracer {
                 status = saved;
                 tid
             } else {
-                unsafe { libc::waitpid(-1, &mut status, libc::__WALL | libc::WNOHANG) }
+                self.wait_next(&mut status)
             };
             if tid == 0 {
                 break;
@@ -485,6 +510,7 @@ mod tests {
             observe_syscalls: true,
             discovered: Vec::new(),
             pending: VecDeque::new(),
+            wait_cursor: 0,
         };
         assert!(tracer.resume(pid).is_err());
         assert!(tracer.tids.contains(&pid));

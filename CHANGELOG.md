@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Preserve syscall exit status when a sibling exits the process and ptrace stop identity across non-leader exec, quote discovered selectors containing numeric-looking paths, and retain useful CI failure tails.
+- Fairly service syscall thread stops and preserve exit status when a sibling exits the process and ptrace stop identity across non-leader exec, quote discovered selectors containing numeric-looking paths, and retain useful CI failure tails.
 
 - Expand userspace bpftrace helper support: map queries/stats/time series, strings and networking, identity/symbol/register helpers, diagnostics, script arguments, stack formats, and exit statuses. Add explicitly gated commands/signals/writes and session watchpoint removal, with captured-result replay and specific no-BPF capability errors. See the helper compatibility guide for limits and differences.
 
