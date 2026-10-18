@@ -95,6 +95,11 @@ and host event availability are resolved later. `--list` shows recognized event
 names, not a guarantee that the host supports every event. Kernel tracepoints
 also need readable tracefs event formats.
 
+`profile:hz:N` must fit the host limit in
+`/proc/sys/kernel/perf_event_max_sample_rate`. For example, a limit of 1000
+rejects `profile:hz:1001`; use `profile:hz:1000` or a lower rate such as 99.
+Above-limit errors report the requested frequency and the host ceiling.
+
 ## Probes
 
 | Probe | Behavior |

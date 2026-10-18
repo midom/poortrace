@@ -237,6 +237,12 @@ impl PerfEvent {
             }
             _ => return Err("not a perf probe".into()),
         };
+        if frequency {
+            let maximum = std::fs::read_to_string("/proc/sys/kernel/perf_event_max_sample_rate")
+                .ok()
+                .and_then(|value| value.trim().parse().ok());
+            validate_frequency(period, maximum)?;
+        }
         if capture.dwarf_stack > 32768 || capture.dwarf_stack % 8 != 0 {
             return Err("DWARF stack size must be a multiple of 8 up to 32768".into());
         }
@@ -456,6 +462,17 @@ impl Drop for PerfEvent {
             libc::munmap(self.mapping.as_ptr(), self.mapping_len);
         }
     }
+}
+
+fn validate_frequency(requested: u64, maximum: Option<u64>) -> Result<()> {
+    if let Some(maximum) = maximum.filter(|maximum| *maximum > 0) {
+        if requested > maximum {
+            return Err(format!(
+                "requested sampling frequency {requested} Hz exceeds kernel.perf_event_max_sample_rate={maximum}; use profile:hz:{maximum} or a lower frequency"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn open_error(tid: i32, error: io::Error) -> String {
@@ -759,6 +776,17 @@ fn decode_capture(bytes: &[u8], capture: Capture) -> Result<Record> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn frequency_ceiling_reports_the_requested_and_supported_rates() {
+        assert!(validate_frequency(999, Some(1000)).is_ok());
+        assert!(validate_frequency(1000, Some(1000)).is_ok());
+        let error = validate_frequency(1001, Some(1000)).unwrap_err();
+        assert!(error.contains("1001 Hz"));
+        assert!(error.contains("kernel.perf_event_max_sample_rate=1000"));
+        assert!(error.contains("profile:hz:1000"));
+        assert!(validate_frequency(1001, None).is_ok());
+        assert!(validate_frequency(1001, Some(0)).is_ok());
+    }
     fn record(kind: u32, data: &[u8]) -> Vec<u8> {
         let mut b = Vec::new();
         b.extend(kind.to_ne_bytes());
