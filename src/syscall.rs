@@ -1,7 +1,7 @@
 //! Explicit ptrace syscall backend. Seized targets are detached, never killed here.
 use crate::Result;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     time::{Duration, Instant},
 };
 
@@ -60,8 +60,14 @@ pub struct Tracer {
     follow: bool,
     observe_syscalls: bool,
     discovered: Vec<i32>,
+    pending: VecDeque<(i32, i32)>,
 }
-fn ptrace(request: libc::c_uint, tid: i32, address: usize, data: usize) -> Result<libc::c_long> {
+fn ptrace_io(
+    request: libc::c_uint,
+    tid: i32,
+    address: usize,
+    data: usize,
+) -> std::io::Result<libc::c_long> {
     let value = unsafe {
         libc::ptrace(
             request,
@@ -71,13 +77,14 @@ fn ptrace(request: libc::c_uint, tid: i32, address: usize, data: usize) -> Resul
         )
     };
     if value < 0 {
-        Err(format!(
-            "ptrace TID {tid}: {}",
-            std::io::Error::last_os_error()
-        ))
+        Err(std::io::Error::last_os_error())
     } else {
         Ok(value)
     }
+}
+fn ptrace(request: libc::c_uint, tid: i32, address: usize, data: usize) -> Result<libc::c_long> {
+    ptrace_io(request, tid, address, data)
+        .map_err(|error| format!("ptrace TID {tid} request {request}: {error}"))
 }
 impl Tracer {
     pub fn seize(pid: i32, tids: impl IntoIterator<Item = i32>, launched: bool) -> Result<Self> {
@@ -92,6 +99,7 @@ impl Tracer {
             follow: false,
             observe_syscalls: true,
             discovered: Vec::new(),
+            pending: VecDeque::new(),
         };
         let flags = libc::PTRACE_O_TRACESYSGOOD
             | libc::PTRACE_O_TRACECLONE
@@ -136,12 +144,92 @@ impl Tracer {
     pub fn is_empty(&self) -> bool {
         self.tids.is_empty()
     }
+    fn record_exit(&mut self, tid: i32, status: i32) {
+        self.tids.remove(&tid);
+        self.initial.remove(&tid);
+        self.held.remove(&tid);
+        self.entries.remove(&tid);
+        self.exits.insert(
+            tid,
+            if libc::WIFEXITED(status) {
+                libc::WEXITSTATUS(status)
+            } else {
+                128 + libc::WTERMSIG(status)
+            },
+        );
+    }
+    // A sibling may execute exit_group, or exec may replace the leader, even
+    // while this TID has an observed syscall stop. Accept ESRCH only after a
+    // newer wait status or explicit evidence that the old task has died.
+    fn request(
+        &mut self,
+        request: libc::c_uint,
+        tid: i32,
+        address: usize,
+        data: usize,
+    ) -> Result<Option<libc::c_long>> {
+        match ptrace_io(request, tid, address, data) {
+            Ok(value) => Ok(Some(value)),
+            Err(error) => {
+                if error.raw_os_error() == Some(libc::ESRCH) {
+                    let deadline = Instant::now() + Duration::from_millis(20);
+                    loop {
+                        let mut status = 0;
+                        let waited = unsafe {
+                            libc::waitpid(tid, &mut status, libc::__WALL | libc::WNOHANG)
+                        };
+                        if waited == tid {
+                            if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
+                                self.record_exit(tid, status);
+                                return Ok(None);
+                            }
+                            if libc::WIFSTOPPED(status) {
+                                self.held.insert(tid);
+                                self.pending.push_back((tid, status));
+                                return Ok(None);
+                            }
+                        }
+                        let wait_error = std::io::Error::last_os_error().raw_os_error();
+                        match std::fs::read_to_string(format!("/proc/{tid}/stat")) {
+                            Ok(stat)
+                                if stat.rsplit_once(')').is_some_and(|(_, tail)| {
+                                    matches!(tail.split_whitespace().next(), Some("Z" | "X" | "x"))
+                                }) =>
+                            {
+                                return Ok(None);
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                if waited < 0 && wait_error == Some(libc::ECHILD) {
+                                    self.tids.remove(&tid);
+                                    self.initial.remove(&tid);
+                                    self.held.remove(&tid);
+                                    self.entries.remove(&tid);
+                                }
+                                return Ok(None);
+                            }
+                            _ => {}
+                        }
+                        if Instant::now() >= deadline {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_micros(50));
+                    }
+                }
+                Err(format!("ptrace TID {tid} request {request}: {error}"))
+            }
+        }
+    }
     pub fn poll(&mut self) -> Result<Vec<Event>> {
         let mut output = Vec::new();
         // Bound each pass so timers, duration limits and interrupts remain responsive.
         for _ in 0..1024 {
             let mut status = 0;
-            let tid = unsafe { libc::waitpid(-1, &mut status, libc::__WALL | libc::WNOHANG) };
+            let tid = if let Some((tid, saved)) = self.pending.pop_front() {
+                status = saved;
+                tid
+            } else {
+                unsafe { libc::waitpid(-1, &mut status, libc::__WALL | libc::WNOHANG) }
+            };
             if tid == 0 {
                 break;
             }
@@ -153,22 +241,13 @@ impl Tracer {
                 return Err(error.to_string());
             }
             if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
-                self.tids.remove(&tid);
-                self.initial.remove(&tid);
-                self.entries.remove(&tid);
-                self.exits.insert(
-                    tid,
-                    if libc::WIFEXITED(status) {
-                        libc::WEXITSTATUS(status)
-                    } else {
-                        128 + libc::WTERMSIG(status)
-                    },
-                );
+                self.record_exit(tid, status);
                 continue;
             }
             if !libc::WIFSTOPPED(status) {
                 continue;
             }
+            self.held.remove(&tid);
             if self.initial.contains(&tid) || !self.tids.contains(&tid) {
                 let tgid = std::fs::read_to_string(format!("/proc/{tid}/status"))
                     .ok()
@@ -195,22 +274,32 @@ impl Tracer {
                 libc::PTRACE_EVENT_CLONE | libc::PTRACE_EVENT_FORK | libc::PTRACE_EVENT_VFORK
             ) {
                 let mut child = 0usize;
-                ptrace(
-                    libc::PTRACE_GETEVENTMSG,
-                    tid,
-                    0,
-                    (&mut child as *mut usize) as usize,
-                )?;
+                if self
+                    .request(
+                        libc::PTRACE_GETEVENTMSG,
+                        tid,
+                        0,
+                        (&mut child as *mut usize) as usize,
+                    )?
+                    .is_none()
+                {
+                    continue;
+                }
                 self.tids.insert(child as i32);
                 self.initial.insert(child as i32);
             } else if event == libc::PTRACE_EVENT_EXEC {
                 let mut old = 0usize;
-                ptrace(
-                    libc::PTRACE_GETEVENTMSG,
-                    tid,
-                    0,
-                    (&mut old as *mut usize) as usize,
-                )?;
+                if self
+                    .request(
+                        libc::PTRACE_GETEVENTMSG,
+                        tid,
+                        0,
+                        (&mut old as *mut usize) as usize,
+                    )?
+                    .is_none()
+                {
+                    continue;
+                }
                 if old as i32 != tid {
                     self.tids.remove(&(old as i32));
                     self.initial.remove(&(old as i32));
@@ -220,7 +309,11 @@ impl Tracer {
                 self.entries.remove(&tid);
             } else if signal == (libc::SIGTRAP | 0x80) {
                 let mut info = [0u8; 88];
-                let n = ptrace(0x420e, tid, info.len(), info.as_mut_ptr() as usize)? as usize;
+                let Some(n) = self.request(0x420e, tid, info.len(), info.as_mut_ptr() as usize)?
+                else {
+                    continue;
+                };
+                let n = n as usize;
                 if n < 24 {
                     return Err("PTRACE_GET_SYSCALL_INFO requires Linux 5.3 or newer".into());
                 }
@@ -270,7 +363,7 @@ impl Tracer {
                 }
             } else if event == libc::PTRACE_EVENT_STOP {
                 if signal != libc::SIGTRAP {
-                    ptrace(libc::PTRACE_LISTEN, tid, 0, 0)?;
+                    self.request(libc::PTRACE_LISTEN, tid, 0, 0)?;
                     continue;
                 }
             } else {
@@ -286,7 +379,7 @@ impl Tracer {
                 self.held.insert(tid);
                 return Ok(output);
             }
-            ptrace(
+            self.request(
                 if self.observe_syscalls {
                     libc::PTRACE_SYSCALL
                 } else {
@@ -301,7 +394,7 @@ impl Tracer {
     }
     pub fn resume(&mut self, tid: i32) -> Result<()> {
         self.held.remove(&tid);
-        ptrace(
+        self.request(
             if self.observe_syscalls {
                 libc::PTRACE_SYSCALL
             } else {
@@ -377,6 +470,28 @@ impl Drop for Tracer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn live_untraced_task_is_not_mistaken_for_an_exited_target() {
+        let pid = std::process::id() as i32;
+        let mut tracer = Tracer {
+            pid,
+            tids: BTreeSet::from([pid]),
+            initial: BTreeSet::new(),
+            entries: BTreeMap::new(),
+            exits: BTreeMap::new(),
+            active: true,
+            held: BTreeSet::new(),
+            follow: false,
+            observe_syscalls: true,
+            discovered: Vec::new(),
+            pending: VecDeque::new(),
+        };
+        assert!(tracer.resume(pid).is_err());
+        assert!(tracer.tids.contains(&pid));
+        assert!(tracer.exits.is_empty());
+        // This fixture owns no ptrace attachment to detach.
+        tracer.tids.clear();
+    }
     #[test]
     fn native_names_and_numeric_fallback() {
         assert_eq!(number("write"), Some(libc::SYS_write));

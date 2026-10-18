@@ -1634,3 +1634,62 @@ fn live_process_tree_thread_exec_discards_replaced_stops() {
     }
     std::fs::remove_dir_all(directory).unwrap();
 }
+
+#[test]
+#[ignore = "requires ptrace and a native C compiler"]
+fn live_syscalls_sibling_exit_group_preserves_exit_status() {
+    let directory =
+        std::env::temp_dir().join(format!("poortrace-exit-group-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let source = directory.join("exit-group.c");
+    let binary = directory.join("exit-group");
+    std::fs::write(
+        &source,
+        r#"
+#include <pthread.h>
+#include <stdatomic.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+static atomic_int ready;
+static void *killer(void *unused) {
+    (void)unused;
+    while (!atomic_load(&ready)) usleep(10);
+    usleep(1000);
+    _exit(23);
+}
+int main(void) {
+    pthread_t thread;
+    if (pthread_create(&thread, 0, killer, 0)) return 99;
+    atomic_store(&ready, 1);
+    for (;;) syscall(SYS_getpid);
+}
+"#,
+    )
+    .unwrap();
+    let compile = Command::new("cc")
+        .args(["-O0", "-g", "-pthread"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .unwrap();
+    assert!(compile.status.success(), "{}", errors(&compile));
+    for attempt in 0..24 {
+        let out = trace(&[
+            "-q",
+            "-d",
+            "5",
+            "-e",
+            "syscall:enter:getpid { repeat(1024) { @hits=count(); } }",
+            "--",
+            binary.to_str().unwrap(),
+        ]);
+        assert_eq!(
+            out.status.code(),
+            Some(23),
+            "attempt {attempt}: {}",
+            errors(&out)
+        );
+    }
+    std::fs::remove_dir_all(directory).unwrap();
+}
