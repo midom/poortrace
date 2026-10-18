@@ -627,12 +627,32 @@ even after the thread exits.
 ## Function discovery, SDT markers, and typed reads
 
 ```sh
+# List concrete entry/return/USDT probes in the executable and mapped libraries.
+poortrace -l -p 1234
+poortrace -l -p 1234 --function-filter '*work*'
 poortrace --list-functions /path/app --function-filter 'work*'
 poortrace --list-usdt /path/app
 poortrace -e 'uprobe:/path/app:work* { @[probe] = count(); }' -- /path/app
 poortrace -e 'usdt:/path/app:provider:request* { @[probe, arg0] = count(); }' -- /path/app
 poortrace -f -e 'syscall:enter:write { @[pid, ustack] = count(); }' -- /path/app
 ```
+
+`-l -p PID` inspects a bounded snapshot of the running executable and its
+file-backed executable library mappings. It prints sorted, deduplicated concrete
+`uprobe:PATH:FUNCTION`, `uretprobe:PATH:FUNCTION`, and `usdt:PATH:PROVIDER:NAME`
+selectors that can be copied into a script. Paths refer to the target's filesystem
+namespace; paths needing quotes are quoted in the output. `--function-filter`
+matches raw/demangled function names and SDT marker names or `provider:name`.
+Ambiguous or specially encoded symbol names are listed by exact file offset.
+
+Discovery neither attaches nor opens perf events. Symbol visibility depends on
+the ELF files: stripped images may expose only dynamic symbols, and anonymous
+JIT code is not enumerated. Deleted, replaced, unreadable, or unsupported library
+images produce diagnostics; an inaccessible executable or PID fails explicitly.
+Files are checked against mapping device/inode identities. Newly loaded libraries
+after the snapshot are not included. Limits are 1024 images, 128 MiB per image,
+512 MiB total ELF data, and 250,000 matching functions. Plain `-l` without a PID
+continues to list the supported probe families.
 
 Function globs match raw or demangled names, deduplicate aliases by file offset,
 and expand to at most 256 probes per clause. Quote paths containing spaces.

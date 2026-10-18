@@ -195,7 +195,11 @@ pub fn functions(tid: i32, path: &str, pattern: &str) -> Result<Vec<Function>> {
     if bytes.len() > 128 * 1024 * 1024 {
         return Err("function ELF exceeds 128 MiB".into());
     }
-    let object = object::File::parse(bytes.as_slice()).map_err(|e| e.to_string())?;
+    functions_from_bytes(&bytes, pattern)
+}
+
+pub(crate) fn functions_from_bytes(bytes: &[u8], pattern: &str) -> Result<Vec<Function>> {
+    let object = object::File::parse(bytes).map_err(|e| e.to_string())?;
     let mut found = BTreeSet::new();
     for symbol in object.symbols().chain(object.dynamic_symbols()) {
         if symbol.kind() != SymbolKind::Text || symbol.is_undefined() {

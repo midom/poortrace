@@ -30,7 +30,11 @@ pub fn sites(tid: i32, path: &str) -> Result<Vec<Site>> {
     if data.len() > 128 * 1024 * 1024 {
         return Err("SDT ELF exceeds 128 MiB".into());
     }
-    let elf = object::File::parse(data.as_slice()).map_err(|e| e.to_string())?;
+    sites_from_bytes(&data)
+}
+
+pub(crate) fn sites_from_bytes(data: &[u8]) -> Result<Vec<Site>> {
+    let elf = object::File::parse(data).map_err(|e| e.to_string())?;
     if !elf.is_64() || elf.is_little_endian() != cfg!(target_endian = "little") {
         return Err("native 64-bit SDT notes required".into());
     }

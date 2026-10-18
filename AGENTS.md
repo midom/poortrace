@@ -49,6 +49,8 @@ Serde for profile/report formats; LLVM is accessed through direct C API bindings
 - `src/counters.rs`: grouped per-thread/per-CPU counters and scheduling-time scaling.
 - `src/functions.rs`: all-stop ptrace function breakpoints, return matching, fork handling, and text restoration.
 - `src/uprobe.rs`: ELF symbol/file-offset resolution and optional dynamic perf uprobe registration data.
+- `src/discovery.rs`: read-only, identity-checked native/USDT probe discovery for
+  `-l -p PID` across the executable and mapped libraries.
 - `src/syscall.rs`: ptrace syscall/lifecycle tracking and detach cleanup; native
   syscall-name tables live in `src/syscalls/{x86_64,aarch64}.txt`.
 - `src/perf.rs`: perf attributes, event descriptors, mmap ring consumption,

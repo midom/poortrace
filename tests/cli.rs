@@ -1092,3 +1092,56 @@ fn live_perf_node_javascript_frames() {
         "{text}"
     );
 }
+
+#[test]
+#[ignore = "requires a native C compiler"]
+fn live_usdt_discovery_for_pid() {
+    use std::io::{BufRead, BufReader};
+    let directory =
+        std::env::temp_dir().join(format!("poortrace-usdt-discovery-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let binary = directory.join("fixture");
+    let compile = Command::new("cc")
+        .args(["-g", "-O1", "-no-pie"])
+        .arg(format!(
+            "{}/tests/fixtures/usdt.c",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .unwrap();
+    assert!(compile.status.success(), "{}", errors(&compile));
+    let mut child = Command::new(&binary)
+        .arg("attach")
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    struct Fixture(Child);
+    use std::process::Child;
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    let mut fixture = Fixture(child);
+    let mut ready = String::new();
+    reader.read_line(&mut ready).unwrap();
+    assert!(!ready.is_empty());
+    let out = trace(&[
+        "-l",
+        "-p",
+        &fixture.0.id().to_string(),
+        "--function-filter",
+        "poortrace:work",
+    ]);
+    assert!(out.status.success(), "{}", errors(&out));
+    let expected = format!("usdt:{}:poortrace:work\n", binary.display());
+    assert_eq!(output(&out), expected);
+    poortrace::language::parse(&format!("{} {{ @calls=count(); }}", expected.trim())).unwrap();
+    assert!(fixture.0.try_wait().unwrap().is_none());
+    drop(fixture);
+    std::fs::remove_dir_all(directory).unwrap();
+}

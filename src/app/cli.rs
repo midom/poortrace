@@ -45,7 +45,7 @@ pub(super) struct Args {
     /// Print generated LLVM IR and exit
     #[arg(long)]
     pub(super) emit_llvm: bool,
-    /// List supported probes/events
+    /// List probe families, or concrete native/USDT probes in a process with -p PID
     #[arg(short = 'l', long)]
     pub(super) list: bool,
     /// Save handler events and helper results for offline replay
@@ -96,7 +96,7 @@ pub(super) struct Args {
     /// List ELF functions and file offsets without attaching
     #[arg(long)]
     pub(super) list_functions: Option<String>,
-    /// Glob used by --list-functions (raw or demangled names)
+    /// Function/marker glob for --list-functions or -l -p PID (raw or demangled names)
     #[arg(long, default_value = "*")]
     pub(super) function_filter: String,
     /// Track thread creation with ptrace instead of periodic discovery

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Discover concrete native entry/return and USDT probes in an existing process with `-l -p PID`, including mapped libraries and function/marker filtering.
+
 - Honor the selected native stack unwinder independently of recording and managed stack capture.
 - Export versioned CLI JSON reports with measurement provenance; retain legacy JSON comparison imports.
 - Preserve recording provenance during replay and label wall-clock profiles in exported files.

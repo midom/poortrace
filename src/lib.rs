@@ -44,3 +44,5 @@ pub mod managed_bridge;
 pub mod capture;
 
 pub mod native_args;
+
+pub mod discovery;

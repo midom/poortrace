@@ -83,6 +83,16 @@ fn run_with_args(mut args: Args) -> Result<i32> {
         return Ok(0);
     }
     if args.list {
+        if let Some(pid) = args.pid {
+            let listing = poortrace::discovery::process(pid, &args.function_filter)?;
+            for warning in listing.warnings {
+                eprintln!("poortrace: {warning}");
+            }
+            for probe in listing.probes {
+                println!("{probe}");
+            }
+            return Ok(0);
+        }
         println!(
             "BEGIN\nEND\ntracepoint:CATEGORY:EVENT\nkprobe:FUNCTION\nkretprobe:FUNCTION\ninterval:{{ns,us,ms,s,hz}}:N\nprofile:{{ns,us,ms,s,hz}}:N\nwait:{{ms,s,hz}}:N\nwakeup:{{ms,s,hz}}:N\nuprobe:PATH:FUNCTION\nuretprobe:PATH:FUNCTION\nusdt:PATH:PROVIDER:NAME"
         );
