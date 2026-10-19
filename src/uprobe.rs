@@ -4,7 +4,6 @@ use object::{Object, ObjectSegment, ObjectSymbol, SegmentFlags, SymbolKind};
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::CString,
-    io::Read,
 };
 
 pub struct Resolved {
@@ -34,20 +33,22 @@ pub fn locate_many(tid: i32, specs: &[(&str, &str, bool)]) -> Result<Vec<Resolve
             path.to_string()
         };
         let file = std::fs::File::open(&target).map_err(|e| format!("uprobe {path}: {e}"))?;
-        if file.metadata().map_err(|e| e.to_string())?.len() > 128 * 1024 * 1024 {
-            return Err("uprobe ELF file exceeds 128 MiB".into());
-        }
-        let mut bytes = Vec::new();
-        file.take(128 * 1024 * 1024 + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|e| e.to_string())?;
-        if bytes.len() > 128 * 1024 * 1024 {
-            return Err("uprobe ELF file exceeds 128 MiB".into());
-        }
-        let object =
-            object::File::parse(bytes.as_slice()).map_err(|e| format!("uprobe ELF {path}: {e}"))?;
+        let image = crate::elf_image::Image::new(file)?;
+        let object = image.parse().map_err(|e| format!("uprobe ELF {path}: {e}"))?;
         let mut symbols = BTreeMap::<String, BTreeSet<(u64, u64)>>::new();
-        if indices.iter().any(|&index| {
+        if let Some(index) = image.index() {
+            for &request in &indices {
+                let function = specs[request].1;
+                let name = function.rsplit_once('+')
+                    .filter(|(_, delta)| number(delta).is_some())
+                    .map_or(function, |(name, _)| name);
+                if !name.starts_with("0x") && !name.starts_with("__sdt__")
+                    && !symbols.contains_key(name)
+                {
+                    symbols.insert(name.into(), index.lookup(name)?);
+                }
+            }
+        } else if indices.iter().any(|&index| {
             let function = specs[index].1;
             !function.starts_with("0x") && !function.starts_with("__sdt__")
         }) {
@@ -65,6 +66,7 @@ pub fn locate_many(tid: i32, specs: &[(&str, &str, bool)]) -> Result<Vec<Resolve
                 }
             }
         }
+        image.check()?;
         for index in indices {
             let (_, function, ret) = specs[index];
             results[index] = Some(locate_object(
@@ -78,8 +80,8 @@ pub fn locate_many(tid: i32, specs: &[(&str, &str, bool)]) -> Result<Vec<Resolve
         .collect()
 }
 
-fn locate_object(
-    object: &object::File<'_>,
+fn locate_object<'a, R: object::read::ReadRef<'a>>(
+    object: &object::File<'a, R>,
     symbols: &BTreeMap<String, BTreeSet<(u64, u64)>>,
     target: &str,
     path: &str,
@@ -252,21 +254,20 @@ pub fn functions(tid: i32, path: &str, pattern: &str) -> Result<Vec<Function>> {
         path.into()
     };
     let file = std::fs::File::open(&target).map_err(|e| format!("{path}: {e}"))?;
-    if file.metadata().map_err(|e| e.to_string())?.len() > 128 * 1024 * 1024 {
-        return Err("function ELF exceeds 128 MiB".into());
+    let image = crate::elf_image::Image::new(file)?;
+    if let Some(index) = image.index() {
+        return index.functions(pattern);
     }
-    let mut bytes = Vec::new();
-    file.take(128 * 1024 * 1024 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|e| e.to_string())?;
-    if bytes.len() > 128 * 1024 * 1024 {
-        return Err("function ELF exceeds 128 MiB".into());
-    }
-    functions_from_bytes(&bytes, pattern)
+    let functions = functions_from_data(&image, pattern);
+    image.check()?;
+    functions
 }
 
-pub(crate) fn functions_from_bytes(bytes: &[u8], pattern: &str) -> Result<Vec<Function>> {
-    let object = object::File::parse(bytes).map_err(|e| e.to_string())?;
+pub(crate) fn functions_from_data<'a, R: object::read::ReadRef<'a>>(
+    data: R,
+    pattern: &str,
+) -> Result<Vec<Function>> {
+    let object = object::File::parse(data).map_err(|e| e.to_string())?;
     let mut found = BTreeSet::new();
     for symbol in object.symbols().chain(object.dynamic_symbols()) {
         if symbol.kind() != SymbolKind::Text || symbol.is_undefined() {

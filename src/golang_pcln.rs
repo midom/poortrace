@@ -58,18 +58,24 @@ fn cstring(data: &[u8], at: usize) -> Result<String> {
         .ok_or("Go name exceeds 4096 bytes")?;
     String::from_utf8(tail[..end].to_vec()).map_err(|e| e.to_string())
 }
-struct Types<'a> {
-    elf: &'a object::File<'a>,
+struct Types<'a, 'data, R: object::read::ReadRef<'data>> {
+    elf: &'a object::File<'data, R>,
+    reader: R,
     base: u64,
 }
-impl Types<'_> {
+impl<'data, R: object::read::ReadRef<'data>> Types<'_, 'data, R> {
     fn data(&self, address: u64, size: usize) -> Result<&[u8]> {
         self.elf
             .segments()
             .find_map(|segment| {
-                let offset = address.checked_sub(segment.address())?;
-                let data = segment.data().ok()?;
-                data.get(offset as usize..(offset as usize).checked_add(size)?)
+                let delta = address.checked_sub(segment.address())?;
+                let (offset, length) = segment.file_range();
+                if delta.checked_add(size as u64)? > length {
+                    return None;
+                }
+                self.reader
+                    .read_bytes_at(offset.checked_add(delta)?, size as u64)
+                    .ok()
             })
             .ok_or_else(|| "Go reflection address outside ELF".into())
     }
@@ -138,7 +144,10 @@ impl Types<'_> {
 }
 type Fields = BTreeMap<String, (u64, usize)>;
 impl Image {
-    pub fn parse(elf: &object::File<'_>, bias: u64) -> Result<(Self, Fields)> {
+    pub fn parse<'data, R: object::read::ReadRef<'data>>(
+        elf: &object::File<'data, R>,
+        bias: u64,
+    ) -> Result<(Self, Fields)> {
         // Go's internal PIE linker stores preferred virtual-address addends in
         // reflection fields. Interpret them in the ELF, and apply the observed
         // load bias only to live PCs/globals (not to file metadata pointers).
@@ -176,6 +185,10 @@ impl Image {
             .ok_or("Go reflection types unavailable")?;
         let types = Types {
             elf,
+            reader: match elf {
+                object::File::Elf64(elf) => elf.data(),
+                _ => return Err("Go reflection requires 64-bit ELF".into()),
+            },
             base: ro.address(),
         };
         let links = elf

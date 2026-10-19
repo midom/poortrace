@@ -2,7 +2,6 @@
 use crate::Result;
 use object::{Object, ObjectSection, ObjectSegment, SegmentFlags};
 use serde::{Deserialize, Serialize};
-use std::io::Read;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Site {
     pub provider: String,
@@ -23,17 +22,16 @@ pub fn sites(tid: i32, path: &str) -> Result<Vec<Site>> {
         path.into()
     };
     let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
-    let mut data = Vec::new();
-    file.take(128 * 1024 * 1024 + 1)
-        .read_to_end(&mut data)
-        .map_err(|e| e.to_string())?;
-    if data.len() > 128 * 1024 * 1024 {
-        return Err("SDT ELF exceeds 128 MiB".into());
+    let image = crate::elf_image::Image::new(file)?;
+    if let Some(index) = image.index() {
+        return index.sites();
     }
-    sites_from_bytes(&data)
+    let sites = sites_from_data(&image);
+    image.check()?;
+    sites
 }
 
-pub(crate) fn sites_from_bytes(data: &[u8]) -> Result<Vec<Site>> {
+pub(crate) fn sites_from_data<'a, R: object::read::ReadRef<'a>>(data: R) -> Result<Vec<Site>> {
     let elf = object::File::parse(data).map_err(|e| e.to_string())?;
     if !elf.is_64() || elf.is_little_endian() != cfg!(target_endian = "little") {
         return Err("native 64-bit SDT notes required".into());

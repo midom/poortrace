@@ -2,7 +2,6 @@
 use crate::{Result, perf::UserRegs, symbols::Mapping};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    os::unix::fs::MetadataExt,
     time::{Duration, Instant},
 };
 
@@ -511,21 +510,23 @@ impl Tracer {
             .collect();
         let resolved = crate::uprobe::locate_many(pid, &requests)?;
         let mut metadata = BTreeMap::new();
+        let mut identities = crate::file_identity::Resolver::new(pid as u32);
         let mut bindings = Vec::with_capacity(specs.len());
         for (spec, resolved) in specs.iter().zip(resolved) {
             let path = resolved.path.to_str().map_err(|e| e.to_string())?;
-            let meta = if let Some(meta) = metadata.get(path) {
-                meta
+            let (device, inode) = if let Some(identity) = metadata.get(path) {
+                *identity
             } else {
-                metadata
-                    .entry(path.to_owned())
-                    .or_insert(std::fs::metadata(path).map_err(|e| e.to_string())?)
+                let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+                let identity = identities.identify(&file).map_err(|e| e.to_string())?;
+                metadata.insert(path.to_owned(), identity);
+                identity
             };
             bindings.push(Binding {
                 usdt: crate::usdt::encoded(&spec.function)?,
                 offset: resolved.offset,
-                inode: meta.ino(),
-                device: meta.dev(),
+                inode,
+                device,
                 ret: spec.ret,
             });
         }

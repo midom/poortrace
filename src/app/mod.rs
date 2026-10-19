@@ -31,6 +31,18 @@ pub(super) fn run() -> Result<i32> {
 }
 
 fn run_with_args(mut args: Args) -> Result<i32> {
+    if let Some(binary) = &args.build_index {
+        let output = args.index_output.as_ref()
+            .ok_or("--build-index requires --index-output")?;
+        let count = poortrace::binary_index::build(
+            args.pid.unwrap_or(std::process::id() as i32),
+            binary,
+            output,
+        )?;
+        println!("Indexed {count} functions in {}", output.display());
+        return Ok(0);
+    }
+    poortrace::binary_index::configure(&args.binary_index)?;
     for event in &mut args.stat_events {
         *event = poortrace::language::canonical_probe_name(event).into_owned();
     }

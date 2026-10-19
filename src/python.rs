@@ -5,7 +5,6 @@ use crate::{Result, memory};
 use object::{Object, ObjectSegment, ObjectSymbol};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    io::Read,
     time::{Duration, Instant},
 };
 #[derive(Default)]
@@ -216,19 +215,10 @@ fn runtime(pid: u32) -> Result<(u64, Layout)> {
         let Ok(file) = std::fs::File::open(path) else {
             continue;
         };
-        if file.metadata().is_ok_and(|m| m.len() > 128 * 1024 * 1024) {
+        let Ok(image) = crate::elf_image::Image::new(file) else {
             continue;
-        }
-        let mut bytes = Vec::new();
-        if file
-            .take(128 * 1024 * 1024 + 1)
-            .read_to_end(&mut bytes)
-            .is_err()
-            || bytes.len() > 128 * 1024 * 1024
-        {
-            continue;
-        }
-        let Ok(elf) = object::File::parse(bytes.as_slice()) else {
+        };
+        let Ok(elf) = image.parse() else {
             continue;
         };
         #[cfg(target_arch = "aarch64")]
@@ -266,6 +256,7 @@ fn runtime(pid: u32) -> Result<(u64, Layout)> {
                 _ => {}
             }
         }
+        image.check()?;
         if let (Some(runtime), Some(version)) = (runtime, version) {
             let version = u32::from_ne_bytes(read(pid, version, 4)?.try_into().unwrap());
             if trace_refs {
@@ -304,6 +295,7 @@ fn runtime(pid: u32) -> Result<(u64, Layout)> {
             {
                 return Err("CPython stack-reference debug builds are unsupported".into());
             }
+            image.check()?;
             return Ok((runtime, layout));
         }
     }

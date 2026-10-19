@@ -108,6 +108,15 @@ pub(super) struct Args {
     /// List ELF functions and file offsets without attaching
     #[arg(long)]
     pub(super) list_functions: Option<String>,
+    /// Build a reusable flat index for this ELF binary without attaching
+    #[arg(long, requires="index_output", conflicts_with_all=["replay", "list", "list_functions", "list_usdt", "expression", "script", "command", "shell_command", "stat", "check", "emit_llvm", "binary_index"])]
+    pub(super) build_index: Option<String>,
+    /// Output file for --build-index (replaced atomically)
+    #[arg(long, requires="build_index")]
+    pub(super) index_output: Option<PathBuf>,
+    /// Reuse a binary index for native names, probes, and stacks (repeatable)
+    #[arg(long, conflicts_with="replay")]
+    pub(super) binary_index: Vec<PathBuf>,
     /// Function/marker glob for --list-functions or -l -p PID (raw or demangled names)
     #[arg(long, default_value = "*")]
     pub(super) function_filter: String,

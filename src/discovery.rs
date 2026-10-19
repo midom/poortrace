@@ -8,8 +8,7 @@ use std::{
     os::unix::fs::MetadataExt,
 };
 
-const MAX_IMAGE: u64 = 128 * 1024 * 1024;
-const MAX_TOTAL: usize = 512 * 1024 * 1024;
+const MAX_TOTAL: u64 = 8 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct FunctionMatch {
@@ -45,8 +44,13 @@ fn process_inner(pid: i32, pattern: &str, printable: bool) -> Result<Listing> {
     }
     let started = crate::managed_bridge::start_ticks(pid as u32)
         .map_err(|e| format!("cannot inspect PID {pid}: {e}"))?;
-    let executable = std::fs::metadata(format!("/proc/{pid}/exe"))
+    let executable_file = File::open(format!("/proc/{pid}/exe"))
         .map_err(|e| format!("cannot inspect executable of PID {pid}: {e}"))?;
+    let executable = executable_file.metadata().map_err(|e| e.to_string())?;
+    let mut identities = crate::file_identity::Resolver::new(pid as u32);
+    let executable_identity = identities
+        .identify(&executable_file)
+        .map_err(|e| format!("cannot identify executable of PID {pid}: {e}"))?;
     let mut maps = String::new();
     File::open(format!("/proc/{pid}/maps"))
         .map_err(|e| format!("cannot inspect mappings of PID {pid}: {e}"))?
@@ -75,23 +79,21 @@ fn process_inner(pid: i32, pattern: &str, printable: bool) -> Result<Listing> {
         }
     }
     let mut images: Vec<_> = images.into_iter().collect();
-    images.sort_by_key(|((device, inode), _)| {
-        !(*device == executable.dev() && *inode == executable.ino())
-    });
+    images.sort_by_key(|((device, inode), _)| (*device, *inode) != executable_identity);
     let mut probes = BTreeSet::new();
-    let mut total = 0usize;
+    let mut total = 0u64;
     let mut candidates = Vec::new();
     let mut found_executable = false;
     for ((device, inode), (mapping, deleted)) in images {
-        let main = device == executable.dev() && inode == executable.ino();
+        let main = (device, inode) == executable_identity;
         let path = &mapping.path;
         let loaded = if deleted {
             Err("mapped image has been deleted".into())
         } else {
-            read_image(pid, &mapping)
+            read_image(pid, &mapping, &mut identities)
         };
-        let bytes = match loaded {
-            Ok(bytes) => bytes,
+        let image = match loaded {
+            Ok(image) => image,
             Err(error) => {
                 if main {
                     return Err(format!("cannot list executable {path}: {error}"));
@@ -102,12 +104,17 @@ fn process_inner(pid: i32, pattern: &str, printable: bool) -> Result<Listing> {
         };
         found_executable |= main;
         total = total
-            .checked_add(bytes.len())
+            .checked_add(image.size())
             .ok_or("probe discovery byte count overflow")?;
         if total > MAX_TOTAL {
-            return Err("probe discovery ELF data exceeds 512 MiB".into());
+            return Err("probe discovery ELF file sizes exceed 8 GiB".into());
         }
-        let discovered = match crate::uprobe::functions_from_bytes(&bytes, pattern) {
+        let discovered = if let Some(index) = image.index() {
+            index.functions(pattern)
+        } else {
+            crate::uprobe::functions_from_data(&image, pattern)
+        };
+        let discovered = match image.check().and(discovered) {
             Ok(found) => found,
             Err(error) if !main => {
                 warnings.push(format!("cannot list functions in {path}: {error}"));
@@ -147,7 +154,12 @@ fn process_inner(pid: i32, pattern: &str, printable: bool) -> Result<Listing> {
         if !printable {
             continue;
         }
-        match crate::usdt::sites_from_bytes(&bytes) {
+        let sites = if let Some(index) = image.index() {
+            index.sites()
+        } else {
+            crate::usdt::sites_from_data(&image)
+        };
+        match image.check().and(sites) {
             Ok(sites) => {
                 for site in sites {
                     let name = format!("{}:{}", site.provider, site.name);
@@ -167,7 +179,10 @@ fn process_inner(pid: i32, pattern: &str, printable: bool) -> Result<Listing> {
     }
     if !found_executable {
         return Err(format!(
-            "executable of PID {pid} has no readable executable mapping"
+            "executable of PID {pid} has no matching file-backed executable mapping in /proc/{pid}/maps (device {:x}:{:x}, inode {}); check the executable identity and retry if the process executed a new image",
+            libc::major(executable_identity.0),
+            libc::minor(executable_identity.0),
+            executable_identity.1,
         ));
     }
     let current = std::fs::metadata(format!("/proc/{pid}/exe")).map_err(|e| e.to_string())?;
@@ -185,24 +200,18 @@ fn process_inner(pid: i32, pattern: &str, printable: bool) -> Result<Listing> {
     })
 }
 
-fn read_image(pid: i32, mapping: &Mapping) -> Result<Vec<u8>> {
+fn read_image(
+    pid: i32,
+    mapping: &Mapping,
+    identities: &mut crate::file_identity::Resolver,
+) -> Result<crate::elf_image::Image> {
     let file =
         File::open(format!("/proc/{pid}/root{}", mapping.path)).map_err(|e| e.to_string())?;
-    let metadata = file.metadata().map_err(|e| e.to_string())?;
-    if metadata.dev() != mapping.device || metadata.ino() != mapping.inode {
+    if identities.identify(&file).map_err(|e| e.to_string())? != (mapping.device, mapping.inode) {
         return Err("pathname no longer identifies the mapped image".into());
     }
-    if metadata.len() > MAX_IMAGE {
-        return Err("ELF image exceeds 128 MiB".into());
-    }
-    let mut bytes = Vec::new();
-    file.take(MAX_IMAGE + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|e| e.to_string())?;
-    if bytes.len() as u64 > MAX_IMAGE {
-        return Err("ELF image exceeds 128 MiB".into());
-    }
-    let elf = object::File::parse(bytes.as_slice()).map_err(|e| e.to_string())?;
+    let image = crate::elf_image::Image::new(file)?;
+    let elf = image.parse()?;
     #[cfg(target_arch = "x86_64")]
     let architecture = object::Architecture::X86_64;
     #[cfg(target_arch = "aarch64")]
@@ -213,7 +222,7 @@ fn read_image(pid: i32, mapping: &Mapping) -> Result<Vec<u8>> {
     {
         return Err("mapped image is not native 64-bit ELF".into());
     }
-    Ok(bytes)
+    Ok(image)
 }
 
 pub(crate) fn component(text: &str, path: bool) -> Result<String> {
@@ -270,6 +279,28 @@ pub fn function_probe_name(path: &str, name: &str, ret: bool) -> Result<String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_read_rejects_wrong_device_and_inode() {
+        let pid = std::process::id();
+        let mut identities = crate::file_identity::Resolver::new(pid);
+        let file = File::open(format!("/proc/{pid}/exe")).unwrap();
+        let identity = identities.identify(&file).unwrap();
+        let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).unwrap();
+        let mapping = maps
+            .lines()
+            .filter_map(Mapping::parse)
+            .find(|mapping| (mapping.device, mapping.inode) == identity)
+            .unwrap();
+        let mut wrong_device = mapping.clone();
+        wrong_device.device ^= 1;
+        let mut wrong_inode = mapping;
+        wrong_inode.inode = wrong_inode.inode.wrapping_add(1);
+        for mapping in [wrong_device, wrong_inode] {
+            let error = read_image(pid as i32, &mapping, &mut identities).unwrap_err();
+            assert!(error.contains("pathname no longer identifies"), "{error}");
+        }
+    }
     #[test]
     fn generated_selectors_quote_numeric_paths_and_symbol_components() {
         for path in [

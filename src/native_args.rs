@@ -5,7 +5,7 @@ use crate::{
 };
 use addr2line::gimli::{self, AttributeValue, Reader as _, UnwindSection};
 use object::{Object, ObjectSection, ObjectSegment};
-use std::{io::Read, os::unix::fs::MetadataExt};
+use std::os::unix::fs::MetadataExt;
 #[derive(Default)]
 pub struct Reader {
     image: Option<(String, Image)>,
@@ -26,7 +26,11 @@ impl Reader {
         } else {
             path.to_owned()
         };
-        let meta = std::fs::metadata(&target).map_err(|e| e.to_string())?;
+        let file = std::fs::File::open(&target).map_err(|e| e.to_string())?;
+        let meta = file.metadata().map_err(|e| e.to_string())?;
+        let (device, inode) = crate::file_identity::Resolver::new(pid)
+            .identify(&file)
+            .map_err(|e| e.to_string())?;
         let identity = format!(
             "{pid}:{target}:{}:{}:{}:{}",
             meta.dev(),
@@ -47,8 +51,8 @@ impl Reader {
             .find(|map| {
                 map.start <= regs.ip
                     && regs.ip < map.end
-                    && map.inode == meta.ino()
-                    && map.device == meta.dev()
+                    && map.inode == inode
+                    && map.device == device
             })
             .ok_or("stopped PC is outside the selected DWARF image")?;
         let (offset, _, address) = image
@@ -210,16 +214,9 @@ impl Reader {
 }
 impl Image {
     fn load(path: &str) -> Result<Self> {
-        let mut data = Vec::new();
-        std::fs::File::open(path)
-            .map_err(|e| e.to_string())?
-            .take(128 * 1024 * 1024 + 1)
-            .read_to_end(&mut data)
-            .map_err(|e| e.to_string())?;
-        if data.len() > 128 * 1024 * 1024 {
-            return Err("DWARF image exceeds128MiB".into());
-        }
-        let object = object::File::parse(data.as_slice()).map_err(|e| e.to_string())?;
+        let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+        let image = crate::elf_image::Image::new(file)?;
+        let object = image.parse()?;
         let segments=object.segments().filter(|segment|matches!(segment.flags(),object::SegmentFlags::Elf{p_flags} if p_flags & object::elf::PF_X!=0)).take(129).map(|segment|{let(offset,size)=segment.file_range();(offset,size,segment.address())}).collect::<Vec<_>>();
         if segments.len() > 128 {
             return Err("ELF segment limit exceeded".into());
@@ -242,6 +239,7 @@ impl Image {
         };
         let (sections, endian) =
             types::load_dwarf(std::fs::File::open(path).map_err(|e| e.to_string())?)?;
+        image.check()?;
         Ok(Self {
             sections,
             endian,

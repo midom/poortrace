@@ -51,6 +51,32 @@ impl Mapping {
     }
 }
 
+fn debuglink_crc(path: &str) -> std::io::Result<u32> {
+    let mut file = std::fs::File::open(path)?.take(crate::elf_image::MAX_FILE_SIZE + 1);
+    let mut buffer = [0u8; 64 * 1024];
+    let mut total = 0u64;
+    let mut sum = !0u32;
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            return Ok(sum ^ !0);
+        }
+        total += count as u64;
+        if total > crate::elf_image::MAX_FILE_SIZE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "debug ELF exceeds 4 GiB",
+            ));
+        }
+        for &byte in &buffer[..count] {
+            sum ^= byte as u32;
+            for _ in 0..8 {
+                sum = (sum >> 1) ^ if sum & 1 != 0 { 0xedb88320 } else { 0 };
+            }
+        }
+    }
+}
+
 struct Symbol {
     address: u64,
     size: u64,
@@ -60,6 +86,7 @@ struct Image {
     // ELF load segments: file offset, file size, virtual address.
     segments: Vec<(u64, u64, u64)>,
     symbols: Vec<Symbol>,
+    index: Option<std::sync::Arc<crate::binary_index::Index>>,
     lines: Option<addr2line::Loader>,
     sections: framehop::ExplicitModuleSectionInfo<std::sync::Arc<[u8]>>,
 }
@@ -73,23 +100,18 @@ impl Image {
             "/proc/{pid}/map_files/{:x}-{:x}",
             mapping.start, mapping.end
         );
+        let mut identities = crate::file_identity::Resolver::new(pid);
         let (file, selected_path) = [root_path, map_path].into_iter().find_map(|path| {
             let file = std::fs::File::open(&path).ok()?;
             let meta = file.metadata().ok()?;
-            (meta.ino() == mapping.inode
-                && meta.dev() == mapping.device
-                && meta.len() <= 128 * 1024 * 1024)
+            (identities.identify(&file).ok()? == (mapping.device, mapping.inode)
+                && meta.len() <= crate::elf_image::MAX_FILE_SIZE)
                 .then_some((file, path))
         })?;
-        let mut bytes = Vec::new();
-        file.take(128 * 1024 * 1024 + 1)
-            .read_to_end(&mut bytes)
-            .ok()?;
-        if bytes.len() > 128 * 1024 * 1024 {
-            return None;
-        }
-        let mut image = Self::parse(&bytes)?;
-        let object = object::File::parse(bytes.as_slice()).ok()?;
+        let data = crate::elf_image::Image::new(file).ok()?;
+        let mut image = Self::parse_with_index(&data, data.index().cloned())?;
+        data.check().ok()?;
+        let object = data.parse().ok()?;
         let mut candidates = Vec::new();
         if let Ok(Some((name, crc))) = object.gnu_debuglink() {
             if let Ok(name) = std::str::from_utf8(name) {
@@ -123,23 +145,17 @@ impl Image {
                 ));
             }
         }
-        candidates.push((selected_path, None));
+        if image.index.is_none() || object.section_by_name(".debug_info").is_some() {
+            candidates.push((selected_path, None));
+        }
         for (path, crc) in candidates {
-            if !std::fs::metadata(&path).is_ok_and(|meta| meta.len() <= 128 * 1024 * 1024) {
+            if !std::fs::metadata(&path)
+                .is_ok_and(|meta| meta.len() <= crate::elf_image::MAX_FILE_SIZE)
+            {
                 continue;
             }
             if let Some(crc) = crc {
-                let Ok(bytes) = std::fs::read(&path) else {
-                    continue;
-                };
-                let actual = bytes.iter().fold(!0u32, |mut sum, b| {
-                    sum ^= *b as u32;
-                    for _ in 0..8 {
-                        sum = (sum >> 1) ^ if sum & 1 != 0 { 0xedb88320 } else { 0 };
-                    }
-                    sum
-                }) ^ !0;
-                if actual != crc {
+                if debuglink_crc(&path).ok() != Some(crc) {
                     continue;
                 }
             }
@@ -148,10 +164,18 @@ impl Image {
                 break;
             }
         }
+        data.check().ok()?;
         Some(image)
     }
-    fn parse(bytes: &[u8]) -> Option<Self> {
-        let object = object::File::parse(bytes).ok()?;
+    #[cfg(test)]
+    fn parse<'a, R: object::read::ReadRef<'a>>(data: R) -> Option<Self> {
+        Self::parse_with_index(data, None)
+    }
+    fn parse_with_index<'a, R: object::read::ReadRef<'a>>(
+        data: R,
+        index: Option<std::sync::Arc<crate::binary_index::Index>>,
+    ) -> Option<Self> {
+        let object = object::File::parse(data).ok()?;
         let segments = object
             .segments()
             .map(|segment| {
@@ -163,7 +187,7 @@ impl Image {
             .symbols()
             .chain(object.dynamic_symbols())
             .filter(|symbol| symbol.kind() == SymbolKind::Text && !symbol.is_undefined())
-            .take(250_000)
+            .take(if index.is_some() { 0 } else { 250_000 })
             .filter_map(|symbol| {
                 Some(Symbol {
                     address: symbol.address(),
@@ -191,9 +215,10 @@ impl Image {
             object
                 .section_by_name(name)
                 .filter(|section| {
-                    section
-                        .compressed_data()
-                        .is_ok_and(|data| data.uncompressed_size <= 128 * 1024 * 1024)
+                    section.size() <= 128 * 1024 * 1024
+                        && section
+                            .compressed_data()
+                            .is_ok_and(|data| data.uncompressed_size <= 128 * 1024 * 1024)
                 })
                 .and_then(|section| section.uncompressed_data().ok())
                 .map(|bytes| std::sync::Arc::<[u8]>::from(bytes.as_ref()))
@@ -217,6 +242,7 @@ impl Image {
         Some(Self {
             segments,
             symbols,
+            index,
             lines: None,
             sections,
         })
@@ -227,6 +253,8 @@ impl Image {
             .iter()
             .find(|(offset, size, _)| file_offset >= *offset && file_offset - offset < *size)?;
         let address = address.checked_add(file_offset - offset)?;
+        let indexed = self.index.as_ref()
+            .and_then(|index| index.resolve(address).ok().flatten());
         let index = self
             .symbols
             .partition_point(|symbol| symbol.address <= address);
@@ -234,8 +262,12 @@ impl Image {
             symbol.address <= address
                 && (symbol.size == 0 || address - symbol.address < symbol.size)
         });
-        let delta = closest.map(|symbol| address - symbol.address);
-        let display_name = closest.map(|symbol| demangle(&symbol.name));
+        let delta = indexed.as_ref()
+            .map(|(_, delta)| *delta)
+            .or_else(|| closest.map(|symbol| address - symbol.address));
+        let display_name = indexed.as_ref()
+            .map(|(name, _)| name.clone())
+            .or_else(|| closest.map(|symbol| demangle(&symbol.name)));
         if let Some(loader) = &self.lines {
             if let Ok(mut frames) = loader.find_frames(address) {
                 let mut names = Vec::new();
@@ -248,7 +280,7 @@ impl Image {
                     });
                     if name.is_some() || location.is_some() {
                         let name = name.unwrap_or_else(|| "?".into());
-                        let offset = closest
+                        let offset = delta
                             .filter(|_| display_name.as_deref() == Some(name.as_str()))
                             .map(|_| format!("+0x{:x}", delta.unwrap()))
                             .unwrap_or_default();
@@ -262,6 +294,9 @@ impl Image {
                     return Some(names.join(" [inlined into] "));
                 }
             }
+            if let Some((name, delta)) = &indexed {
+                return Some(format!("{name}+0x{delta:x}"));
+            }
             if let Some(name) = loader.find_symbol(address) {
                 return Some(format!(
                     "{}{}",
@@ -271,6 +306,9 @@ impl Image {
                         .unwrap_or_default()
                 ));
             }
+        }
+        if let Some((name, delta)) = indexed {
+            return Some(format!("{name}+0x{delta:x}"));
         }
         let index = self
             .symbols
@@ -595,13 +633,14 @@ mod tests {
         assert!(text.contains("getpid"), "{text}");
         assert_eq!(symbols.stack(0, &[0x1234]), "    0x1234\n");
         assert!(symbols.stack(0, &[]).contains("<no user stack>"));
-        assert!(Image::parse(b"not an ELF file").is_none());
+        assert!(Image::parse(&b"not an ELF file"[..]).is_none());
     }
 
     #[test]
     fn segment_offsets_handle_non_pie_and_symbol_boundaries() {
         let image = Image {
             segments: vec![(0x1000, 0x1000, 0x401000)],
+            index: None,
             lines: None,
             sections: Default::default(),
             symbols: vec![Symbol {
@@ -623,6 +662,7 @@ mod tests {
     fn raw_symbol_names_demangle_when_resolved() {
         let image = Image {
             segments: vec![(0, 0x1000, 0x400000)],
+            index: None,
             lines: None,
             sections: Default::default(),
             symbols: vec![

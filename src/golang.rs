@@ -9,7 +9,7 @@ use crate::{
 #[path = "golang_pcln.rs"]
 mod pcln;
 use object::{Object, ObjectSegment, ObjectSymbol};
-use std::{collections::BTreeMap, io::Read, os::unix::fs::MetadataExt};
+use std::{collections::BTreeMap, os::unix::fs::MetadataExt};
 
 #[derive(Default)]
 pub struct Reader {
@@ -148,17 +148,8 @@ impl Reader {
             .is_none_or(|layout| layout.identity != identity)
         {
             let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
-            if meta.len() > 128 * 1024 * 1024 {
-                return Err("Go image exceeds128MiB".into());
-            }
-            let mut bytes = Vec::new();
-            file.take(128 * 1024 * 1024 + 1)
-                .read_to_end(&mut bytes)
-                .map_err(|e| e.to_string())?;
-            if bytes.len() > 128 * 1024 * 1024 {
-                return Err("Go image exceeds 128 MiB".into());
-            }
-            let elf = object::File::parse(bytes.as_slice()).map_err(|e| e.to_string())?;
+            let image = crate::elf_image::Image::new(file)?;
+            let elf = image.parse()?;
             #[cfg(target_arch = "aarch64")]
             let native = object::Architecture::Aarch64;
             #[cfg(target_arch = "x86_64")]
@@ -236,6 +227,7 @@ impl Reader {
             } else {
                 None
             };
+            image.check()?;
             if self.processes.len() >= 16 {
                 self.processes.clear();
             }

@@ -304,8 +304,9 @@ symbolizer executable or additional shared libraries in a static build.
 Resolution is best effort: mappings refresh at most every 100 ms while handling
 stacks, so unloading/replacing modules before samples are processed can prevent
 or invalidate resolution. Access restrictions, deleted/unreadable files, and
-anonymous mappings fall back to addresses. ELF reads are limited to 128 MiB per
-file and 250,000 text symbols; symbol caches are bounded. DWARF unwinding uses at most 128 executable mappings
+anonymous mappings fall back to addresses. ELF files are limited to 4 GiB per
+file and 250,000 text symbols without an index. A binary index removes this
+symbol limit. Symbol caches are bounded. DWARF unwinding uses at most 128 executable mappings
 per process. Stack keys own their
 rendered frames so maps remain printable after the target exits. Lifecycle and
 interval events have no sampled stack and print `<no user stack>`.
@@ -453,7 +454,7 @@ addresses; symbol addresses are translated through executable ELF segments.
 Ambiguous overloads must use a precise signature, mangled name, or file offset.
 Offsets must be instruction boundaries (4-byte aligned on AArch64); return probes
 must select function entries. Inlined functions without a distinct symbol/entry
-cannot be probed this way. Targets must be native 64-bit ELF files up to 128 MiB.
+cannot be probed this way. Targets must be native 64-bit ELF files up to 4 GiB.
 Absolute paths are resolved in the target's filesystem root; relative paths use
 the tracer's working directory. Stripped functions need a known file offset.
 
@@ -709,10 +710,70 @@ Discovery neither attaches nor opens perf events. Symbol visibility depends on
 the ELF files: stripped images may expose only dynamic symbols, and anonymous
 JIT code is not enumerated. Deleted, replaced, unreadable, or unsupported library
 images produce diagnostics; an inaccessible executable or PID fails explicitly.
-Files are checked against mapping device/inode identities. Newly loaded libraries
-after the snapshot are not included. Limits are 1024 images, 128 MiB per image,
-512 MiB total ELF data. There is no matching-function count cap. Plain `-l` without a PID
+Files are checked against mapping device/inode identities. On Btrfs, poortrace
+uses the opened file's mount ID and mountinfo to compare the filesystem device
+reported by mappings, rather than the subvolume device reported by file stat.
+This requires Linux 5.8 or newer and readable process mountinfo on Btrfs.
+Newly loaded libraries after the snapshot are not included.
+Limits are 1024 images, 4 GiB per image, and 8 GiB total ELF file sizes.
+ELF sections are read on demand, with a cache limit of 3 GiB and 65536 ranges
+per image. Unused file data is not loaded into memory. There is no
+matching-function count cap. Plain `-l` without a PID
 continues to list the supported probe families.
+
+### Reusable binary indexes
+
+Build a flat index once, then use it in later commands:
+
+```sh
+poortrace --build-index /path/app --index-output /path/app.ptidx
+poortrace --binary-index /path/app.ptidx --list-functions /path/app --function-filter 'work*'
+poortrace --binary-index /path/app.ptidx -l -p 1234 --function-filter 'work*'
+poortrace --binary-index /path/app.ptidx -p 1234 -e 'profile:hz:99 { @[ustack] = count(); }'
+```
+
+`--build-index` does not attach to the process. With `-p PID`, the binary path
+uses that process's filesystem namespace. The index output path uses the tracer's
+namespace. Repeat `--binary-index FILE` to use indexes for multiple images.
+Images without a supplied index use the ELF reader.
+
+The index stores raw and demangled native function names, virtual addresses,
+sizes, executable file offsets, and SDT descriptors. Exact name and address
+lookups use binary search. Function globs with a literal prefix also use the
+sorted tables. Other globs scan stored names without repeating demangling.
+Process discovery, function probe resolution, SDT listing, and native
+stack names use the same index. DWARF lines, types, argument locations, runtime
+metadata, and unwind data still use their bounded ELF readers.
+
+Indexes use a versioned little-endian format with 64-bit offsets. Limits are
+16 GiB per index, 16 million symbols, 16 MiB of SDT metadata, and 1024 supplied
+indexes. Writers replace the output file atomically. Do not change an index in
+place while a tracer uses it. Reuse requires the same architecture, device,
+inode, binary size, modification time, and change time. A changed or replaced
+binary produces an error; build its index again.
+
+Indexes are mapped read-only. Exact lookups load only the required pages into
+memory; a wildcard scan can read the entire name pool. Unsupported SDT metadata
+retains its diagnostic and does not prevent native index construction.
+The ELF cache does not
+allocate 3 GiB at startup. Index construction maps the source binary and uses
+temporary symbol tables and mapped output pages. Listing all functions also allocates the
+matching output names. DWARF and unwind data have separate memory limits.
+See [the binary index format](docs/binary-index.md) for the file layout.
+
+For a 2.21 GiB MySQL server binary, a release build indexed 3,020,285 functions.
+Measurements used a warm filesystem cache:
+
+| Operation | Elapsed time | Peak resident memory |
+| --- | --- | --- |
+| Build the 5.22 GiB index | 56.77 s | 5.26 GiB |
+| List `main` from ELF | 53.79 s | 1.21 GiB |
+| List `main` from index | <0.01 s | 38.6 MiB |
+| List `mysql_parse*` from index | 0.01 s | 37.1 MiB |
+
+The `main` outputs matched. These are lookup measurements, not full tracing
+memory limits. This binary's unsupported SDT argument widths retain an explicit
+diagnostic; native lookups work.
 
 Function globs match raw or demangled names, deduplicate aliases by file offset,
 and have no default expansion count cap. Quote paths containing spaces.
@@ -772,7 +833,7 @@ as `child->value` are supported. Multidimensional array paths such as
 dimensions are limited to 128 and formatted/argument output remains bounded. `offsetof` rejects paths requiring pointer
 dereferences or bitfield selection. Nonconstant member-location expressions and
 ambiguous layouts remain rejected. `fieldf` returns a floating-point field for
-arithmetic; `value(address, "Type")` renders a bounded structured value. ELF input is bounded to 128 MiB,
+arithmetic; `value(address, "Type")` renders a bounded structured value. ELF files are bounded to 4 GiB,
 expanded DWARF sections to 256 MiB, and type traversal to 32 levels.
 
 `args()` at a ptrace function entry reconstructs a bounded DWARF C signature

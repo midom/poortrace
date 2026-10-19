@@ -2,7 +2,7 @@
 use crate::Result;
 use addr2line::gimli::{self, AttributeValue, EndianSlice, RunTimeEndian, UnitOffset};
 use object::{Object, ObjectSection};
-use std::{collections::BTreeMap, io::Read, os::unix::fs::MetadataExt};
+use std::{collections::BTreeMap, os::unix::fs::MetadataExt};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Layout {
     pub offset: u64,
@@ -409,14 +409,8 @@ fn validate_calling_convention(convention: Option<AttributeValue<R<'_>>>) -> Res
 pub(crate) fn load_dwarf(
     file: std::fs::File,
 ) -> Result<(gimli::DwarfSections<Vec<u8>>, RunTimeEndian)> {
-    let mut data = Vec::new();
-    file.take(128 * 1024 * 1024 + 1)
-        .read_to_end(&mut data)
-        .map_err(|e| e.to_string())?;
-    if data.len() > 128 * 1024 * 1024 {
-        return Err("DWARF image exceeds 128 MiB".into());
-    }
-    let object = object::File::parse(data.as_slice()).map_err(|e| e.to_string())?;
+    let image = crate::elf_image::Image::new(file)?;
+    let object = image.parse()?;
     #[cfg(target_arch = "aarch64")]
     let architecture = object::Architecture::Aarch64;
     #[cfg(target_arch = "x86_64")]
@@ -436,6 +430,9 @@ pub(crate) fn load_dwarf(
     let dwarf = gimli::DwarfSections::load(|section| -> Result<Vec<u8>> {
         match object.section_by_name(section.name()) {
             Some(section) => {
+                if section.size() > 256 * 1024 * 1024 {
+                    return Err("DWARF section exceeds 256 MiB".into());
+                }
                 let size = section
                     .compressed_data()
                     .map_err(|e| e.to_string())?
@@ -454,6 +451,7 @@ pub(crate) fn load_dwarf(
             None => Ok(Vec::new()),
         }
     })?;
+    image.check()?;
     Ok((dwarf, endian))
 }
 fn resolve(

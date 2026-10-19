@@ -5,7 +5,6 @@ use crate::{Result, memory, perf::UserRegs};
 use object::{Object, ObjectSegment, ObjectSymbol};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    io::Read,
 };
 
 #[derive(Default)]
@@ -824,19 +823,10 @@ fn discover(pid: u32, maps: &str) -> Result<Layout> {
         let Ok(file) = std::fs::File::open(format!("/proc/{pid}/root{}", map.path)) else {
             continue;
         };
-        if file.metadata().is_ok_and(|m| m.len() > 128 * 1024 * 1024) {
+        let Ok(image) = crate::elf_image::Image::new(file) else {
             continue;
-        }
-        let mut bytes = Vec::new();
-        if file
-            .take(128 * 1024 * 1024 + 1)
-            .read_to_end(&mut bytes)
-            .is_err()
-            || bytes.len() > 128 * 1024 * 1024
-        {
-            continue;
-        }
-        let Ok(elf) = object::File::parse(bytes.as_slice()) else {
+        };
+        let Ok(elf) = image.parse() else {
             continue;
         };
         #[cfg(target_arch = "aarch64")]
@@ -905,6 +895,7 @@ fn discover(pid: u32, maps: &str) -> Result<Layout> {
                 }
             }
         }
+        image.check()?;
         if values.contains_key("HeapObjectTag") {
             let layout = Layout {
                 values,
