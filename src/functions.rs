@@ -1726,12 +1726,59 @@ impl Tracer {
     }
 }
 impl Tracer {
+    // PTRACE_INTERRUPT can win the race with delivery of a synchronous
+    // breakpoint SIGTRAP. The task then reports EVENT_STOP with that SIGTRAP
+    // still pending. Observe its delivery before restoring text and detaching;
+    // otherwise the untraced target receives our fatal SIGTRAP afterward.
+    fn collect_interrupted_breakpoints(&mut self) -> Result<()> {
+        for (tid, status) in self.pending.clone() {
+            if status >> 16 != libc::PTRACE_EVENT_STOP
+                || libc::WSTOPSIG(status) != libc::SIGTRAP
+                || !self.stopped.contains(&tid)
+            {
+                continue;
+            }
+            self.select(tid);
+            let ip = Registers::read(tid)?.user().ip;
+            if !trap_address(ip).is_some_and(|address| self.breakpoints.contains_key(&address)) {
+                continue;
+            }
+            let args = libc::ptrace_peeksiginfo_args {
+                off: 0,
+                flags: 0,
+                nr: 32,
+            };
+            let mut signals = unsafe { std::mem::zeroed::<[libc::siginfo_t; 32]>() };
+            let count = control(
+                libc::PTRACE_PEEKSIGINFO,
+                tid,
+                (&args as *const libc::ptrace_peeksiginfo_args) as usize,
+                signals.as_mut_ptr() as usize,
+            )? as usize;
+            if !signals[..count].iter().any(|info| {
+                info.si_signo == libc::SIGTRAP
+                    && matches!(info.si_code, libc::TRAP_BRKPT | libc::SI_KERNEL)
+            }) {
+                continue;
+            }
+            control(libc::PTRACE_CONT, tid, 0, 0)?;
+            self.stopped.remove(&tid);
+            self.pending.retain(|(task, _)| *task != tid);
+            let (_, status) = wait_status(tid, Instant::now() + Duration::from_secs(1))
+                .map_err(|error| error.to_string())?
+                .ok_or("timed out collecting an interrupted breakpoint")?;
+            self.queue(tid, status)?;
+        }
+        Ok(())
+    }
+
     pub fn detach(&mut self) {
         for tid in self.listening.clone() {
             let _ = control(libc::PTRACE_INTERRUPT, tid, 0, 0);
             self.listening.remove(&tid);
         }
         let _ = self.stop_world();
+        let _ = self.collect_interrupted_breakpoints();
         // Queued INT3 stops have advanced RIP. Rewind before restoring their bytes.
         let mut owned_traps = BTreeSet::new();
         for (tid, status) in self.pending.clone() {

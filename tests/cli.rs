@@ -1443,6 +1443,93 @@ fn live_uprobes_large_probe_sets_and_resource_limits() {
 
 #[test]
 #[ignore = "requires ptrace access and a native C compiler"]
+fn live_uprobes_repeated_interrupt_detach_keeps_target_alive() {
+    use std::io::{BufRead, BufReader};
+    let directory =
+        std::env::temp_dir().join(format!("poortrace-interrupt-detach-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let source = directory.join("target.c");
+    let binary = directory.join("target");
+    let mut code = String::from(
+        "#include <stdio.h>\n#include <sys/prctl.h>\n#include <unistd.h>\nstatic volatile unsigned long counter;\n",
+    );
+    for index in 0..1536 {
+        code.push_str(&format!(
+            "__attribute__((noinline)) void observed_{index}(void) {{ counter++; }}\n"
+        ));
+    }
+    code.push_str(
+        r#"
+int main(void) {
+ prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
+ printf("%p\n", (void *)&counter); fflush(stdout);
+ for (;;) { observed_1535(); usleep(1000); }
+}
+"#,
+    );
+    std::fs::write(&source, code).unwrap();
+    let compiled = Command::new("cc")
+        .args(["-O0", "-g"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .unwrap();
+    assert!(compiled.status.success(), "{}", errors(&compiled));
+    struct Target(std::process::Child);
+    impl Drop for Target {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut target = Target(
+        Command::new(&binary)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut line = String::new();
+    BufReader::new(target.0.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let address = u64::from_str_radix(line.trim().trim_start_matches("0x"), 16).unwrap();
+    let pid = target.0.id().to_string();
+    let script = format!("u:{}:observed_* {{ @hits=count(); }}", binary.display());
+    // Interrupt a hot breakpoint repeatedly, including reliable-mode END's
+    // extra pause. A pending tracer SIGTRAP must not escape after detachment.
+    for attempt in 0..64 {
+        let mut args = vec!["-q", "-p", &pid, "-d", "0.04", "-e", &script];
+        if attempt % 2 == 0 {
+            args.push("--reliable");
+        }
+        let out = trace(&args);
+        assert!(out.status.success(), "attempt {attempt}: {}", errors(&out));
+        let before = poortrace::memory::read(target.0.id(), address, 8, false).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_millis(100);
+        loop {
+            std::thread::sleep(Duration::from_millis(1));
+            let status = target.0.try_wait().unwrap();
+            assert!(
+                status.is_none(),
+                "target exited after attempt {attempt}: {status:?}"
+            );
+            let after = poortrace::memory::read(target.0.id(), address, 8, false).unwrap();
+            if before != after {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "target did not resume after attempt {attempt}"
+            );
+        }
+    }
+    drop(target);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+#[ignore = "requires ptrace access and a native C compiler"]
 fn live_uprobes_hot_loop_counts_and_timer_progress() {
     let directory = std::env::temp_dir().join(format!("poortrace-hot-loop-{}", std::process::id()));
     std::fs::create_dir_all(&directory).unwrap();

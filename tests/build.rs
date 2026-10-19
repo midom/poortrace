@@ -7,26 +7,40 @@ use std::{
     fs,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Mutex, MutexGuard,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
+static FIXTURES: Mutex<()> = Mutex::new(());
 
-struct Fixture(PathBuf);
+struct Fixture {
+    path: PathBuf,
+    _guard: MutexGuard<'static, ()>,
+}
 impl Fixture {
     fn new() -> Self {
+        // A concurrent spawn can inherit another fixture's open script writer
+        // until exec closes it, causing intermittent ETXTBSY on that script.
+        // Keep fixture creation and compiler execution in one critical section.
+        let guard = FIXTURES.lock().unwrap_or_else(|error| error.into_inner());
         let path = std::env::temp_dir().join(format!(
             "poortrace-build-test-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed),
         ));
         fs::create_dir(&path).unwrap();
-        Self(path)
+        Self {
+            path,
+            _guard: guard,
+        }
     }
 
     fn compiler(&self, name: &str, link_status: u8) -> OsString {
-        let script = self.0.join(name);
-        let libraries = self.0.join("compiler libraries");
+        let script = self.path.join(name);
+        let libraries = self.path.join("compiler libraries");
         fs::create_dir_all(&libraries).unwrap();
         for library in ["libstdc++.so", "libstdc++.a"] {
             fs::write(libraries.join(library), b"fixture").unwrap();
@@ -50,9 +64,9 @@ impl Fixture {
 
     fn probe(&self, static_crt: bool) -> Probe<'_> {
         Probe {
-            directory: &self.0,
+            directory: &self.path,
             architecture: "x86_64",
-            llvm_directory: &self.0,
+            llvm_directory: &self.path,
             llvm_libraries: "-lLLVMCore -lLLVMX86CodeGen",
             system_libraries: "-lz -ldl",
             static_crt,
@@ -61,7 +75,7 @@ impl Fixture {
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        let _ = fs::remove_dir_all(&self.path);
     }
 }
 
@@ -75,10 +89,10 @@ fn explicit_cxx_failure_never_falls_back_and_reports_linker_output() {
         Err(error) => error,
     };
     assert!(error.contains("configured CXX"));
-    assert!(error.contains("fixture linker result"));
+    assert!(error.contains("fixture linker result"), "{error}");
     assert!(error.contains("LLVM_CONFIG"));
-    assert!(!fixture.0.join("good.args").exists());
-    assert!(fixture.0.join("llvm-link-probe.log").exists());
+    assert!(!fixture.path.join("good.args").exists());
+    assert!(fixture.path.join("llvm-link-probe.log").exists());
 }
 
 #[test]
@@ -90,13 +104,13 @@ fn automatic_selection_skips_bad_compilers_and_retains_the_library_directory() {
     assert_eq!(selected.compiler, good);
     assert_eq!(
         selected.library_directory,
-        fixture.0.join("compiler libraries")
+        fixture.path.join("compiler libraries")
     );
-    let arguments = fs::read_to_string(fixture.0.join("good compiler.args")).unwrap();
+    let arguments = fs::read_to_string(fixture.path.join("good compiler.args")).unwrap();
     assert!(arguments.contains("-lLLVMX86CodeGen"));
     assert!(arguments.contains("-lz"));
     assert!(!arguments.lines().any(|arg| arg == "-static"));
-    let source = fs::read_to_string(fixture.0.join("llvm-link-probe.cpp")).unwrap();
+    let source = fs::read_to_string(fixture.path.join("llvm-link-probe.cpp")).unwrap();
     assert!(source.contains("LLVMInitializeX86AsmPrinter();"));
     assert!(source.contains("LLVMLinkInMCJIT();"));
 }
@@ -107,9 +121,9 @@ fn static_crt_checks_a_static_link_and_requires_the_cpp_archive() {
     let compiler = fixture.compiler("good", 0);
     let probe = fixture.probe(true);
     select(Some(compiler.clone()), Vec::new(), &probe).unwrap();
-    let arguments = fs::read_to_string(fixture.0.join("good.args")).unwrap();
+    let arguments = fs::read_to_string(fixture.path.join("good.args")).unwrap();
     assert!(arguments.lines().any(|arg| arg == "-static"));
-    fs::remove_file(fixture.0.join("compiler libraries/libstdc++.a")).unwrap();
+    fs::remove_file(fixture.path.join("compiler libraries/libstdc++.a")).unwrap();
     let error = probe.library_directory(&compiler).unwrap_err();
     assert!(error.contains("libstdc++.a"));
 }
@@ -137,8 +151,8 @@ fn target_selection_does_not_use_host_toolsets_for_cross_builds() {
 #[test]
 fn toolset_registration_supplies_roots_and_sorts_versions_numerically() {
     let fixture = Fixture::new();
-    let registry = fixture.0.join("registry");
-    let prefix = fixture.0.join("registered root");
+    let registry = fixture.path.join("registry");
+    let prefix = fixture.path.join("registered root");
     fs::create_dir(&registry).unwrap();
     for name in ["gcc-toolset-9", "gcc-toolset-15", "devtoolset-12"] {
         let compiler = prefix.join(name).join("root/usr/bin/g++");
