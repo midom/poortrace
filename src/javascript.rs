@@ -3,9 +3,7 @@
 //! optional fields are gated to verified Node 20/22/24 scope-info.tq layouts.
 use crate::{Result, memory, perf::UserRegs};
 use object::{Object, ObjectSegment, ObjectSymbol};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-};
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Default)]
 pub struct Reader {

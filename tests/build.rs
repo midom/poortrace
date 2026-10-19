@@ -17,7 +17,8 @@ impl Fixture {
     fn new() -> Self {
         let path = std::env::temp_dir().join(format!(
             "poortrace-build-test-{}-{}",
-            std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed),
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
         ));
         fs::create_dir(&path).unwrap();
         Self(path)
@@ -87,7 +88,10 @@ fn automatic_selection_skips_bad_compilers_and_retains_the_library_directory() {
     let good = fixture.compiler("good compiler", 0);
     let selected = select(None, vec![bad, good.clone()], &fixture.probe(false)).unwrap();
     assert_eq!(selected.compiler, good);
-    assert_eq!(selected.library_directory, fixture.0.join("compiler libraries"));
+    assert_eq!(
+        selected.library_directory,
+        fixture.0.join("compiler libraries")
+    );
     let arguments = fs::read_to_string(fixture.0.join("good compiler.args")).unwrap();
     assert!(arguments.contains("-lLLVMX86CodeGen"));
     assert!(arguments.contains("-lz"));
@@ -112,12 +116,22 @@ fn static_crt_checks_a_static_link_and_requires_the_cpp_archive() {
 
 #[test]
 fn target_selection_does_not_use_host_toolsets_for_cross_builds() {
-    assert_eq!(cxx_variables("host", "target-triplet"), vec![
-        "CXX_target-triplet", "CXX_target_triplet", "TARGET_CXX", "CXX",
-    ]);
+    assert_eq!(
+        cxx_variables("host", "target-triplet"),
+        vec![
+            "CXX_target-triplet",
+            "CXX_target_triplet",
+            "TARGET_CXX",
+            "CXX",
+        ]
+    );
     let compilers = candidates("x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu");
     assert!(compilers.contains(&OsString::from("aarch64-linux-gnu-g++")));
-    assert!(compilers.iter().all(|compiler| !Path::new(compiler).is_absolute()));
+    assert!(
+        compilers
+            .iter()
+            .all(|compiler| !Path::new(compiler).is_absolute())
+    );
 }
 
 #[test]
@@ -132,7 +146,11 @@ fn toolset_registration_supplies_roots_and_sorts_versions_numerically() {
         fs::write(&compiler, b"fixture").unwrap();
         fs::write(registry.join(name), prefix.to_str().unwrap()).unwrap();
     }
-    fs::write(registry.join("gcc-toolset-invalid"), prefix.to_str().unwrap()).unwrap();
+    fs::write(
+        registry.join("gcc-toolset-invalid"),
+        prefix.to_str().unwrap(),
+    )
+    .unwrap();
     let compilers = registered_toolsets(&registry);
     assert_eq!(compilers.len(), 3);
     assert!(Path::new(&compilers[0]).starts_with(prefix.join("gcc-toolset-15")));

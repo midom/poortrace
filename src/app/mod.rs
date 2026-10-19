@@ -32,7 +32,9 @@ pub(super) fn run() -> Result<i32> {
 
 fn run_with_args(mut args: Args) -> Result<i32> {
     if let Some(binary) = &args.build_index {
-        let output = args.index_output.as_ref()
+        let output = args
+            .index_output
+            .as_ref()
             .ok_or("--build-index requires --index-output")?;
         let count = poortrace::binary_index::build(
             args.pid.unwrap_or(std::process::id() as i32),

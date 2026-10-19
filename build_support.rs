@@ -14,7 +14,8 @@ pub fn cxx_variables(host: &str, target: &str) -> Vec<String> {
             "HOST_CXX"
         } else {
             "TARGET_CXX"
-        }.into(),
+        }
+        .into(),
         "CXX".into(),
     ];
     variables.dedup();
@@ -53,7 +54,8 @@ pub fn registered_toolsets(registry: &Path) -> Vec<OsString> {
         }
     }
     toolsets.sort_by(|a, b| b.cmp(a));
-    toolsets.into_iter()
+    toolsets
+        .into_iter()
         .map(|(_, path)| path.into_os_string())
         .collect()
 }
@@ -95,7 +97,8 @@ impl Probe<'_> {
         if !result.status.success() {
             return Err(format!(
                 "{} cannot locate {library}: {}",
-                compiler.to_string_lossy(), String::from_utf8_lossy(&result.stderr),
+                compiler.to_string_lossy(),
+                String::from_utf8_lossy(&result.stderr),
             ));
         }
         let output = String::from_utf8(result.stdout)
@@ -137,11 +140,13 @@ impl Probe<'_> {
         if self.static_crt {
             command.arg("-static");
         }
-        command.arg("-L")
+        command
+            .arg("-L")
             .arg(self.llvm_directory)
             .args(self.llvm_libraries.split_whitespace())
             .args(self.system_libraries.split_whitespace());
-        let result = command.output()
+        let result = command
+            .output()
             .map_err(|e| format!("cannot run {}: {e}", compiler.to_string_lossy()))?;
         if result.status.success() {
             return Ok(());
@@ -156,7 +161,9 @@ impl Probe<'_> {
         let detail: String = detail.chars().take(4000).collect();
         Err(format!(
             "{} failed the LLVM link test ({}):\n{detail}\nFull output: {}",
-            compiler.to_string_lossy(), result.status, log.display(),
+            compiler.to_string_lossy(),
+            result.status,
+            log.display(),
         ))
     }
 }
@@ -175,13 +182,16 @@ pub fn select(
     let candidates = explicit.map_or(candidates, |compiler| vec![compiler]);
     let mut failures = Vec::new();
     for compiler in candidates {
-        match probe.library_directory(&compiler).and_then(|library_directory| {
-            probe.check(&compiler).map(|()| library_directory)
-        }) {
-            Ok(library_directory) => return Ok(Selection {
-                compiler,
-                library_directory,
-            }),
+        match probe
+            .library_directory(&compiler)
+            .and_then(|library_directory| probe.check(&compiler).map(|()| library_directory))
+        {
+            Ok(library_directory) => {
+                return Ok(Selection {
+                    compiler,
+                    library_directory,
+                });
+            }
             Err(error) => failures.push(error),
         }
     }
@@ -190,5 +200,8 @@ pub fn select(
     } else {
         "No available C++ compiler can link the selected LLVM archives."
     };
-    Err(format!("{heading}\nInstall a compatible C++ development toolchain or set CXX to its compiler executable.\nCheck LLVM_CONFIG and the target architecture.\n{}", failures.join("\n\n")))
+    Err(format!(
+        "{heading}\nInstall a compatible C++ development toolchain or set CXX to its compiler executable.\nCheck LLVM_CONFIG and the target architecture.\n{}",
+        failures.join("\n\n")
+    ))
 }

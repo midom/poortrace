@@ -158,7 +158,10 @@ impl Index {
         let metadata: Metadata = serde_json::from_slice(&bytes[metadata_start as usize..])
             .map_err(|e| format!("binary index metadata: {e}"))?;
         for site in &metadata.sites {
-            let encoded = format!("__sdt__{}", serde_json::to_string(site).map_err(|e| e.to_string())?);
+            let encoded = format!(
+                "__sdt__{}",
+                serde_json::to_string(site).map_err(|e| e.to_string())?
+            );
             crate::usdt::encoded(&encoded)?;
         }
         Ok(Self {
@@ -187,7 +190,9 @@ impl Index {
     fn name(&self, row: &[u64; 7], display: bool) -> Result<&str> {
         let i = if display { 5 } else { 3 };
         let (start, size) = (row[i], row[i + 1]);
-        let end = start.checked_add(size).ok_or("binary index string overflow")?;
+        let end = start
+            .checked_add(size)
+            .ok_or("binary index string overflow")?;
         if start < HEADER as u64 || end > self.pool_end as u64 {
             return Err("binary index name is outside the string pool".into());
         }
@@ -201,7 +206,9 @@ impl Index {
         } else {
             self.raw_order
         };
-        let bytes = self.data.bytes()
+        let bytes = self
+            .data
+            .bytes()
             .get(start + position * 4..start + position * 4 + 4)
             .ok_or("truncated binary index name table")?;
         let id = u32::from_le_bytes(bytes.try_into().unwrap()) as usize;
@@ -315,11 +322,14 @@ pub fn configure(paths: &[PathBuf]) -> Result<()> {
     if paths.len() > 1024 {
         return Err("at most 1024 binary indexes are supported".into());
     }
-    let indexes = paths.iter()
+    let indexes = paths
+        .iter()
         .map(|path| Index::open(path).map(Arc::new))
         .collect::<Result<Vec<_>>>()?;
-    *INDEXES.get_or_init(|| RwLock::new(Vec::new()))
-        .write().map_err(|e| e.to_string())? = indexes;
+    *INDEXES
+        .get_or_init(|| RwLock::new(Vec::new()))
+        .write()
+        .map_err(|e| e.to_string())? = indexes;
     Ok(())
 }
 
@@ -390,15 +400,20 @@ pub fn build(tid: i32, binary: &str, output: &Path) -> Result<usize> {
     if !elf.is_64() || elf.architecture() != arch || !elf.is_little_endian() {
         return Err("binary indexes require native 64-bit ELF".into());
     }
-    let parent = output.parent()
+    let parent = output
+        .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     let temporary = Temporary(parent.join(format!(
         ".poortrace-index-{}-{}",
-        std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed),
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed),
     )));
     let out = OpenOptions::new()
-        .read(true).write(true).create_new(true).open(&temporary.0)
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&temporary.0)
         .map_err(|e| format!("{}: {e}", temporary.0.display()))?;
     let mut writer = BufWriter::new(out);
     writer.write_all(&[0; HEADER]).map_err(|e| e.to_string())?;
@@ -429,13 +444,17 @@ pub fn build(tid: i32, binary: &str, output: &Path) -> Result<usize> {
         } else {
             let display = crate::symbols::demangle(name);
             let raw = position;
-            writer.write_all(name.as_bytes()).map_err(|e| e.to_string())?;
+            writer
+                .write_all(name.as_bytes())
+                .map_err(|e| e.to_string())?;
             position += name.len() as u64;
             let pretty = if display == name {
                 raw
             } else {
                 let start = position;
-                writer.write_all(display.as_bytes()).map_err(|e| e.to_string())?;
+                writer
+                    .write_all(display.as_bytes())
+                    .map_err(|e| e.to_string())?;
                 position += display.len() as u64;
                 start
             };
@@ -447,8 +466,13 @@ pub fn build(tid: i32, binary: &str, output: &Path) -> Result<usize> {
             return Err("binary index exceeds 16 GiB".into());
         }
         rows.push([
-            symbol.address(), symbol.size(), offset,
-            entry[0], entry[1], entry[2], entry[3],
+            symbol.address(),
+            symbol.size(),
+            offset,
+            entry[0],
+            entry[1],
+            entry[2],
+            entry[3],
         ]);
     }
     let (sites, site_error) = match crate::usdt::sites_from_data(source.bytes()) {
@@ -465,8 +489,12 @@ pub fn build(tid: i32, binary: &str, output: &Path) -> Result<usize> {
         &strings.bytes()[row[i] as usize..(row[i] + row[i + 1]) as usize]
     };
     rows.sort_unstable_by(|a, b| {
-        (a[0], name(a, true), name(a, false), a[1])
-            .cmp(&(b[0], name(b, true), name(b, false), b[1]))
+        (a[0], name(a, true), name(a, false), a[1]).cmp(&(
+            b[0],
+            name(b, true),
+            name(b, false),
+            b[1],
+        ))
     });
     rows.dedup_by(|a, b| a[..3] == b[..3] && name(a, false) == name(b, false));
     let mut raw_order: Vec<u32> = (0..rows.len() as u32).collect();
@@ -480,21 +508,30 @@ pub fn build(tid: i32, binary: &str, output: &Path) -> Result<usize> {
     let records = position;
     for row in &rows {
         for value in row {
-            writer.write_all(&value.to_le_bytes()).map_err(|e| e.to_string())?;
+            writer
+                .write_all(&value.to_le_bytes())
+                .map_err(|e| e.to_string())?;
         }
     }
     let raw_start = records + rows.len() as u64 * RECORD as u64;
     for id in &raw_order {
-        writer.write_all(&id.to_le_bytes()).map_err(|e| e.to_string())?;
+        writer
+            .write_all(&id.to_le_bytes())
+            .map_err(|e| e.to_string())?;
     }
     let display_start = raw_start + rows.len() as u64 * 4;
     for id in &display_order {
-        writer.write_all(&id.to_le_bytes()).map_err(|e| e.to_string())?;
+        writer
+            .write_all(&id.to_le_bytes())
+            .map_err(|e| e.to_string())?;
     }
     let metadata_start = display_start + rows.len() as u64 * 4;
     let metadata = serde_json::to_vec(&Metadata {
-        path: source_path, sites, site_error,
-    }).map_err(|e| e.to_string())?;
+        path: source_path,
+        sites,
+        site_error,
+    })
+    .map_err(|e| e.to_string())?;
     if metadata.len() > MAX_METADATA {
         return Err("binary index SDT metadata exceeds 16 MiB".into());
     }
@@ -506,9 +543,23 @@ pub fn build(tid: i32, binary: &str, output: &Path) -> Result<usize> {
     let mut header = [0u8; HEADER];
     header[..8].copy_from_slice(MAGIC);
     let values = [
-        1, architecture(), before[0], before[1], before[2], before[3], before[4], before[5], before[6],
-        records - HEADER as u64, rows.len() as u64, records, raw_start, display_start, metadata_start,
-        metadata.len() as u64, total,
+        1,
+        architecture(),
+        before[0],
+        before[1],
+        before[2],
+        before[3],
+        before[4],
+        before[5],
+        before[6],
+        records - HEADER as u64,
+        rows.len() as u64,
+        records,
+        raw_start,
+        display_start,
+        metadata_start,
+        metadata.len() as u64,
+        total,
     ];
     for (i, value) in values.iter().enumerate() {
         header[8 + i * 8..16 + i * 8].copy_from_slice(&value.to_le_bytes());
@@ -523,7 +574,9 @@ pub fn build(tid: i32, binary: &str, output: &Path) -> Result<usize> {
         return Err("binary changed while building its index; retry".into());
     }
     std::fs::rename(&temporary.0, output).map_err(|e| e.to_string())?;
-    File::open(parent).and_then(|file| file.sync_all()).map_err(|e| e.to_string())?;
+    File::open(parent)
+        .and_then(|file| file.sync_all())
+        .map_err(|e| e.to_string())?;
     Ok(rows.len())
 }
 
@@ -535,23 +588,45 @@ mod tests {
     fn flat_names_above_four_gib_and_invalid_record_bounds() {
         let temporary = Temporary(std::env::temp_dir().join(format!(
             "poortrace-index-high-{}-{}",
-            std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed),
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
         )));
-        let mut file = OpenOptions::new().read(true).write(true).create_new(true)
-            .open(&temporary.0).unwrap();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&temporary.0)
+            .unwrap();
         let name_start = 4 * 1024 * 1024 * 1024u64;
         let records = name_start + 16;
         let metadata_start = records + RECORD as u64 + 8;
         let metadata = serde_json::to_vec(&Metadata {
-            path: PathBuf::from("/fixture"), sites: Vec::new(), site_error: None,
-        }).unwrap();
+            path: PathBuf::from("/fixture"),
+            sites: Vec::new(),
+            site_error: None,
+        })
+        .unwrap();
         let total = metadata_start + metadata.len() as u64;
         let mut header = [0u8; HEADER];
         header[..8].copy_from_slice(MAGIC);
         let values = [
-            1, architecture(), 0, 0, 1024, 0, 0, 0, 0,
-            records - HEADER as u64, 1, records, records + RECORD as u64,
-            records + RECORD as u64 + 4, metadata_start, metadata.len() as u64, total,
+            1,
+            architecture(),
+            0,
+            0,
+            1024,
+            0,
+            0,
+            0,
+            0,
+            records - HEADER as u64,
+            1,
+            records,
+            records + RECORD as u64,
+            records + RECORD as u64 + 4,
+            metadata_start,
+            metadata.len() as u64,
+            total,
         ];
         for (i, value) in values.iter().enumerate() {
             header[8 + i * 8..16 + i * 8].copy_from_slice(&value.to_le_bytes());
@@ -563,12 +638,17 @@ mod tests {
         file.write_all(b"worker").unwrap();
         file.seek(SeekFrom::Start(records)).unwrap();
         let row = [0x400100u64, 16, 0x100, name_start, 6, name_start, 6];
-        for value in row { file.write_all(&value.to_le_bytes()).unwrap(); }
+        for value in row {
+            file.write_all(&value.to_le_bytes()).unwrap();
+        }
         file.write_all(&[0; 8]).unwrap();
         file.write_all(&metadata).unwrap();
         let index = Index::open(&temporary.0).unwrap();
         assert_eq!(index.functions("work*").unwrap()[0].offset, 0x100);
-        assert_eq!(index.lookup("worker").unwrap(), BTreeSet::from([(0x400100, 16)]));
+        assert_eq!(
+            index.lookup("worker").unwrap(),
+            BTreeSet::from([(0x400100, 16)])
+        );
         assert_eq!(index.resolve(0x400105).unwrap(), Some(("worker".into(), 5)));
         assert_eq!(index.resolve(0x400110).unwrap(), None);
         drop(index);
@@ -577,7 +657,12 @@ mod tests {
         file.seek(SeekFrom::Start(records + 3 * 8)).unwrap();
         file.write_all(&u64::MAX.to_le_bytes()).unwrap();
         let index = Index::open(&temporary.0).unwrap();
-        assert!(index.functions("*").unwrap_err().contains("string overflow"));
+        assert!(
+            index
+                .functions("*")
+                .unwrap_err()
+                .contains("string overflow")
+        );
         drop(index);
         file.set_len(total - 1).unwrap();
         assert!(Index::open(&temporary.0).unwrap_err().contains("layout"));

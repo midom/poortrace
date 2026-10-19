@@ -112,10 +112,10 @@ pub(super) struct Args {
     #[arg(long, requires="index_output", conflicts_with_all=["replay", "list", "list_functions", "list_usdt", "expression", "script", "command", "shell_command", "stat", "check", "emit_llvm", "binary_index"])]
     pub(super) build_index: Option<String>,
     /// Output file for --build-index (replaced atomically)
-    #[arg(long, requires="build_index")]
+    #[arg(long, requires = "build_index")]
     pub(super) index_output: Option<PathBuf>,
     /// Reuse a binary index for native names, probes, and stacks (repeatable)
-    #[arg(long, conflicts_with="replay")]
+    #[arg(long, conflicts_with = "replay")]
     pub(super) binary_index: Vec<PathBuf>,
     /// Function/marker glob for --list-functions or -l -p PID (raw or demangled names)
     #[arg(long, default_value = "*")]

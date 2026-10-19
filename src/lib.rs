@@ -3,9 +3,9 @@ compile_error!("poortrace requires 64-bit Linux");
 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 compile_error!("poortrace supports AArch64 and x86-64");
 
+pub mod binary_index;
 pub mod codegen;
 pub mod counters;
-pub mod binary_index;
 mod elf_image;
 mod file_identity;
 pub mod language;
@@ -18,7 +18,6 @@ mod symbols;
 pub mod syscall;
 
 pub type Result<T> = std::result::Result<T, String>;
-
 
 pub mod uprobe;
 

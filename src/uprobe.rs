@@ -34,15 +34,19 @@ pub fn locate_many(tid: i32, specs: &[(&str, &str, bool)]) -> Result<Vec<Resolve
         };
         let file = std::fs::File::open(&target).map_err(|e| format!("uprobe {path}: {e}"))?;
         let image = crate::elf_image::Image::new(file)?;
-        let object = image.parse().map_err(|e| format!("uprobe ELF {path}: {e}"))?;
+        let object = image
+            .parse()
+            .map_err(|e| format!("uprobe ELF {path}: {e}"))?;
         let mut symbols = BTreeMap::<String, BTreeSet<(u64, u64)>>::new();
         if let Some(index) = image.index() {
             for &request in &indices {
                 let function = specs[request].1;
-                let name = function.rsplit_once('+')
+                let name = function
+                    .rsplit_once('+')
                     .filter(|(_, delta)| number(delta).is_some())
                     .map_or(function, |(name, _)| name);
-                if !name.starts_with("0x") && !name.starts_with("__sdt__")
+                if !name.starts_with("0x")
+                    && !name.starts_with("__sdt__")
                     && !symbols.contains_key(name)
                 {
                     symbols.insert(name.into(), index.lookup(name)?);

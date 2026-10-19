@@ -133,19 +133,25 @@ fn pid_listing_quotes_paths_for_scripts() {
 
 #[test]
 fn pid_listing_accepts_large_elf_and_rejects_images_above_the_limit() {
-    let dir = std::env::temp_dir().join(format!(
-        "poortrace-large-discovery-{}",
-        std::process::id()
-    ));
+    let dir =
+        std::env::temp_dir().join(format!("poortrace-large-discovery-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
+    let source = std::env::current_exe().unwrap();
+    let source_size = std::fs::metadata(&source).unwrap().len();
+    // Static system libraries can contribute unsupported SDT notes. Padding and
+    // relocating ELF tables must preserve the original lookup result, including
+    // an explicit unsupported-note error.
+    let expected_sites =
+        poortrace::usdt::sites(std::process::id() as i32, source.to_str().unwrap())
+            .map(|sites| serde_json::to_value(sites).unwrap());
     // Cover the production executable and the inclusive 4 GiB file boundary.
     for (size, accepted) in [
-        (241_740_568u64, true),
+        (241_740_568u64.max(source_size), true),
         (4 * 1024 * 1024 * 1024, true),
         (4 * 1024 * 1024 * 1024 + 1, false),
     ] {
         let executable = dir.join(format!("fixture-{size}"));
-        std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+        std::fs::copy(&source, &executable).unwrap();
         std::fs::OpenOptions::new()
             .write(true)
             .open(&executable)
@@ -175,8 +181,11 @@ fn pid_listing_accepts_large_elf_and_rejects_images_above_the_limit() {
                 false,
             )
             .unwrap();
-            assert!(
-                poortrace::usdt::sites(fixture.0.id() as i32, executable.to_str().unwrap()).is_ok()
+            assert_eq!(
+                poortrace::usdt::sites(fixture.0.id() as i32, executable.to_str().unwrap())
+                    .map(|sites| serde_json::to_value(sites).unwrap()),
+                expected_sites,
+                "SDT lookup changed for {size}-byte fixture"
             );
         } else {
             assert!(out.stdout.is_empty());
@@ -232,10 +241,7 @@ fn move_elf_tables_above_three_gib(path: &std::path::Path) {
 #[test]
 #[ignore = "requires ptrace access to a launched command"]
 fn live_four_gib_function_probes_and_symbolized_stacks() {
-    let dir = std::env::temp_dir().join(format!(
-        "poortrace-large-tracing-{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("poortrace-large-tracing-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let executable = dir.join("fixture");
     std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
@@ -349,36 +355,89 @@ fn flat_index_reuse_matches_native_listing_and_probe_resolution() {
     let direct = poortrace::uprobe::functions(pid, path, "poortrace_listing*").unwrap();
     assert!(!direct.is_empty());
     let built = Command::new(env!("CARGO_BIN_EXE_poortrace"))
-        .args(["--build-index", path, "--index-output", index.to_str().unwrap()])
-        .output().unwrap();
-    assert!(built.status.success(), "{}", String::from_utf8_lossy(&built.stderr));
+        .args([
+            "--build-index",
+            path,
+            "--index-output",
+            index.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
     poortrace::binary_index::configure(std::slice::from_ref(&index)).unwrap();
-    assert_eq!(poortrace::uprobe::functions(pid, path, "poortrace_listing*").unwrap(), direct);
-    assert_eq!(poortrace::uprobe::functions(pid, path, "*listing_target").unwrap(),
-        direct.iter().filter(|f| f.name.ends_with("listing_target")).cloned().collect::<Vec<_>>());
+    assert_eq!(
+        poortrace::uprobe::functions(pid, path, "poortrace_listing*").unwrap(),
+        direct
+    );
+    assert_eq!(
+        poortrace::uprobe::functions(pid, path, "*listing_target").unwrap(),
+        direct
+            .iter()
+            .filter(|f| f.name.ends_with("listing_target"))
+            .cloned()
+            .collect::<Vec<_>>()
+    );
     let exact = poortrace::uprobe::functions(pid, path, "poortrace_listing_target").unwrap();
     assert_eq!(exact.len(), 1);
-    let probes = poortrace::uprobe::locate_many(pid, &[
-        (path, "poortrace_listing_target", false),
-        (path, "poortrace_listing_target+1", false),
-    ]).unwrap();
+    let instruction_size = if cfg!(target_arch = "aarch64") { 4 } else { 1 };
+    let offset_function = format!("poortrace_listing_target+{instruction_size}");
+    let probes = poortrace::uprobe::locate_many(
+        pid,
+        &[
+            (path, "poortrace_listing_target", false),
+            (path, &offset_function, false),
+        ],
+    )
+    .unwrap();
     assert_eq!(probes[0].offset, exact[0].offset);
-    assert_eq!(probes[1].offset, exact[0].offset + 1);
-    assert!(poortrace::uprobe::locate(pid, path, "poortrace_listing_target+1", true).is_err());
+    assert_eq!(probes[1].offset, exact[0].offset + instruction_size);
+    assert!(poortrace::uprobe::locate(pid, path, &offset_function, true).is_err());
     poortrace::binary_index::configure(&[]).unwrap();
     let indexed = Command::new(env!("CARGO_BIN_EXE_poortrace"))
-        .args(["--binary-index", index.to_str().unwrap(), "--list-functions", path,
-            "--function-filter", "poortrace_listing_target"])
-        .output().unwrap();
-    assert!(indexed.status.success(), "{}", String::from_utf8_lossy(&indexed.stderr));
-    assert_eq!(String::from_utf8(indexed.stdout).unwrap(), format!(
-        "0x{:x} {} [{}]\n", exact[0].offset, exact[0].name, exact[0].demangled));
+        .args([
+            "--binary-index",
+            index.to_str().unwrap(),
+            "--list-functions",
+            path,
+            "--function-filter",
+            "poortrace_listing_target",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        indexed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(indexed.stdout).unwrap(),
+        format!(
+            "0x{:x} {} [{}]\n",
+            exact[0].offset, exact[0].name, exact[0].demangled
+        )
+    );
     let fixture = Fixture::spawn(&binary);
     let out = Command::new(env!("CARGO_BIN_EXE_poortrace"))
-        .args(["--binary-index", index.to_str().unwrap(), "-l", "-p", &fixture.0.id().to_string(),
-            "--function-filter", "poortrace_listing_target"])
-        .output().unwrap();
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        .args([
+            "--binary-index",
+            index.to_str().unwrap(),
+            "-l",
+            "-p",
+            &fixture.0.id().to_string(),
+            "--function-filter",
+            "poortrace_listing_target",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert_eq!(out.stdout, fixture.list("poortrace_listing_target").stdout);
     drop(fixture);
     std::fs::remove_dir_all(dir).unwrap();
@@ -386,20 +445,40 @@ fn flat_index_reuse_matches_native_listing_and_probe_resolution() {
 
 #[test]
 fn flat_index_rejects_stale_replaced_truncated_files_and_binary_output() {
-    let dir = std::env::temp_dir().join(format!("poortrace-index-validation-{}", std::process::id()));
+    let dir =
+        std::env::temp_dir().join(format!("poortrace-index-validation-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let binary = dir.join("fixture");
     let index = dir.join("fixture.ptidx");
     std::fs::copy(std::env::current_exe().unwrap(), &binary).unwrap();
     let pid = std::process::id() as i32;
     let path = binary.to_str().unwrap();
-    assert!(poortrace::binary_index::build(pid, path, &binary).unwrap_err().contains("differ"));
+    assert!(
+        poortrace::binary_index::build(pid, path, &binary)
+            .unwrap_err()
+            .contains("differ")
+    );
     poortrace::binary_index::build(pid, path, &index).unwrap();
-    let lookup = || Command::new(env!("CARGO_BIN_EXE_poortrace"))
-        .args(["--binary-index", index.to_str().unwrap(), "--list-functions", path,
-            "--function-filter", "poortrace_listing_target"]).output().unwrap();
+    let lookup = || {
+        Command::new(env!("CARGO_BIN_EXE_poortrace"))
+            .args([
+                "--binary-index",
+                index.to_str().unwrap(),
+                "--list-functions",
+                path,
+                "--function-filter",
+                "poortrace_listing_target",
+            ])
+            .output()
+            .unwrap()
+    };
     let size = std::fs::metadata(&binary).unwrap().len();
-    std::fs::OpenOptions::new().write(true).open(&binary).unwrap().set_len(size + 1).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&binary)
+        .unwrap()
+        .set_len(size + 1)
+        .unwrap();
     let out = lookup();
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("stale binary index"));
@@ -411,7 +490,12 @@ fn flat_index_rejects_stale_replaced_truncated_files_and_binary_output() {
     let out = lookup();
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("replaced"));
-    std::fs::OpenOptions::new().write(true).open(&index).unwrap().set_len(159).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&index)
+        .unwrap()
+        .set_len(159)
+        .unwrap();
     let out = lookup();
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("index size"));
@@ -426,16 +510,36 @@ fn live_flat_index_native_stacks_and_sdt_arguments() {
     let binary = dir.join("usdt");
     let index = dir.join("usdt.ptidx");
     let compiled = Command::new("cc")
-        .args(["-O1", "-fno-inline", "-no-pie", "tests/fixtures/usdt.c", "-o"])
-        .arg(&binary).output().unwrap();
-    assert!(compiled.status.success(), "{}", String::from_utf8_lossy(&compiled.stderr));
+        .args([
+            "-O1",
+            "-fno-inline",
+            "-no-pie",
+            "tests/fixtures/usdt.c",
+            "-o",
+        ])
+        .arg(&binary)
+        .output()
+        .unwrap();
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
     let path = binary.to_str().unwrap();
     poortrace::binary_index::build(std::process::id() as i32, path, &index).unwrap();
     let direct = Command::new(env!("CARGO_BIN_EXE_poortrace"))
-        .args(["--list-usdt", path]).output().unwrap();
+        .args(["--list-usdt", path])
+        .output()
+        .unwrap();
     let indexed = Command::new(env!("CARGO_BIN_EXE_poortrace"))
-        .args(["--binary-index", index.to_str().unwrap(), "--list-usdt", path])
-        .output().unwrap();
+        .args([
+            "--binary-index",
+            index.to_str().unwrap(),
+            "--list-usdt",
+            path,
+        ])
+        .output()
+        .unwrap();
     assert!(direct.status.success() && indexed.status.success());
     assert_eq!(direct.stdout, indexed.stdout);
     assert!(String::from_utf8_lossy(&indexed.stdout).contains("poortrace:work"));
@@ -443,28 +547,64 @@ fn live_flat_index_native_stacks_and_sdt_arguments() {
         "usdt:{path:?}:poortrace:work {{ @calls=count(); @sum=sum(arg0); @small=sum(arg1); @memory=sum(arg2); printf(\"%s\",ustack(8)); }}"
     );
     let out = Command::new(env!("CARGO_BIN_EXE_poortrace"))
-        .args(["--binary-index", index.to_str().unwrap(), "-q", "-e", &script, "--", path])
-        .output().unwrap();
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        .args([
+            "--binary-index",
+            index.to_str().unwrap(),
+            "-q",
+            "-e",
+            &script,
+            "--",
+            path,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let text = String::from_utf8_lossy(&out.stdout);
-    for expected in ["@calls: 3", "@sum: 6", "@small: -15", "@memory: -297", "fire", "semaphore=1"] {
+    for expected in [
+        "@calls: 3",
+        "@sum: 6",
+        "@small: -15",
+        "@memory: -297",
+        "fire",
+        "semaphore=1",
+    ] {
         assert!(text.contains(expected), "missing {expected}: {text}");
     }
     // Keep an unsupported SDT descriptor explicit without losing native names.
     let mut bytes = std::fs::read(&binary).unwrap();
     let marker = b"poortrace\0work\0-8@";
-    let at = bytes.windows(marker.len()).position(|bytes| bytes == marker).unwrap();
+    let at = bytes
+        .windows(marker.len())
+        .position(|bytes| bytes == marker)
+        .unwrap();
     bytes[at + marker.len() - 2] = b'9';
     std::fs::write(&binary, bytes).unwrap();
     poortrace::binary_index::build(std::process::id() as i32, path, &index).unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_poortrace"))
-        .args(["--binary-index", index.to_str().unwrap(), "--list-functions", path,
-            "--function-filter", "fire"])
-        .output().unwrap();
+        .args([
+            "--binary-index",
+            index.to_str().unwrap(),
+            "--list-functions",
+            path,
+            "--function-filter",
+            "fire",
+        ])
+        .output()
+        .unwrap();
     assert!(out.status.success() && !out.stdout.is_empty());
     let out = Command::new(env!("CARGO_BIN_EXE_poortrace"))
-        .args(["--binary-index", index.to_str().unwrap(), "--list-usdt", path])
-        .output().unwrap();
+        .args([
+            "--binary-index",
+            index.to_str().unwrap(),
+            "--list-usdt",
+            path,
+        ])
+        .output()
+        .unwrap();
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("SDT argument sizes"));
     std::fs::remove_dir_all(dir).unwrap();

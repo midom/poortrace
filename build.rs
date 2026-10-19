@@ -68,11 +68,10 @@ fn main() {
     }
     if static_llvm {
         let system_libraries = llvm(&config, &[mode, "--system-libs"]);
-        let directory = std::path::PathBuf::from(
-            std::env::var_os("OUT_DIR").expect("Cargo supplies OUT_DIR"),
-        );
-        let architecture = std::env::var("CARGO_CFG_TARGET_ARCH")
-            .expect("Cargo supplies target architecture");
+        let directory =
+            std::path::PathBuf::from(std::env::var_os("OUT_DIR").expect("Cargo supplies OUT_DIR"));
+        let architecture =
+            std::env::var("CARGO_CFG_TARGET_ARCH").expect("Cargo supplies target architecture");
         let explicit = cxx_variables.iter().find_map(std::env::var_os);
         let probe = build_support::Probe {
             directory: &directory,
@@ -82,9 +81,9 @@ fn main() {
             system_libraries: &system_libraries,
             static_crt,
         };
-        let selection = build_support::select(
-            explicit, build_support::candidates(&host, &target), &probe,
-        ).unwrap_or_else(|error| panic!("static LLVM {version}: {error}"));
+        let selection =
+            build_support::select(explicit, build_support::candidates(&host, &target), &probe)
+                .unwrap_or_else(|error| panic!("static LLVM {version}: {error}"));
         println!(
             "cargo:warning=LLVM {version} link test passed with {}",
             selection.compiler.to_string_lossy(),

@@ -253,7 +253,9 @@ impl Image {
             .iter()
             .find(|(offset, size, _)| file_offset >= *offset && file_offset - offset < *size)?;
         let address = address.checked_add(file_offset - offset)?;
-        let indexed = self.index.as_ref()
+        let indexed = self
+            .index
+            .as_ref()
             .and_then(|index| index.resolve(address).ok().flatten());
         let index = self
             .symbols
@@ -262,10 +264,12 @@ impl Image {
             symbol.address <= address
                 && (symbol.size == 0 || address - symbol.address < symbol.size)
         });
-        let delta = indexed.as_ref()
+        let delta = indexed
+            .as_ref()
             .map(|(_, delta)| *delta)
             .or_else(|| closest.map(|symbol| address - symbol.address));
-        let display_name = indexed.as_ref()
+        let display_name = indexed
+            .as_ref()
             .map(|(name, _)| name.clone())
             .or_else(|| closest.map(|symbol| demangle(&symbol.name)));
         if let Some(loader) = &self.lines {

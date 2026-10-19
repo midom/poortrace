@@ -15,10 +15,7 @@ pub(crate) struct Resolver {
 
 impl Resolver {
     pub(crate) fn new(pid: u32) -> Self {
-        Self {
-            pid,
-            mounts: None,
-        }
+        Self { pid, mounts: None }
     }
 
     pub(crate) fn identify(&mut self, file: &File) -> io::Result<(u64, u64)> {

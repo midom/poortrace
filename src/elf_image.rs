@@ -178,8 +178,14 @@ mod tests {
         file.seek(SeekFrom::Start(MAX_FILE_SIZE - 4)).unwrap();
         file.write_all(b"ELF!").unwrap();
         let image = Image::new(file).unwrap();
-        assert_eq!((&image).read_bytes_at(MAX_FILE_SIZE - 4, 4).unwrap(), b"ELF!");
-        assert_eq!((&image).read_bytes_at(MAX_FILE_SIZE - 4, 4).unwrap(), b"ELF!");
+        assert_eq!(
+            (&image).read_bytes_at(MAX_FILE_SIZE - 4, 4).unwrap(),
+            b"ELF!"
+        );
+        assert_eq!(
+            (&image).read_bytes_at(MAX_FILE_SIZE - 4, 4).unwrap(),
+            b"ELF!"
+        );
         assert_eq!(image.bytes.get(), 4);
         assert!(image.check().is_ok());
         assert!(Image::new(sparse(MAX_FILE_SIZE + 1)).is_err());
