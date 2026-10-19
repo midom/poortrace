@@ -387,6 +387,7 @@ struct Semaphore {
 }
 #[derive(Clone, Default)]
 struct AddressSpace {
+    mappings: Vec<Mapping>,
     semaphores: BTreeMap<u64, Semaphore>,
     words: BTreeMap<u64, Word>,
     breakpoints: BTreeMap<u64, Breakpoint>,
@@ -394,6 +395,7 @@ struct AddressSpace {
     unresolved: bool,
 }
 pub struct Tracer {
+    mappings: Vec<Mapping>,
     pid: i32,
     root: i32,
     follow: bool,
@@ -531,6 +533,7 @@ impl Tracer {
             });
         }
         let mut tracer = Self {
+            mappings: Vec::new(),
             pid,
             root: pid,
             follow: include_descendants || !extra_pids.is_empty(),
@@ -662,6 +665,7 @@ impl Tracer {
     }
     fn snapshot(&self) -> AddressSpace {
         AddressSpace {
+            mappings: self.mappings.clone(),
             semaphores: self.semaphores.clone(),
             words: self.words.clone(),
             breakpoints: self.breakpoints.clone(),
@@ -685,6 +689,7 @@ impl Tracer {
             ..Default::default()
         });
         self.pid = owner;
+        self.mappings = state.mappings;
         self.semaphores = state.semaphores;
         self.words = state.words;
         self.breakpoints = state.breakpoints;
@@ -848,25 +853,66 @@ impl Tracer {
         self.decoder.clear(tid);
     }
     fn stop_world(&mut self) -> Result<()> {
-        let notification = ChildNotification::new().map_err(|e| e.to_string())?;
-        for &tid in &self.tids {
-            if !self.stopped.contains(&tid)
-                && !self.listening.contains(&tid)
-                && !self.vfork.contains_key(&tid)
-            {
-                let _ = control(libc::PTRACE_INTERRUPT, tid, 0, 0);
-            }
+        self.stop_tasks(self.tids.clone())
+    }
+    /// Private followed processes can keep running while a different address
+    /// space is patched. Unknown/shared owners stay in the conservative cohort.
+    fn stop_space(&mut self, tid: i32) -> Result<()> {
+        if !self.follow {
+            return self.stop_world();
         }
+        let group = tgid(tid).unwrap_or(tid);
+        let owner = self.owners.get(&group).copied().unwrap_or(group);
+        let tasks = self
+            .tids
+            .iter()
+            .copied()
+            .filter(|task| {
+                tgid(*task)
+                    .is_none_or(|group| self.owners.get(&group).copied().unwrap_or(group) == owner)
+            })
+            .collect();
+        self.stop_tasks(tasks)
+    }
+    fn stop_tasks(&mut self, mut tasks: BTreeSet<i32>) -> Result<()> {
+        let notification = ChildNotification::new().map_err(|e| e.to_string())?;
+        let mut remaining: BTreeSet<_> = tasks
+            .iter()
+            .copied()
+            .filter(|tid| {
+                !self.stopped.contains(tid)
+                    && !self.listening.contains(tid)
+                    && !self.vfork.contains_key(tid)
+            })
+            .collect();
+        for &tid in &remaining {
+            let _ = control(libc::PTRACE_INTERRUPT, tid, 0, 0);
+        }
+        let mut known = self.tids.clone();
         let deadline = Instant::now() + Duration::from_secs(1);
-        while self.tids.iter().any(|tid| {
-            !self.stopped.contains(tid)
-                && !self.listening.contains(tid)
-                && !self.vfork.contains_key(tid)
-        }) {
+        while !remaining.is_empty() {
             let mut status = 0;
             let tid = unsafe { libc::waitpid(-1, &mut status, libc::__WALL | libc::WNOHANG) };
             if tid > 0 {
                 self.queue(tid, status)?;
+                remaining.remove(&tid);
+                if matches!(
+                    status >> 16,
+                    libc::PTRACE_EVENT_CLONE | libc::PTRACE_EVENT_FORK | libc::PTRACE_EVENT_VFORK
+                ) {
+                    // Newly traced children may share the patched mm. Wait for
+                    // their mandatory initial stop before touching any bytes.
+                    for child in self.tids.difference(&known) {
+                        tasks.insert(*child);
+                        if !self.stopped.contains(child)
+                            && !self.listening.contains(child)
+                            && !self.vfork.contains_key(child)
+                        {
+                            remaining.insert(*child);
+                        }
+                    }
+                    known = self.tids.clone();
+                }
             } else if tid < 0 {
                 let error = std::io::Error::last_os_error();
                 if error.raw_os_error() == Some(libc::ECHILD) {
@@ -877,10 +923,7 @@ impl Tracer {
                     return Err(error.to_string());
                 }
             } else {
-                // Drain ready statuses before doing liveness I/O. Checking every
-                // task after every sibling stop costs O(threads^2) proc lookups.
-                let vanished: Vec<_> = self
-                    .tids
+                let vanished: Vec<_> = remaining
                     .iter()
                     .filter(|tid| !std::path::Path::new(&format!("/proc/{tid}")).exists())
                     .copied()
@@ -888,12 +931,16 @@ impl Tracer {
                 if !vanished.is_empty() {
                     for tid in vanished {
                         self.forget(tid);
+                        remaining.remove(&tid);
                     }
-                    // de_thread can replace a stopped leader while its execing
-                    // sibling disappears, before PTRACE_EVENT_EXEC is waitable.
-                    // Revalidate surviving stops after that disappearance; never
-                    // dispatch an old syscall stop against the replacement task.
-                    for tid in self.stopped.clone() {
+                    // de_thread can replace a stopped leader before its exec
+                    // event is waitable. Invalidate stops for that old task.
+                    for tid in self
+                        .stopped
+                        .intersection(&tasks)
+                        .copied()
+                        .collect::<Vec<_>>()
+                    {
                         let stat = std::fs::read_to_string(format!("/proc/{tid}/stat"));
                         let stopped = stat.as_ref().ok().is_some_and(|stat| {
                             stat.rsplit_once(')').is_some_and(|(_, tail)| {
@@ -903,15 +950,12 @@ impl Tracer {
                         if !stopped {
                             self.stopped.remove(&tid);
                             self.pending.retain(|(task, _)| *task != tid);
+                            remaining.insert(tid);
                             let _ = control(libc::PTRACE_INTERRUPT, tid, 0, 0);
                         }
                     }
                 }
-                if self.tids.iter().all(|tid| {
-                    self.stopped.contains(tid)
-                        || self.listening.contains(tid)
-                        || self.vfork.contains_key(tid)
-                }) {
+                if remaining.is_empty() {
                     break;
                 }
                 if Instant::now() >= deadline {
@@ -957,6 +1001,19 @@ impl Tracer {
         }
         Ok(())
     }
+    /// Normal-mode handlers using captured data need not hold unrelated tasks.
+    /// Unhandled breakpoint, signal and lifecycle stops remain queued and stopped.
+    pub fn release_for_processing(&mut self) -> Result<()> {
+        if self.active_hit.is_some() {
+            return Err("rearm the active breakpoint before releasing tasks".into());
+        }
+        self.pending.retain(|(tid, status)| {
+            self.initial.contains(tid)
+                || status >> 16 != libc::PTRACE_EVENT_STOP
+                || libc::WSTOPSIG(*status) != libc::SIGTRAP
+        });
+        self.resume_all()
+    }
     /// Registers are read only from observed ptrace stops, never running tasks.
     pub fn snapshot_registers(&self) -> Result<Vec<(i32, UserRegs)>> {
         if !self.active {
@@ -986,7 +1043,11 @@ impl Tracer {
                 }
             })
             .copied()
-            .or_else(|| self.stopped.first().copied())
+            .or_else(|| {
+                (!self.follow)
+                    .then(|| self.stopped.first().copied())
+                    .flatten()
+            })
             .ok_or_else(|| "no stopped thread for breakpoint memory access".into())
     }
     // /proc/PID/maps is ordered by address; avoid scanning all VMAs per probe.
@@ -1104,12 +1165,43 @@ impl Tracer {
         );
         self.patch(word)
     }
+    fn refresh_if_changed(&mut self, tid: i32) -> Result<()> {
+        // A leader can exit while siblings remain alive. Use the observed TID,
+        // without requiring a stopped thread just to inspect its mappings.
+        let text = match std::fs::read_to_string(format!("/proc/{tid}/maps")) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.refreshed = Instant::now();
+                return Ok(()); // Leave exit collection to the normal wait path.
+            }
+            Err(error) => return Err(format!("checking function mappings for TID {tid}: {error}")),
+        };
+        let current: Vec<_> = text.lines().filter_map(Mapping::parse).collect();
+        if current != self.mappings && !current.is_empty() {
+            self.stop_space(tid)?;
+            // exit_group can finish while acquiring the barrier. Listening
+            // group stops may also leave no task available for text access.
+            if self.memory_tid().is_ok() {
+                self.refresh()?;
+            } else {
+                self.refreshed = Instant::now();
+            }
+        } else {
+            self.refreshed = Instant::now();
+        }
+        Ok(())
+    }
     fn refresh(&mut self) -> Result<()> {
         if !self.active {
             return Ok(());
         }
-        let current = self.current_maps()?;
-        let mapped = memory_maps(self.memory_tid()?)?;
+        let current = self.current_maps().map_err(|error| {
+            format!("refreshing function mappings for PID {}: {error}", self.pid)
+        })?;
+        let mapped = memory_maps(
+            self.memory_tid()
+                .map_err(|error| format!("refreshing stopped function target: {error}"))?,
+        )?;
         let inactive: Vec<_> = self
             .semaphores
             .iter()
@@ -1234,11 +1326,16 @@ impl Tracer {
                 self.words.remove(&(address & !7));
             }
         }
+        self.mappings = current;
         self.refreshed = Instant::now();
         Ok(())
     }
     fn resume_all(&mut self) -> Result<()> {
+        let pending: BTreeSet<_> = self.pending.iter().map(|(tid, _)| *tid).collect();
         for tid in self.stopped.clone() {
+            if pending.contains(&tid) {
+                continue;
+            }
             let signal = self.signals.remove(&tid).unwrap_or(0);
             let (request, signal) = if self.listening.contains(&tid) {
                 (libc::PTRACE_LISTEN, 0)
@@ -1304,13 +1401,12 @@ impl Tracer {
         Ok(())
     }
     /// Sleep until a child status is ready or the caller's service deadline.
-    /// Queue the status and stop siblings before any subsequent handler or patch.
+    /// Queue the status; poll classifies it before deciding which siblings to stop.
     pub fn wait_ready(&mut self, timeout: Duration) -> Result<()> {
         if self.pending.is_empty() && self.active_hit.is_none() && !self.tids.is_empty() {
             match wait_status(-1, Instant::now() + timeout) {
                 Ok(Some((tid, status))) => {
                     self.queue(tid, status)?;
-                    self.stop_world()?;
                 }
                 Ok(None) => {}
                 Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {}
@@ -1328,26 +1424,24 @@ impl Tracer {
             let tid = unsafe { libc::waitpid(-1, &mut status, libc::__WALL | libc::WNOHANG) };
             if tid > 0 {
                 self.queue(tid, status)?;
-                self.stop_world()?;
             } else if tid < 0
                 && std::io::Error::last_os_error().raw_os_error() != Some(libc::ECHILD)
             {
                 return Err(std::io::Error::last_os_error().to_string());
             } else if self.active && self.refreshed.elapsed() >= Duration::from_millis(100) {
-                self.stop_world()?;
-                if !self.stopped.is_empty() && self.pending.is_empty() {
-                    if self.follow
-                        && !self.stopped.iter().any(|tid| {
-                            tgid(*tid).is_some_and(|group| {
-                                self.owners.get(&group).copied().unwrap_or(group) == self.pid
-                            })
+                if let Some(tid) = self
+                    .tids
+                    .iter()
+                    .copied()
+                    .find(|tid| {
+                        tgid(*tid).is_some_and(|group| {
+                            self.owners.get(&group).copied().unwrap_or(group) == self.pid
                         })
-                    {
-                        if let Some(&tid) = self.stopped.first() {
-                            self.select(tid);
-                        }
-                    }
-                    self.refresh()?;
+                    })
+                    .or_else(|| self.tids.first().copied())
+                {
+                    self.select(tid);
+                    self.refresh_if_changed(tid)?;
                 }
             }
         }
@@ -1359,6 +1453,16 @@ impl Tracer {
             let initial = self.initial.remove(&tid);
             let event = status >> 16;
             let signal = libc::WSTOPSIG(status);
+            if matches!(
+                event,
+                libc::PTRACE_EVENT_EXEC
+                    | libc::PTRACE_EVENT_CLONE
+                    | libc::PTRACE_EVENT_FORK
+                    | libc::PTRACE_EVENT_VFORK
+            ) {
+                // Exec/shared-mm transitions require the existing full barrier.
+                self.stop_world()?;
+            }
             if initial
                 && !self.follow
                 && tgid(tid).is_some_and(|tgid| tgid != self.root)
@@ -1404,6 +1508,7 @@ impl Tracer {
                         }
                     }
                     self.foreign.remove(&tid);
+                    self.mappings.clear();
                     self.semaphores.clear();
                     self.words.clear();
                     self.breakpoints.clear();
@@ -1466,6 +1571,7 @@ impl Tracer {
                         self.foreign.remove(&child);
                     }
                 }
+                self.mappings.clear();
                 self.semaphores.clear();
                 self.words.clear();
                 self.breakpoints.clear();
@@ -1511,7 +1617,7 @@ impl Tracer {
                         false
                     };
                     if self.unresolved || mapping_change {
-                        self.refresh()?;
+                        self.refresh_if_changed(tid)?;
                     }
                     if self.syscalls && (self.follow || !self.foreign.contains(&tid)) {
                         if let Some(event) = self.decoder.stop(tid)? {
@@ -1537,6 +1643,7 @@ impl Tracer {
                     self.signals.insert(tid, signal);
                     continue;
                 };
+                self.stop_space(tid)?;
                 regs.set_ip(address);
                 regs.write(tid)?;
                 self.breakpoints.get_mut(&address).unwrap().enabled = false;

@@ -481,8 +481,8 @@ Absolute paths are resolved in the target's filesystem root; relative paths use
 the tracer's working directory. Stripped functions need a known file offset.
 
 `--uprobe-backend ptrace` is the default. It requires ordinary ptrace access,
-not a privileged perf uprobe PMU. The tracer stops the target's threads while
-patching, handling hits, and single-stepping original instructions; code bytes
+not a privileged perf uprobe PMU. The tracer stops threads sharing the affected
+address space while patching and single-stepping original instructions; code bytes
 are restored on normal/error/interrupt cleanup before detach. Executable mappings
 must be private. This backend is intrusive and can substantially change timing;
 it is for native function tracing, not transparent high-rate profiling. Abruptly
@@ -499,6 +499,21 @@ attached together with `--shared-mm-pids PID1,PID2 -p ROOT_PID`. All declared
 groups stop before patching; `kcmp(KCMP_VM)` must prove their shared address
 space. A denied comparison or undeclared/unknown trap fails explicitly before
 unsafe adoption.
+
+In normal mode, ordinary signal and syscall stops do not pause siblings.
+Private followed processes can continue during another address space's breakpoint
+step; exec and fork/clone transitions retain conservative synchronization.
+Periodic probe refresh checks executable mapping identities before stopping
+threads, and leaves unchanged mappings running. Clauses using captured event
+fields, native stacks, and tracer-owned map state resume eligible threads after
+register/stack capture and breakpoint rearming, before unwinding, formatting,
+and output. Stack symbolization pins the observed mapping metadata and validates
+ELF identities; unavailable images retain raw-address fallbacks. Clauses needing
+live memory, live register helpers such as `farg`/`sarg`, explicit effects, or
+script exit still execute before resumption. Recording and explicit memory
+capture also retain that path. `--reliable` keeps its verified full pause during
+every handler. Software breakpoint hits still require sibling coordination;
+this is not displaced stepping or a non-stop function backend.
 
 Entry probes expose the first six integer/pointer arguments in `arg0..arg5` under
 the native calling convention. At ptrace stops, `farg` reads scalar FP registers

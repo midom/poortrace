@@ -47,6 +47,38 @@ siblings. It needs a C compiler and ptrace access, without perf privileges:
 python3 scripts/benchmark-functions.py --runs 3 --hits 500 --threads 1 12 > functions.json
 ```
 
+To measure the effect of hundreds of siblings, the same fixture supports up to
+512 threads:
+
+```sh
+python3 scripts/benchmark-functions.py --runs 3 --hits 500 --threads 1 32 128 512 > functions-many-threads.json
+```
+
+`tests/function_scheduling.rs` separately verifies sibling progress at ordinary
+syscall stops and during blocked output from captured-data handlers, preserves
+live-read and reliable pauses, and checks that private followed processes run
+during another address space's breakpoint step. CI runs this opt-in test with
+the native ptrace suite. Its progress checks establish scheduling behavior, not
+a performance estimate.
+
+An illustrative [AArch64/LLVM 18 scheduling comparison](baselines/aarch64-ptrace-scheduling.json)
+against commit `0dffafa` measured the following median rates, with three release
+runs and exactly 500 delivered hits per run:
+
+| Threads | Before (events/s) | After (events/s) |
+| --- | ---: | ---: |
+| 1 | 10,736 | 10,472 |
+| 32 | 2,935 | 3,002 |
+| 128 | 612 | 656 |
+| 512 | 51 | 65 |
+
+The small-thread rates are effectively unchanged in this sample. At 512 threads
+the rate improved by about 28%, but software breakpoint stepping still stops
+siblings in the affected address space. These measurements include thread
+creation and cleanup; they do not isolate steady-state hit cost or establish
+application slowdown. The blocked-output test verifies the separate benefit of
+letting eligible threads run during handler processing.
+
 An illustrative [AArch64/LLVM 18 comparison](baselines/aarch64-ptrace-throughput.json)
 measured approximately 707 to 10,535 events/second with one thread, and 330 to
 4,918 events/second with 12 threads, after replacing the sleep-based waits and

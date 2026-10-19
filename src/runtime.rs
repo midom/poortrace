@@ -494,6 +494,13 @@ impl<'a> State<'a> {
             StackMode::Dwarf => self.symbols.unwind(sample),
         }
     }
+    /// Pin metadata before allowing a stopped native-stack observation to run.
+    pub fn pin_user_symbols(&mut self, pid: u32) {
+        self.symbols.pin_process(pid);
+    }
+    pub fn unpin_user_symbols(&mut self) {
+        self.symbols.unpin_processes();
+    }
     pub fn replay_helpers(&mut self, helpers: Vec<crate::recording::Helper>) {
         self.replay = Some(helpers.into());
         self.replay_lookup = false;

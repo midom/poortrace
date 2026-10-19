@@ -6,7 +6,7 @@ use poortrace::{
     language::Probe,
     runtime::{Event, State},
 };
-use std::ffi::CString;
+use std::{collections::BTreeMap, ffi::CString, sync::Arc};
 
 pub(super) fn monotonic_ns() -> u64 {
     let mut t = libc::timespec {
@@ -129,14 +129,35 @@ pub(super) fn invoke_kind(
         }
     }
 }
-pub(super) fn dispatch_function_events(
+pub(super) struct CapturedFunctionEvent {
+    event: poortrace::functions::Event,
+    destinations: Vec<(usize, String)>,
+    pid: i32,
+    comm: CString,
+    syscall: CString,
+    nsecs: u64,
+    stack: Option<Arc<Vec<u8>>>,
+}
+impl CapturedFunctionEvent {
+    pub(super) fn can_run_resumed(&self, program: &Program) -> bool {
+        self.destinations
+            .iter()
+            .all(|(clause, _)| program.can_run_resumed(*clause))
+    }
+}
+
+/// Capture process identity, register context and stack bytes before stepping.
+/// Unwinding, symbolization and handler output can then use this owned snapshot.
+pub(super) fn capture_function_events(
     program: &Program,
     state: &mut State<'_>,
     events: Vec<poortrace::functions::Event>,
     bindings: &[(usize, String)],
     pid: i32,
     stack_bytes: u32,
-) -> Result<()> {
+) -> Result<Vec<CapturedFunctionEvent>> {
+    let mut captured = Vec::new();
+    let mut stacks = BTreeMap::new();
     for event in events {
         let destinations: Vec<(usize, String)> = if let Some(syscall) = &event.syscall {
             program
@@ -164,7 +185,13 @@ pub(super) fn dispatch_function_events(
         if destinations.is_empty() {
             continue;
         }
-        let syscall_name = CString::new(
+        let event_pid = poortrace::syscall::tgid(event.tid).unwrap_or(pid);
+        if !state.has_target_identity(event_pid as u32) {
+            state.register_target_identity(event_pid as u32)?;
+        }
+        let nsecs = monotonic_ns();
+        let comm = task_comm(event_pid, event.tid);
+        let syscall = CString::new(
             event
                 .syscall
                 .as_ref()
@@ -172,46 +199,82 @@ pub(super) fn dispatch_function_events(
                 .unwrap_or_default(),
         )
         .unwrap();
-        let event_pid = poortrace::syscall::tgid(event.tid).unwrap_or(pid);
-        let comm = task_comm(event_pid, event.tid);
+        let stack = if program.needs_ustack() || state.recorder.is_some() {
+            Some(Arc::clone(
+                stacks.entry((event.tid, event.regs.sp)).or_insert_with(|| {
+                    Arc::new(
+                        poortrace::memory::read_stack(
+                            event.tid as u32,
+                            event.regs.sp,
+                            stack_bytes as usize,
+                        )
+                        .unwrap_or_default(),
+                    )
+                }),
+            ))
+        } else {
+            None
+        };
+        if program.needs_ustack() {
+            state.pin_user_symbols(event_pid as u32);
+        }
+        captured.push(CapturedFunctionEvent {
+            event,
+            destinations,
+            pid: event_pid,
+            comm,
+            syscall,
+            nsecs,
+            stack,
+        });
+    }
+    Ok(captured)
+}
+
+pub(super) fn dispatch_captured_function_events(
+    program: &Program,
+    state: &mut State<'_>,
+    events: Vec<CapturedFunctionEvent>,
+) -> Result<()> {
+    for captured in events {
+        let event = captured.event;
+        let snapshot = poortrace::perf::Sample {
+            pid: captured.pid as u32,
+            tid: event.tid as u32,
+            ip: event.regs.ip,
+            time: captured.nsecs,
+            regs: Some(event.regs),
+            stack: captured.stack.as_deref().cloned().unwrap_or_default(),
+            callchain: vec![event.regs.ip],
+            ..Default::default()
+        };
         let frames = if program.needs_ustack() || state.recorder.is_some() {
-            let stack = poortrace::memory::read_stack(
-                event.tid as u32,
-                event.regs.sp,
-                stack_bytes as usize,
-            )
-            .unwrap_or_default();
-            state.unwind_sample(&poortrace::perf::Sample {
-                pid: event_pid as u32,
-                tid: event.tid as u32,
-                ip: event.regs.ip,
-                regs: Some(event.regs),
-                stack,
-                callchain: vec![event.regs.ip],
-                ..Default::default()
-            })
+            state.unwind_sample(&snapshot)
         } else {
             Vec::new()
         };
-        let event_nsecs = monotonic_ns();
-        for (id, name) in destinations {
+        for (id, name) in captured.destinations {
             let name = CString::new(name).unwrap();
-            let mut sample = Event::new(&comm, &name)
+            let mut sample = Event::new(&captured.comm, &name)
                 .with_ustack(&frames)
-                .with_syscall(&syscall_name);
+                .with_syscall(&captured.syscall);
             sample.sysno = event.syscall.as_ref().map(|e| e.number as u64).unwrap_or(0);
-            sample.pid = event_pid as u64;
-            if !state.has_target_identity(event_pid as u32) {
-                state.register_target_identity(event_pid as u32)?;
-            }
+            sample.pid = captured.pid as u64;
             sample.tid = event.tid as u64;
-            sample.nsecs = event_nsecs;
+            sample.nsecs = captured.nsecs;
             sample.ip = event.regs.ip;
             sample.args = event.args;
             sample.retval = event.retval;
             sample.latency = event.latency;
             state.kernel_frames.clear();
-            state.js_snapshot = Some((event.regs, Vec::new()));
+            state.js_snapshot = Some((
+                event.regs,
+                if state.recorder.is_some() {
+                    snapshot.stack.clone()
+                } else {
+                    Vec::new()
+                },
+            ));
             state.register_snapshot = Some(event.regs);
             state.capture_event_memory(&sample);
             if !state.stopped {
@@ -227,8 +290,20 @@ pub(super) fn dispatch_function_events(
             break;
         }
     }
-
+    state.unpin_user_symbols();
     Ok(())
+}
+
+pub(super) fn dispatch_function_events(
+    program: &Program,
+    state: &mut State<'_>,
+    events: Vec<poortrace::functions::Event>,
+    bindings: &[(usize, String)],
+    pid: i32,
+    stack_bytes: u32,
+) -> Result<()> {
+    let captured = capture_function_events(program, state, events, bindings, pid, stack_bytes)?;
+    dispatch_captured_function_events(program, state, captured)
 }
 pub(super) fn dispatch_waits(
     program: &Program,

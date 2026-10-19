@@ -16,8 +16,8 @@ parser.add_argument("--runs", type=int, default=3)
 parser.add_argument("--hits", type=int, default=500)
 parser.add_argument("--threads", type=int, nargs="+", default=[1, 12])
 args = parser.parse_args()
-if args.runs < 1 or args.hits < 1 or any(t < 1 or t > 64 for t in args.threads):
-    parser.error("runs/hits must be positive and thread counts must be 1..64")
+if args.runs < 1 or args.hits < 1 or any(t < 1 or t > 512 for t in args.threads):
+    parser.error("runs/hits must be positive and thread counts must be 1..512")
 binary = str(Path(args.binary).resolve())
 fixture = Path(__file__).resolve().parents[1] / "tests/fixtures/function_throughput.c"
 results = {}

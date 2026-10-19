@@ -3,11 +3,11 @@ use object::{Object, ObjectSection, ObjectSegment, ObjectSymbol, SymbolKind};
 use std::{
     collections::BTreeMap,
     io::Read,
-    os::unix::fs::MetadataExt,
+    os::{fd::AsRawFd, unix::fs::MetadataExt},
     time::{Duration, Instant},
 };
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Mapping {
     pub(crate) start: u64,
     pub(crate) end: u64,
@@ -91,7 +91,7 @@ struct Image {
     sections: framehop::ExplicitModuleSectionInfo<std::sync::Arc<[u8]>>,
 }
 impl Image {
-    fn read(pid: u32, mapping: &Mapping) -> Option<Self> {
+    fn open(pid: u32, mapping: &Mapping) -> Option<(std::fs::File, String)> {
         if !mapping.path.starts_with('/') || mapping.inode == 0 {
             return None;
         }
@@ -101,13 +101,28 @@ impl Image {
             mapping.start, mapping.end
         );
         let mut identities = crate::file_identity::Resolver::new(pid);
-        let (file, selected_path) = [root_path, map_path].into_iter().find_map(|path| {
+        [root_path, map_path].into_iter().find_map(|path| {
             let file = std::fs::File::open(&path).ok()?;
             let meta = file.metadata().ok()?;
             (identities.identify(&file).ok()? == (mapping.device, mapping.inode)
                 && meta.len() <= crate::elf_image::MAX_FILE_SIZE)
                 .then_some((file, path))
-        })?;
+        })
+    }
+    fn read(pid: u32, mapping: &Mapping) -> Option<Self> {
+        let (file, path) = Self::open(pid, mapping)?;
+        Self::read_opened(pid, mapping, file, path)
+    }
+    fn read_opened(
+        pid: u32,
+        mapping: &Mapping,
+        file: std::fs::File,
+        original_path: String,
+    ) -> Option<Self> {
+        // The target may have exited since capture; this path still names the
+        // exact opened ELF for lazy DWARF loading in our own process.
+        let selected_path = format!("/proc/self/fd/{}", file.as_raw_fd());
+        let metadata = file.metadata().ok()?;
         let data = crate::elf_image::Image::new(file).ok()?;
         let mut image = Self::parse_with_index(&data, data.index().cloned())?;
         data.check().ok()?;
@@ -146,6 +161,13 @@ impl Image {
             }
         }
         if image.index.is_none() || object.section_by_name(".debug_info").is_some() {
+            // Preserve adjacent .dwp discovery while the original path still
+            // identifies this ELF. The descriptor path also works after exit.
+            if std::fs::metadata(&original_path).is_ok_and(|current| {
+                current.dev() == metadata.dev() && current.ino() == metadata.ino()
+            }) {
+                candidates.push((original_path, None));
+            }
             candidates.push((selected_path, None));
         }
         for (path, crc) in candidates {
@@ -378,6 +400,8 @@ struct UnwindState {
 #[derive(Default)]
 pub(crate) struct Symbolizer {
     processes: BTreeMap<u32, Process>,
+    pinned: std::collections::BTreeSet<u32>,
+    pending_images: BTreeMap<(u32, String, u64, u64), (std::fs::File, String)>,
     images: BTreeMap<(u32, String, u64, u64), Option<Image>>,
     unwinders: BTreeMap<u32, UnwindState>,
 }
@@ -410,10 +434,14 @@ impl Symbolizer {
             let mut unwinder = framehop::UnwinderNative::new();
             for map in process.maps.iter().take(128) {
                 let key = (sample.pid, map.path.clone(), map.device, map.inode);
+                let pending = &mut self.pending_images;
                 let Some(image) = self
                     .images
-                    .entry(key)
-                    .or_insert_with(|| Image::read(sample.pid, map))
+                    .entry(key.clone())
+                    .or_insert_with(|| match pending.remove(&key) {
+                        Some((file, path)) => Image::read_opened(sample.pid, map, file, path),
+                        None => Image::read(sample.pid, map),
+                    })
                     .as_ref()
                 else {
                     continue;
@@ -473,17 +501,18 @@ impl Symbolizer {
         output
     }
 
-    pub(crate) fn stack(&mut self, pid: u32, frames: &[u64]) -> String {
-        if frames.is_empty() {
-            return "    <no user stack>\n".into();
-        }
+    fn refresh_process(&mut self, pid: u32) {
         let refresh = self
             .processes
             .get(&pid)
             .is_none_or(|process| process.refreshed.elapsed() >= Duration::from_millis(100));
-        if refresh {
-            if self.processes.len() >= 16 && !self.processes.contains_key(&pid) {
+        if refresh && !self.pinned.contains(&pid) {
+            if self.processes.len() >= 16
+                && !self.processes.contains_key(&pid)
+                && self.pinned.is_empty()
+            {
                 self.processes.clear();
+                self.pending_images.clear();
                 self.images.clear();
                 self.unwinders.clear();
             }
@@ -498,6 +527,41 @@ impl Symbolizer {
                 );
             }
         }
+    }
+    /// Keep the stopped observation's mapping identities during deferred
+    /// unwinding/rendering. ELF loading remains lazy and checks file identity.
+    pub(crate) fn pin_process(&mut self, pid: u32) {
+        if self.pinned.contains(&pid) {
+            return;
+        }
+        self.refresh_process(pid);
+        if self.pending_images.len() >= 128 && self.pinned.is_empty() {
+            self.pending_images.clear();
+        }
+        if let Some(process) = self.processes.get(&pid) {
+            for mapping in process.maps.iter().take(128) {
+                let key = (pid, mapping.path.clone(), mapping.device, mapping.inode);
+                if self.images.contains_key(&key) || self.pending_images.contains_key(&key) {
+                    continue;
+                }
+                if self.pending_images.len() >= 128 {
+                    break;
+                }
+                if let Some(file) = Image::open(pid, mapping) {
+                    self.pending_images.insert(key, file);
+                }
+            }
+        }
+        self.pinned.insert(pid);
+    }
+    pub(crate) fn unpin_processes(&mut self) {
+        self.pinned.clear();
+    }
+    pub(crate) fn stack(&mut self, pid: u32, frames: &[u64]) -> String {
+        if frames.is_empty() {
+            return "    <no user stack>\n".into();
+        }
+        self.refresh_process(pid);
         let mut result = String::new();
         for (index, &ip) in frames.iter().take(127).enumerate() {
             // Callers are return addresses; look inside the calling instruction
@@ -515,10 +579,14 @@ impl Symbolizer {
                 if self.images.len() >= 128 && !self.images.contains_key(&key) {
                     self.images.clear();
                 }
-                let image = self
-                    .images
-                    .entry(key)
-                    .or_insert_with(|| Image::read(pid, mapping));
+                let pending = &mut self.pending_images;
+                let image =
+                    self.images
+                        .entry(key.clone())
+                        .or_insert_with(|| match pending.remove(&key) {
+                            Some((file, path)) => Image::read_opened(pid, mapping, file, path),
+                            None => Image::read(pid, mapping),
+                        });
                 let symbol = file_offset.and_then(|offset| image.as_ref()?.resolve(offset));
                 match symbol {
                     Some(symbol) => format!("{symbol} ({})", mapping.path),
@@ -605,6 +673,66 @@ fn jit_symbols(pid: u32) -> Vec<(u64, u64, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn captured_elf_descriptors_allow_lazy_symbols_after_target_exit() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let target_ip =
+            loop {
+                let text = std::fs::read_to_string(format!("/proc/{}/maps", child.id())).unwrap();
+                if let Some(mapping) = text.lines().filter_map(Mapping::parse).find(|mapping| {
+                    mapping.path.rsplit('/').next().is_some_and(|name| {
+                        name.starts_with("libc.so") || name.starts_with("libc-")
+                    })
+                }) {
+                    // Resolve the child's own libc, including when this test binary
+                    // itself is fully static and has no shared libc mapping.
+                    let data =
+                        crate::elf_image::Image::new(Image::open(child.id(), &mapping).unwrap().0)
+                            .unwrap();
+                    let object = data.parse().unwrap();
+                    let address = object
+                        .dynamic_symbols()
+                        .find(|symbol| symbol.name() == Ok("getpid"))
+                        .unwrap()
+                        .address();
+                    let offset = object
+                        .segments()
+                        .find_map(|segment| {
+                            let (offset, size) = segment.file_range();
+                            (address >= segment.address() && address - segment.address() < size)
+                                .then(|| offset + address - segment.address())
+                        })
+                        .unwrap();
+                    assert!(
+                        offset >= mapping.offset
+                            && offset - mapping.offset < mapping.end - mapping.start
+                    );
+                    break mapping.start + offset - mapping.offset;
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("child did not map libc");
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            };
+        let mut symbols = Symbolizer::default();
+        symbols.pin_process(child.id());
+        assert!(
+            symbols.images.is_empty(),
+            "ELF parsing should remain deferred"
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let text = symbols.symbol(child.id(), target_ip);
+        assert!(text.contains("getpid"), "{text}");
+        symbols.unpin_processes();
+    }
 
     #[test]
     fn proc_mapping_preserves_spaces_and_filters_data() {

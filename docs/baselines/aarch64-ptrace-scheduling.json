@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "platform": "Linux-6.17.0-1019-oracle-aarch64-with-glibc2.39",
+  "build": "release, LLVM 18",
+  "fixture": "tests/fixtures/function_throughput.c, cc -O2 -g -pthread -fno-omit-frame-pointer",
+  "hits_per_run": 500,
+  "runs": 3,
+  "notes": "Illustrative single-host measurements including process launch, thread creation, JIT compilation and cleanup. One thread calls the probed function; other threads sleep. Exact delivered counts are checked. Results are not performance guarantees or CI thresholds. Progress during blocked handler output is verified separately by tests/function_scheduling.rs.",
+  "before": {
+    "revision": "0dffafa",
+    "implementation": "All-thread barriers before event classification, handler execution before step/resume",
+    "threads": {
+      "1": {
+        "elapsed_s": [
+          0.056198532693088055,
+          0.04610990080982447,
+          0.046573822386562824
+        ],
+        "median_events_s": 10735.644496816236
+      },
+      "32": {
+        "elapsed_s": [
+          0.17154456675052643,
+          0.16259017772972584,
+          0.1703399633988738
+        ],
+        "median_events_s": 2935.306489582736
+      },
+      "128": {
+        "elapsed_s": [
+          0.8098072027787566,
+          0.8174567865207791,
+          0.8452169122174382
+        ],
+        "median_events_s": 611.6531274124915
+      },
+      "512": {
+        "elapsed_s": [
+          9.855761179700494,
+          9.402738634496927,
+          10.133044994436204
+        ],
+        "median_events_s": 50.731748759276904
+      }
+    }
+  },
+  "after": {
+    "implementation": "Classified stops, address-space barriers, mapping checks before pauses, captured-data handlers after resume",
+    "threads": {
+      "1": {
+        "elapsed_s": [
+          0.05525752995163202,
+          0.04774730559438467,
+          0.045414580032229424
+        ],
+        "median_events_s": 10471.795084051875
+      },
+      "32": {
+        "elapsed_s": [
+          0.16856707632541656,
+          0.16653903014957905,
+          0.1628542598336935
+        ],
+        "median_events_s": 3002.2992180927135
+      },
+      "128": {
+        "elapsed_s": [
+          0.7646588645875454,
+          0.7621520580723882,
+          0.7512601837515831
+        ],
+        "median_events_s": 656.0370659689416
+      },
+      "512": {
+        "elapsed_s": [
+          7.692709273658693,
+          7.59935374930501,
+          7.909135221503675
+        ],
+        "median_events_s": 64.99660681472723
+      }
+    }
+  }
+}

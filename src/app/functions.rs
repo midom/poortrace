@@ -10,7 +10,7 @@ use super::{
     report::{configure_record, configure_report, finish_report},
 };
 use super::{
-    events::dispatch_function_events,
+    events::{capture_function_events, dispatch_captured_function_events},
     perf::{attach, drain},
 };
 use poortrace::{Result, codegen::Program, language::Probe};
@@ -200,7 +200,7 @@ pub(super) fn run_functions(args: &Args, program: &Program) -> Result<i32> {
                 )?;
             }
             let idle = events.is_empty();
-            dispatch_function_events(
+            let captured = capture_function_events(
                 program,
                 &mut state,
                 events,
@@ -208,8 +208,18 @@ pub(super) fn run_functions(args: &Args, program: &Program) -> Result<i32> {
                 pid,
                 args.stack_bytes,
             )?;
-            if !state.stopped {
+            let resumed = !state.stopped
+                && state.recorder.is_none()
+                && state.capture_requests.is_empty()
+                && captured.iter().all(|event| event.can_run_resumed(program));
+            if resumed {
                 tracer.resume_hit()?;
+                tracer.release_for_processing()?;
+            }
+            dispatch_captured_function_events(program, &mut state, captured)?;
+            if !state.stopped && !resumed {
+                tracer.resume_hit()?;
+                tracer.release_for_processing()?;
             }
             if let Some(child) = &mut child {
                 if let Some(code) = (!tracer.has_target(child.pid))

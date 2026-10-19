@@ -6,6 +6,8 @@ use crate::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
+mod resumption;
+
 pub struct Program {
     pub source: String,
     origin: std::sync::Arc<()>,
@@ -14,6 +16,7 @@ pub struct Program {
     formats: Vec<Format>,
     pub ir: String,
     handlers: Vec<Handler>,
+    resumable: Vec<bool>,
     ustack: bool,
     kstack: bool,
     jsstack: bool,
@@ -28,6 +31,7 @@ impl Program {
             return Err("script exceeds 256 KiB".into());
         }
         let clauses = language::parse(source)?;
+        let resumable = resumption::clauses(&clauses);
         let mut generator = Generator {
             definitions: clauses
                 .first()
@@ -55,6 +59,7 @@ impl Program {
             formats: generator.formats,
             ir,
             handlers,
+            resumable,
             ustack: generator.ustack,
             kstack: generator.kstack,
             jsstack: generator.jsstack,
@@ -134,6 +139,11 @@ impl Program {
     }
     pub fn needs_ustack(&self) -> bool {
         self.ustack
+    }
+    /// This clause uses captured event data and tracer-owned state only.
+    /// Unknown helpers, live reads and explicit effects keep the target stopped.
+    pub fn can_run_resumed(&self, clause: usize) -> bool {
+        self.resumable[clause]
     }
     pub fn state<'a>(&self, writer: impl std::io::Write + 'a) -> State<'a> {
         let mut state = State::new(

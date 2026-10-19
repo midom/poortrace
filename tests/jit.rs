@@ -26,6 +26,40 @@ fn execute(source: &str, periods: &[u64]) -> String {
 }
 
 #[test]
+fn resumed_handlers_require_captured_inputs_through_predicates_and_functions() {
+    for source in [
+        "BEGIN { @hits=count(); printf(\"%d\",arg0); }",
+        "BEGIN /tid == 1/ { @[ustack,reg(\"sp\")]=sum(retval); }",
+        "fn twice($n)=$n*2; BEGIN { @x=twice(arg0); }",
+        "BEGIN { $x=arg0; while($x>0) { @x++; $x--; } }",
+    ] {
+        assert!(
+            Program::compile(source).unwrap().can_run_resumed(0),
+            "{source}"
+        );
+    }
+    for source in [
+        "BEGIN { @x=read_u64(arg0); }",
+        "BEGIN /read_u64(arg0)>0/ { @hits=count(); }",
+        "fn load($p)=read_u64($p); fn indirect($p)=load($p); BEGIN { @x=indirect(arg0); }",
+        "fn recurse($p)=$p?recurse($p-1):read_u64(arg0); BEGIN { @x=recurse(1); }",
+        "BEGIN { printf(\"%s\",pystack); }",
+        "BEGIN { printf(\"%s\",farg(0,\"f64\")); }",
+        "BEGIN { @x=sarg(0); }",
+        "BEGIN { printf(\"%s\",args()); }",
+        "BEGIN { @hits=count(); exit(); }",
+        "BEGIN { signal(SIGUSR1); }",
+    ] {
+        assert!(
+            !Program::compile(source)
+                .unwrap_or_else(|error| panic!("{source}: {error}"))
+                .can_run_resumed(0),
+            "{source}"
+        );
+    }
+}
+
+#[test]
 fn native_jit_expressions_control_flow_and_locals() {
     let out = execute(
         r#"

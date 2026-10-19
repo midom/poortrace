@@ -41,6 +41,7 @@ jobs:
           bash scripts/ci-test.sh --locked --features '${{ matrix.features }}' --test arguments -- --ignored
           bash scripts/ci-test.sh --locked --features '${{ matrix.features }}' --test expansion -- --ignored
           bash scripts/ci-test.sh --locked --features '${{ matrix.features }}' --test reliable -- --ignored
+          bash scripts/ci-test.sh --locked --features '${{ matrix.features }}' --test function_scheduling -- --ignored
         env:
           LLVM_CONFIG: llvm-config-18
   fully-static:

@@ -23,8 +23,8 @@ static void *sleeper(void *unused) {
 int main(int argc, char **argv) {
     long hits = argc > 1 ? strtol(argv[1], NULL, 10) : 500;
     int threads = argc > 2 ? atoi(argv[2]) : 1;
-    if (hits < 1 || threads < 1 || threads > 64) return 2;
-    pthread_t siblings[63];
+    if (hits < 1 || threads < 1 || threads > 512) return 2;
+    pthread_t siblings[511];
     if (pthread_barrier_init(&ready, NULL, threads)) return 3;
     for (int i = 0; i < threads - 1; i++)
         if (pthread_create(&siblings[i], NULL, sleeper, NULL)) return 4;
