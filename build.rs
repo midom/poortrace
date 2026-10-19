@@ -1,3 +1,4 @@
+mod build_support;
 use std::process::Command;
 
 fn llvm(config: &str, args: &[&str]) -> String {
@@ -20,6 +21,14 @@ fn llvm(config: &str, args: &[&str]) -> String {
 
 fn main() {
     println!("cargo:rerun-if-env-changed=LLVM_CONFIG");
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=build_support.rs");
+    let host = std::env::var("HOST").expect("Cargo supplies HOST");
+    let target = std::env::var("TARGET").expect("Cargo supplies TARGET");
+    let cxx_variables = build_support::cxx_variables(&host, &target);
+    for variable in &cxx_variables {
+        println!("cargo:rerun-if-env-changed={variable}");
+    }
     let config = std::env::var("LLVM_CONFIG").unwrap_or_else(|_| "llvm-config".into());
     let version = llvm(&config, &["--version"]);
     let major: u32 = version.split('.').next().unwrap().parse().unwrap();
@@ -40,7 +49,7 @@ fn main() {
         "--link-shared"
     };
     let kind = if static_llvm { "static" } else { "dylib" };
-    for flag in llvm(
+    let libraries = llvm(
         &config,
         &[
             mode,
@@ -51,21 +60,48 @@ fn main() {
             "mcjit",
             "native",
         ],
-    )
-    .split_whitespace()
-    {
+    );
+    for flag in libraries.split_whitespace() {
         if let Some(name) = flag.strip_prefix("-l") {
             println!("cargo:rustc-link-lib={kind}={name}");
         }
     }
     if static_llvm {
+        let system_libraries = llvm(&config, &[mode, "--system-libs"]);
+        let directory = std::path::PathBuf::from(
+            std::env::var_os("OUT_DIR").expect("Cargo supplies OUT_DIR"),
+        );
+        let architecture = std::env::var("CARGO_CFG_TARGET_ARCH")
+            .expect("Cargo supplies target architecture");
+        let explicit = cxx_variables.iter().find_map(std::env::var_os);
+        let probe = build_support::Probe {
+            directory: &directory,
+            architecture: &architecture,
+            llvm_directory: std::path::Path::new(&libdir),
+            llvm_libraries: &libraries,
+            system_libraries: &system_libraries,
+            static_crt,
+        };
+        let selection = build_support::select(
+            explicit, build_support::candidates(&host, &target), &probe,
+        ).unwrap_or_else(|error| panic!("static LLVM {version}: {error}"));
+        println!(
+            "cargo:warning=LLVM {version} link test passed with {}",
+            selection.compiler.to_string_lossy(),
+        );
+        // Retain the selected C++ search path in library metadata so binaries,
+        // integration tests, and downstream crates use the same linker script.
+        println!(
+            "cargo:rustc-link-search=native={}",
+            selection.library_directory.display(),
+        );
         // LLVM's component archives do not include its system dependencies or
         // the C++ standard library. Keep system libraries dynamic unless the
         // executable itself is being linked statically.
         // With crt-static, let the linker find archives in its default system
         // search paths (which are not necessarily in rustc's archive search path).
         let system_kind = if static_crt { "" } else { "dylib=" };
-        for flag in llvm(&config, &[mode, "--system-libs"]).split_whitespace() {
+        for flag in system_libraries.split_whitespace() {
             if let Some(name) = flag.strip_prefix("-l") {
                 println!("cargo:rustc-link-lib={system_kind}{name}");
             } else if let Some(path) = flag.strip_prefix("-L") {

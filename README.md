@@ -50,6 +50,28 @@ This requires LLVM's static archives and a C++ standard library development
 package. LLVM's system dependencies and the C/C++ runtimes remain dynamically
 linked in this mode. The LLVM runtime search path is omitted.
 
+For static LLVM builds, the build script checks whether a C++ compiler can link
+the selected LLVM archives before compiling the tracer. Set `CXX` to a compiler
+executable to select it explicitly:
+
+```sh
+CXX=/path/to/g++ cargo build --release --locked --features static-llvm
+```
+
+Compiler selection checks `CXX_<target>`, `CXX_<target_with_underscores>`,
+`HOST_CXX` for native builds or `TARGET_CXX` for cross builds, then `CXX`.
+An explicit selection must pass the link test; it does not fall back to another
+compiler. Without an explicit selection, native builds try `c++`, `g++`,
+`clang++`, then registered GCC toolsets from newest to oldest. Toolset roots
+come from system registration files. Cross builds try target compiler names
+and do not use host toolsets.
+
+The selected compiler's C++ library directory is used in the final Cargo link,
+including integration tests and downstream library users. A failed check reports
+the compiler, linker output, and how to select a compatible toolchain. Cargo
+repeats the check when the CXX selection changes. Shared LLVM builds do not
+perform this check.
+
 For a fully static executable on a native GNU/Linux toolchain, enable Rust's
 `crt-static` target feature; this selects static LLVM automatically:
 
